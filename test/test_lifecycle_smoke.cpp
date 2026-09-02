@@ -151,6 +151,20 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
       observer->count_publishers("/pid_tracking_controller/tracking_diagnostics"), 0u);
     EXPECT_NE(log_capture.output().find("PID_LOG plan_revision=1"), std::string::npos);
     EXPECT_NE(log_capture.output().find("angular_saturation_ratio="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("phase=TRACKING"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("tracking_sample_count=1"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("alignment_sample_count=0"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("raw_linear_command="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("raw_angular_command="), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("tracking_raw_angular_saturation_ratio="),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("tracking_lateral_error_rms="), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("tracking_lateral_error_p95_abs="), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("tracking_lateral_error_max_abs="), std::string::npos);
     EXPECT_NE(log_capture.output().find("kappa="), std::string::npos);
 
     if (costmap_configured) {

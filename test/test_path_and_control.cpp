@@ -120,6 +120,46 @@ TEST_F(CommandContractTest, largeInitialHeadingErrorRotatesBeforeTranslating)
   EXPECT_LT(command.twist.angular.z, 0.0);
 }
 
+TEST_F(CommandContractTest, diagnosticsSeparateAlignmentFromTrackingSamples)
+{
+  controller_.computeVelocityCommands(
+    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_EQ(PidTrackingControllerTestAccess::alignmentSampleCount(controller_), 1u);
+  EXPECT_EQ(PidTrackingControllerTestAccess::trackingSampleCount(controller_), 0u);
+
+  controller_.computeVelocityCommands(
+    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_EQ(PidTrackingControllerTestAccess::alignmentSampleCount(controller_), 1u);
+  EXPECT_EQ(PidTrackingControllerTestAccess::trackingSampleCount(controller_), 1u);
+}
+
+TEST_F(CommandContractTest, trackingLateralDiagnosticsExcludeAlignmentSamples)
+{
+  auto alignment_pose = makeRobotPose(M_PI_2);
+  alignment_pose.pose.position.y = 0.1;
+  controller_.computeVelocityCommands(
+    alignment_pose, geometry_msgs::msg::Twist(), nullptr);
+
+  const double alignment_target_yaw = std::atan2(-0.1, std::sqrt(0.08));
+  auto tracking_pose = makeRobotPose(alignment_target_yaw);
+  tracking_pose.pose.position.y = 0.02;
+  controller_.computeVelocityCommands(
+    tracking_pose, geometry_msgs::msg::Twist(), nullptr);
+
+  const auto & tracking_samples =
+    PidTrackingControllerTestAccess::trackingAbsoluteLateralErrorSamples(controller_);
+  ASSERT_EQ(tracking_samples.size(), 1u);
+  EXPECT_NEAR(tracking_samples.front(), 0.02, 1e-12);
+  EXPECT_NEAR(
+    PidTrackingControllerTestAccess::trackingSumSquaredLateralError(controller_),
+    0.0004, 1e-12);
+  EXPECT_NEAR(
+    PidTrackingControllerTestAccess::trackingMaximumAbsoluteLateralError(controller_),
+    0.02, 1e-12);
+}
+
 TEST_F(CommandContractTest, headingAlignmentDoesNotReenterDuringSameGoal)
 {
   const auto aligning = controller_.computeVelocityCommands(

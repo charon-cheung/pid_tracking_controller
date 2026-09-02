@@ -5,18 +5,51 @@
 namespace pid_tracking_controller
 {
 
-TEST(LegacyBehavior, modelControllerKeepsHandDerivedBodyMapping)
+TEST(LegacyBehavior, equalModelGainsKeepLegacyOutput)
 {
   PidTrackingController controller;
-  PidTrackingControllerTestAccess::setModelParameters(controller, 1.0, 0.2);
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.6, 1.6, 0.2);
 
   const Eigen::Vector2d output = controller.UseModelPidControl(
     Eigen::Vector3d(0.0, 0.0, 0.0),
     Eigen::Vector3d(0.3, 0.1, 1.2),
     Eigen::Vector2d(0.6, -0.4));
 
-  EXPECT_NEAR(output.x(), 0.3, 1e-12);
-  EXPECT_NEAR(output.y(), 0.5, 1e-12);
+  EXPECT_NEAR(output.x(), 0.48, 1e-12);
+  EXPECT_NEAR(output.y(), 0.8, 1e-12);
+}
+
+TEST(LegacyBehavior, independentModelGainsOnlyIncreaseAngularOutput)
+{
+  PidTrackingController controller;
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.6, 2.0, 0.2);
+
+  const Eigen::Vector2d output = controller.UseModelPidControl(
+    Eigen::Vector3d(0.0, 0.0, 0.0),
+    Eigen::Vector3d(0.3, 0.1, 0.0),
+    Eigen::Vector2d::Zero());
+
+  EXPECT_NEAR(output.x(), 0.48, 1e-12);
+  EXPECT_NEAR(output.y(), 1.0, 1e-12);
+}
+
+TEST(LegacyBehavior, splitModelGainsAreInvariantToWorldFrameRotation)
+{
+  PidTrackingController controller;
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.6, 2.0, 0.2);
+  const double half_pi = std::acos(-1.0) / 2.0;
+
+  const Eigen::Vector2d unrotated = controller.UseModelPidControl(
+    Eigen::Vector3d(0.0, 0.0, 0.0),
+    Eigen::Vector3d(0.3, 0.1, 0.0),
+    Eigen::Vector2d::Zero());
+  const Eigen::Vector2d rotated = controller.UseModelPidControl(
+    Eigen::Vector3d(1.0, -2.0, half_pi),
+    Eigen::Vector3d(0.9, -1.7, half_pi),
+    Eigen::Vector2d::Zero());
+
+  EXPECT_NEAR(rotated.x(), unrotated.x(), 1e-12);
+  EXPECT_NEAR(rotated.y(), unrotated.y(), 1e-12);
 }
 
 TEST(LegacyBehavior, lookaheadKeepsSpeedTimeClamp)

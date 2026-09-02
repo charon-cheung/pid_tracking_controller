@@ -119,7 +119,10 @@ void PidTrackingController::configure(
     declare_parameter_if_not_declared(node, controller_plugin_name + ".k_w_d", rclcpp::ParameterValue(0.10) );
 
     declare_parameter_if_not_declared(node, controller_plugin_name + ".k_theta", rclcpp::ParameterValue(0.5));
-    declare_parameter_if_not_declared(node, controller_plugin_name + ".k", rclcpp::ParameterValue(1.0) );
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".model_k_v", rclcpp::ParameterValue(1.0));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".model_k_w", rclcpp::ParameterValue(1.0));
     declare_parameter_if_not_declared(node, controller_plugin_name + ".l", rclcpp::ParameterValue(0.2) );
 
     declare_parameter_if_not_declared(
@@ -162,7 +165,8 @@ void PidTrackingController::configure(
     node->get_parameter(controller_plugin_name + ".k_w_d", k_w_d_);
 
     node->get_parameter(controller_plugin_name + ".k_theta", k_theta_);
-    node->get_parameter(controller_plugin_name + ".k", k_);
+    node->get_parameter(controller_plugin_name + ".model_k_v", model_k_v_);
+    node->get_parameter(controller_plugin_name + ".model_k_w", model_k_w_);
     node->get_parameter(controller_plugin_name + ".l", l_);
 
     node->get_parameter(
@@ -272,6 +276,8 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
   const geometry_msgs::msg::PoseStamped& pose,
   const geometry_msgs::msg::Twist& velocity,
   const geometry_msgs::msg::TwistStamped& command,
+  const Eigen::Vector2d& raw_command,
+  bool alignment_phase,
   const std::vector<geometry_msgs::msg::PoseStamped>& prune_plan,
   double lookahead_distance,
   double theta_trj,
@@ -336,6 +342,37 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
     {
         ++tracking_statistics_.angular_saturation_count;
     }
+    if (alignment_phase)
+    {
+        ++tracking_statistics_.alignment_sample_count;
+        if (std::abs(command.twist.angular.z) >= max_w_ - rmp::common::math::kMathEpsilon)
+        {
+            ++tracking_statistics_.alignment_angular_saturation_count;
+        }
+    }
+    else
+    {
+        ++tracking_statistics_.tracking_sample_count;
+        tracking_statistics_.tracking_sum_squared_lateral_error +=
+                lateral_error * lateral_error;
+        tracking_statistics_.tracking_maximum_absolute_lateral_error = std::max(
+                tracking_statistics_.tracking_maximum_absolute_lateral_error,
+                absolute_lateral_error);
+        tracking_statistics_.tracking_absolute_lateral_error_samples.push_back(
+                absolute_lateral_error);
+        if (std::abs(command.twist.linear.x) >= max_v_ - rmp::common::math::kMathEpsilon)
+        {
+            ++tracking_statistics_.tracking_linear_saturation_count;
+        }
+        if (std::abs(command.twist.angular.z) >= max_w_ - rmp::common::math::kMathEpsilon)
+        {
+            ++tracking_statistics_.tracking_angular_saturation_count;
+        }
+        if (std::abs(raw_command.y()) > max_w_)
+        {
+            ++tracking_statistics_.tracking_raw_angular_saturation_count;
+        }
+    }
 
     const double now_seconds = clock_->now().seconds();
     if (!tracking_start_time_valid_)
@@ -363,25 +400,69 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             static_cast<double>(tracking_statistics_.linear_saturation_count) / sample_count;
     const double angular_saturation_ratio =
             static_cast<double>(tracking_statistics_.angular_saturation_count) / sample_count;
+    double tracking_lateral_error_rms = 0.0;
+    double tracking_lateral_error_p95 = 0.0;
+    if (tracking_statistics_.tracking_sample_count > 0u)
+    {
+        tracking_lateral_error_rms = std::sqrt(
+                tracking_statistics_.tracking_sum_squared_lateral_error /
+                static_cast<double>(tracking_statistics_.tracking_sample_count));
+        auto tracking_samples = tracking_statistics_.tracking_absolute_lateral_error_samples;
+        const std::size_t tracking_p95_index =
+                static_cast<std::size_t>(std::ceil(0.95 * tracking_samples.size())) - 1u;
+        std::nth_element(
+                tracking_samples.begin(), tracking_samples.begin() + tracking_p95_index,
+                tracking_samples.end());
+        tracking_lateral_error_p95 = tracking_samples[tracking_p95_index];
+    }
+    const auto ratio = [](std::size_t count, std::size_t total) {
+        return total == 0u ? 0.0 : static_cast<double>(count) / static_cast<double>(total);
+    };
+    const double tracking_linear_saturation_ratio = ratio(
+            tracking_statistics_.tracking_linear_saturation_count,
+            tracking_statistics_.tracking_sample_count);
+    const double tracking_angular_saturation_ratio = ratio(
+            tracking_statistics_.tracking_angular_saturation_count,
+            tracking_statistics_.tracking_sample_count);
+    const double alignment_angular_saturation_ratio = ratio(
+            tracking_statistics_.alignment_angular_saturation_count,
+            tracking_statistics_.alignment_sample_count);
+    const double tracking_raw_angular_saturation_ratio = ratio(
+            tracking_statistics_.tracking_raw_angular_saturation_count,
+            tracking_statistics_.tracking_sample_count);
     const double elapsed_tracking_time = std::max(
             0.0, now_seconds - tracking_start_time_seconds_);
 
     RCLCPP_INFO(
             logger_,
-            "PID_LOG plan_revision=%zu sample_count=%zu lateral_error=%.6f "
+            "PID_LOG plan_revision=%zu phase=%s sample_count=%zu "
+            "tracking_sample_count=%zu alignment_sample_count=%zu lateral_error=%.6f "
             "lateral_error_rms=%.6f lateral_error_p95_abs=%.6f "
-            "lateral_error_max_abs=%.6f traveled_distance=%.6f "
+            "lateral_error_max_abs=%.6f tracking_lateral_error_rms=%.6f "
+            "tracking_lateral_error_p95_abs=%.6f "
+            "tracking_lateral_error_max_abs=%.6f traveled_distance=%.6f "
             "average_actual_planar_speed=%.6f commanded_linear_speed=%.6f "
             "actual_linear_speed=%.6f commanded_angular_speed=%.6f "
             "actual_angular_speed=%.6f linear_saturation_ratio=%.6f "
-            "angular_saturation_ratio=%.6f lookahead_distance=%.6f "
+            "angular_saturation_ratio=%.6f raw_linear_command=%.6f "
+            "raw_angular_command=%.6f tracking_linear_saturation_ratio=%.6f "
+            "tracking_angular_saturation_ratio=%.6f "
+            "alignment_angular_saturation_ratio=%.6f "
+            "tracking_raw_angular_saturation_ratio=%.6f lookahead_distance=%.6f "
             "theta_trj=%.6f kappa=%.6f carrot_x=%.6f carrot_y=%.6f "
             "elapsed_tracking_time=%.6f",
-            plan_revision_, tracking_statistics_.sample_count, lateral_error,
+            plan_revision_, alignment_phase ? "START_ALIGNMENT" : "TRACKING",
+            tracking_statistics_.sample_count, tracking_statistics_.tracking_sample_count,
+            tracking_statistics_.alignment_sample_count, lateral_error,
             lateral_error_rms, p95, tracking_statistics_.maximum_absolute_lateral_error,
+            tracking_lateral_error_rms, tracking_lateral_error_p95,
+            tracking_statistics_.tracking_maximum_absolute_lateral_error,
             tracking_statistics_.traveled_distance, average_actual_planar_speed,
             command.twist.linear.x, actual_planar_speed, command.twist.angular.z,
             velocity.angular.z, linear_saturation_ratio, angular_saturation_ratio,
+            raw_command.x(), raw_command.y(), tracking_linear_saturation_ratio,
+            tracking_angular_saturation_ratio, alignment_angular_saturation_ratio,
+            tracking_raw_angular_saturation_ratio,
             lookahead_distance, theta_trj, kappa, carrot.point.x, carrot.point.y,
             elapsed_tracking_time);
     last_diagnostics_log_time_seconds_ = now_seconds;
@@ -759,6 +840,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         throw nav2_core::NoValidControl(
                 controller_plugin_name + " could not compute a finite robot heading");
     }
+    Eigen::Vector2d raw_command = Eigen::Vector2d::Zero();
     
 #if 0
     // position reached
@@ -825,10 +907,11 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
 
         if (start_heading_alignment_active_)
         {
+            raw_command[1] = start_heading_kp_ * start_heading_error;
             cmd_vel.twist.linear.x = 0.0;
             cmd_vel.twist.linear.y = 0.0;
             cmd_vel.twist.angular.z = angularRegularization(
-                    velocity, start_heading_kp_ * start_heading_error);
+                    velocity, raw_command[1]);
         }
         else
         {
@@ -848,6 +931,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 throw nav2_core::NoValidControl(
                         controller_plugin_name + " produced a non-finite raw control command");
             }
+            raw_command = u;
 
             cmd_vel.twist.linear.x = std::max(
                     0.0, linearRegularization(velocity, u[0]));
@@ -882,7 +966,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         carrot_pub_->publish(target_ps_map);
     }
     updateAndLogTrackingDiagnostics(
-            pose, velocity, cmd_vel, prune_plan, L, theta_trj, kappa, lookahead_pt);
+            pose, velocity, cmd_vel, raw_command, start_heading_alignment_active_,
+            prune_plan, L, theta_trj, kappa, lookahead_pt);
 
     return cmd_vel;
 }
@@ -962,16 +1047,10 @@ Eigen::Vector2d PidTrackingController::UseModelPidControl(Eigen::Vector3d  s,
 {
     Eigen::Vector2d u;
     Eigen::Vector3d e(s_d - s);
-    Eigen::Vector2d sx_dot(k_ * e[0], k_ * e[1]);
-    // LOG_INFO("sx_dot:  {}, {}", k_ * e[0], k_ * e[1]);
-    Eigen::Matrix2d R_inv;
-    R_inv << cos(s[2]), sin(s[2]), -sin(s[2]) / l_, cos(s[2]) / l_;
-
-    std::ostringstream oss_inv;
-    oss_inv << std::fixed << std::setprecision(2) << cos(s[2]) << "  " << sin(s[2]) << "  " << -sin(s[2]) / l_ << "  " << cos(s[2]) / l_;
-    // LOG_INFO("R inv: {}", oss_inv.str() );
-
-    u = R_inv * sx_dot;
+    const double ex_body = cos(s[2]) * e[0] + sin(s[2]) * e[1];
+    const double ey_body = -sin(s[2]) * e[0] + cos(s[2]) * e[1];
+    u[0] = model_k_v_ * ex_body;
+    u[1] = model_k_w_ / l_ * ey_body;
     
     return u;
 }

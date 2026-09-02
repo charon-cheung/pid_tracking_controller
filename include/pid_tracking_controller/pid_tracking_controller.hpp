@@ -95,6 +95,15 @@ private:
     std::size_t sample_count{0};
     std::size_t linear_saturation_count{0};
     std::size_t angular_saturation_count{0};
+    std::size_t tracking_sample_count{0};
+    std::size_t tracking_linear_saturation_count{0};
+    std::size_t tracking_angular_saturation_count{0};
+    std::size_t tracking_raw_angular_saturation_count{0};
+    std::size_t alignment_sample_count{0};
+    std::size_t alignment_angular_saturation_count{0};
+    double tracking_sum_squared_lateral_error{0.0};
+    double tracking_maximum_absolute_lateral_error{0.0};
+    std::vector<double> tracking_absolute_lateral_error_samples;
     double sum_squared_lateral_error{0.0};
     double maximum_absolute_lateral_error{0.0};
     double traveled_distance{0.0};
@@ -109,6 +118,8 @@ private:
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity,
     const geometry_msgs::msg::TwistStamped & command,
+    const Eigen::Vector2d & raw_command,
+    bool alignment_phase,
     const std::vector<geometry_msgs::msg::PoseStamped> & prune_plan,
     double lookahead_distance,
     double theta_trj,
@@ -142,7 +153,8 @@ private:
   double k_w_i_{0.01};
   double k_w_d_{0.10};
   double k_theta_{0.5};
-  double k_{1.0};
+  double model_k_v_{1.0};
+  double model_k_w_{1.0};
   double l_{0.2};
 
   bool enable_start_heading_alignment_{true};

@@ -13,9 +13,10 @@ class PidTrackingControllerTestAccess
 {
 public:
   static void setModelParameters(
-    PidTrackingController & controller, double k, double l)
+    PidTrackingController & controller, double k_v, double k_w, double l)
   {
-    controller.k_ = k;
+    controller.model_k_v_ = k_v;
+    controller.model_k_w_ = k_w;
     controller.l_ = l;
   }
 
@@ -84,6 +85,34 @@ public:
     const PidTrackingController & controller)
   {
     return controller.global_plan_;
+  }
+
+  static std::size_t trackingSampleCount(const PidTrackingController & controller)
+  {
+    return controller.tracking_statistics_.tracking_sample_count;
+  }
+
+  static std::size_t alignmentSampleCount(const PidTrackingController & controller)
+  {
+    return controller.tracking_statistics_.alignment_sample_count;
+  }
+
+  static double trackingSumSquaredLateralError(
+    const PidTrackingController & controller)
+  {
+    return controller.tracking_statistics_.tracking_sum_squared_lateral_error;
+  }
+
+  static double trackingMaximumAbsoluteLateralError(
+    const PidTrackingController & controller)
+  {
+    return controller.tracking_statistics_.tracking_maximum_absolute_lateral_error;
+  }
+
+  static const std::vector<double> & trackingAbsoluteLateralErrorSamples(
+    const PidTrackingController & controller)
+  {
+    return controller.tracking_statistics_.tracking_absolute_lateral_error_samples;
   }
 };
 

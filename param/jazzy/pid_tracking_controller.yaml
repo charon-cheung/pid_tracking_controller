@@ -13,10 +13,10 @@ controller_server:
       lookahead_time: 0.6
       min_lookahead_dist: 0.3
       max_lookahead_dist: 0.9
-      max_v: 0.6
+      max_v: 0.8
       min_v: 0.05
       max_v_inc: 0.5
-      max_w: 0.6
+      max_w: 0.6  # 0.6
       min_w: 0.0
       max_w_inc: 0.2
       k_v_p: 2.0
@@ -26,10 +26,11 @@ controller_server:
       k_w_i: 0.01
       k_w_d: 0.10
       k_theta: 0.5
-      k: 2.0  # 1.0
+      model_k_v: 1.9
+      model_k_w: 2.1
       l: 0.2
       enable_start_heading_alignment: true
-      start_heading_enter_tolerance: 0.6
+      start_heading_enter_tolerance: 0.3
       start_heading_exit_tolerance: 0.15
       start_heading_kp: 1.0
       pid_frequency: 15.0
