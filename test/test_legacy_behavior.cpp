@@ -1,42 +1,49 @@
+#include <cmath>
+#include <limits>
+
 #include "gtest/gtest.h"
 
 #include "controller_test_access.hpp"
+#include "nav2_core/controller_exceptions.hpp"
 
 namespace pid_tracking_controller
 {
 
-TEST(LegacyBehavior, equalModelGainsKeepLegacyOutput)
+TEST(LegacyBehavior, modelControllerUsesIndependentCruiseSpeed)
 {
   PidTrackingController controller;
-  PidTrackingControllerTestAccess::setModelParameters(controller, 1.6, 1.6, 0.2);
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.7, 1.9, 0.2);
+  PidTrackingControllerTestAccess::setModelSpeedParameters(controller, 0.51, 0.1, 0.6);
 
   const Eigen::Vector2d output = controller.UseModelPidControl(
     Eigen::Vector3d(0.0, 0.0, 0.0),
-    Eigen::Vector3d(0.3, 0.1, 1.2),
+    Eigen::Vector3d(0.3, 0.0, 1.2),
     Eigen::Vector2d(0.6, -0.4));
 
-  EXPECT_NEAR(output.x(), 0.48, 1e-12);
-  EXPECT_NEAR(output.y(), 0.8, 1e-12);
+  EXPECT_NEAR(output.x(), 0.51, 1e-12);
+  EXPECT_NEAR(output.y(), 0.0, 1e-12);
 }
 
-TEST(LegacyBehavior, independentModelGainsOnlyIncreaseAngularOutput)
+TEST(LegacyBehavior, modelControllerLimitsAngularDemandByScalingBothCommands)
 {
   PidTrackingController controller;
-  PidTrackingControllerTestAccess::setModelParameters(controller, 1.6, 2.0, 0.2);
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.7, 1.9, 0.2);
+  PidTrackingControllerTestAccess::setModelSpeedParameters(controller, 0.51, 0.1, 0.6);
 
   const Eigen::Vector2d output = controller.UseModelPidControl(
     Eigen::Vector3d(0.0, 0.0, 0.0),
-    Eigen::Vector3d(0.3, 0.1, 0.0),
+    Eigen::Vector3d(0.2819077862357725, 0.1026060429977006, 0.0),
     Eigen::Vector2d::Zero());
 
-  EXPECT_NEAR(output.x(), 0.48, 1e-12);
-  EXPECT_NEAR(output.y(), 1.0, 1e-12);
+  EXPECT_NEAR(output.x(), 0.245826927003835, 1e-12);
+  EXPECT_NEAR(output.y(), 0.5, 1e-12);
 }
 
 TEST(LegacyBehavior, splitModelGainsAreInvariantToWorldFrameRotation)
 {
   PidTrackingController controller;
-  PidTrackingControllerTestAccess::setModelParameters(controller, 1.6, 2.0, 0.2);
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.7, 1.9, 0.2);
+  PidTrackingControllerTestAccess::setModelSpeedParameters(controller, 0.51, 0.1, 0.6);
   const double half_pi = std::acos(-1.0) / 2.0;
 
   const Eigen::Vector2d unrotated = controller.UseModelPidControl(
@@ -50,6 +57,21 @@ TEST(LegacyBehavior, splitModelGainsAreInvariantToWorldFrameRotation)
 
   EXPECT_NEAR(rotated.x(), unrotated.x(), 1e-12);
   EXPECT_NEAR(rotated.y(), unrotated.y(), 1e-12);
+}
+
+TEST(LegacyBehavior, nonFiniteModelIntermediateThrowsNoValidControl)
+{
+  PidTrackingController controller;
+  PidTrackingControllerTestAccess::setModelParameters(controller, 1.7, 1.9, 0.2);
+  PidTrackingControllerTestAccess::setModelSpeedParameters(controller, 0.51, 0.1, 0.6);
+  const double maximum = std::numeric_limits<double>::max();
+
+  EXPECT_THROW(
+    controller.UseModelPidControl(
+      Eigen::Vector3d(-maximum, 0.0, 0.0),
+      Eigen::Vector3d(maximum, 0.0, 0.0),
+      Eigen::Vector2d::Zero()),
+    nav2_core::NoValidControl);
 }
 
 TEST(LegacyBehavior, lookaheadKeepsSpeedTimeClamp)

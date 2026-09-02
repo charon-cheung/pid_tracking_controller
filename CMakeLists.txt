@@ -41,6 +41,7 @@ set(dependencies
 
 add_library(${PROJECT_NAME} SHARED
   src/pid_tracking_controller.cpp
+  src/legacy_carrot_velocity_planner.cpp
   common/src/geometry/vec2d.cpp
   common/src/math/math_helper.cpp
 )
@@ -97,6 +98,16 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/common/include
   )
   target_link_libraries(test_math_helper
+    ${PROJECT_NAME}
+  )
+
+  ament_add_gtest(test_legacy_carrot_velocity_planner
+    test/test_legacy_carrot_velocity_planner.cpp
+  )
+  target_include_directories(test_legacy_carrot_velocity_planner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(test_legacy_carrot_velocity_planner
     ${PROJECT_NAME}
   )
 

@@ -17,6 +17,7 @@
 #include "angles/angles.h"
 #include "common/geometry/vec2d.h"
 #include "common/math/math_helper.h"
+#include "legacy_carrot_velocity_planner.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -74,6 +75,42 @@ bool eigenVectorIsFinite(const Eigen::Vector2d& vector)
     return vector.allFinite();
 }
 
+LegacyCarrotVelocityPlannerConfig makeLegacyCarrotVelocityPlannerConfig(
+  double model_k_v, double model_k_w, double characteristic_length,
+  double cruise_speed, double max_angular_speed, double angular_speed_reserve)
+{
+    LegacyCarrotVelocityPlannerConfig config;
+    config.model_k_v = model_k_v;
+    config.model_k_w = model_k_w;
+    config.characteristic_length = characteristic_length;
+    config.cruise_speed = cruise_speed;
+    config.max_angular_speed = max_angular_speed;
+    config.angular_speed_reserve = angular_speed_reserve;
+    return config;
+}
+
+LegacyCarrotVelocityPlan planModelVelocity(
+  const Eigen::Vector3d & state,
+  const Eigen::Vector3d & desired_state,
+  const LegacyCarrotVelocityPlannerConfig & config)
+{
+    const Eigen::Vector3d error(desired_state - state);
+    const double ex_body =
+            cos(state[2]) * error[0] + sin(state[2]) * error[1];
+    const double ey_body =
+            -sin(state[2]) * error[0] + cos(state[2]) * error[1];
+    try
+    {
+        return planLegacyCarrotVelocity(ex_body, ey_body, config);
+    }
+    catch (const std::exception & exception)
+    {
+        throw nav2_core::NoValidControl(
+                std::string("could not produce a finite model control plan: ") +
+                exception.what());
+    }
+}
+
 }  // namespace
 
 void PidTrackingController::configure(
@@ -124,6 +161,10 @@ void PidTrackingController::configure(
     declare_parameter_if_not_declared(
       node, controller_plugin_name + ".model_k_w", rclcpp::ParameterValue(1.0));
     declare_parameter_if_not_declared(node, controller_plugin_name + ".l", rclcpp::ParameterValue(0.2) );
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".cruise_speed", rclcpp::ParameterValue(0.51));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".angular_speed_reserve", rclcpp::ParameterValue(0.10));
 
     declare_parameter_if_not_declared(
       node, controller_plugin_name + ".enable_start_heading_alignment",
@@ -168,6 +209,15 @@ void PidTrackingController::configure(
     node->get_parameter(controller_plugin_name + ".model_k_v", model_k_v_);
     node->get_parameter(controller_plugin_name + ".model_k_w", model_k_w_);
     node->get_parameter(controller_plugin_name + ".l", l_);
+    node->get_parameter(controller_plugin_name + ".cruise_speed", cruise_speed_);
+    node->get_parameter(
+      controller_plugin_name + ".angular_speed_reserve", angular_speed_reserve_);
+    node->get_parameter(controller_plugin_name + ".use_model", use_model_);
+
+    validateLegacyCarrotVelocityPlannerActivation(
+            use_model_, max_v_, makeLegacyCarrotVelocityPlannerConfig(
+                    model_k_v_, model_k_w_, l_, cruise_speed_, max_w_,
+                    angular_speed_reserve_));
 
     node->get_parameter(
       controller_plugin_name + ".enable_start_heading_alignment",
@@ -183,8 +233,6 @@ void PidTrackingController::configure(
     double pid_frequency;
     node->get_parameter(controller_plugin_name + ".pid_frequency", pid_frequency);
     d_t_ = 1 / pid_frequency;
-    
-    node->get_parameter(controller_plugin_name + ".use_model", use_model_);
     
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
@@ -277,6 +325,7 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
   const geometry_msgs::msg::Twist& velocity,
   const geometry_msgs::msg::TwistStamped& command,
   const Eigen::Vector2d& raw_command,
+  const LegacyCarrotVelocityPlan& velocity_plan,
   bool alignment_phase,
   const std::vector<geometry_msgs::msg::PoseStamped>& prune_plan,
   double lookahead_distance,
@@ -448,7 +497,12 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             "raw_angular_command=%.6f tracking_linear_saturation_ratio=%.6f "
             "tracking_angular_saturation_ratio=%.6f "
             "alignment_angular_saturation_ratio=%.6f "
-            "tracking_raw_angular_saturation_ratio=%.6f lookahead_distance=%.6f "
+            "tracking_raw_angular_saturation_ratio=%.6f carrot_alpha=%.6f "
+            "carrot_alpha_deg=%.6f carrot_sin_alpha=%.6f carrot_cos_alpha=%.6f "
+            "steering_gain_ratio=%.6f cruise_speed=%.6f "
+            "angular_planning_limit=%.6f angular_limited_speed=%.6f "
+            "reference_speed=%.6f speed_limit_reason=%s "
+            "required_angular_at_cruise=%.6f lookahead_distance=%.6f "
             "theta_trj=%.6f kappa=%.6f carrot_x=%.6f carrot_y=%.6f "
             "elapsed_tracking_time=%.6f",
             plan_revision_, alignment_phase ? "START_ALIGNMENT" : "TRACKING",
@@ -463,6 +517,13 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             raw_command.x(), raw_command.y(), tracking_linear_saturation_ratio,
             tracking_angular_saturation_ratio, alignment_angular_saturation_ratio,
             tracking_raw_angular_saturation_ratio,
+            velocity_plan.alpha, velocity_plan.alpha * 180.0 / std::acos(-1.0),
+            velocity_plan.sin_alpha, velocity_plan.cos_alpha,
+            velocity_plan.steering_gain_ratio, velocity_plan.cruise_speed,
+            velocity_plan.angular_planning_limit,
+            velocity_plan.angular_limited_speed, velocity_plan.reference_speed,
+            speedLimitReasonName(velocity_plan.speed_limit_reason),
+            velocity_plan.required_angular_at_cruise,
             lookahead_distance, theta_trj, kappa, carrot.point.x, carrot.point.y,
             elapsed_tracking_time);
     last_diagnostics_log_time_seconds_ = now_seconds;
@@ -841,6 +902,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 controller_plugin_name + " could not compute a finite robot heading");
     }
     Eigen::Vector2d raw_command = Eigen::Vector2d::Zero();
+    LegacyCarrotVelocityPlan velocity_plan;
     
 #if 0
     // position reached
@@ -923,7 +985,15 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             // ZZP: 根据参数选择
             Eigen::Vector2d u;
             if(use_model_)
-                u = UseModelPidControl(s, s_d, u_r);
+            {
+                velocity_plan = planModelVelocity(
+                        s, s_d, makeLegacyCarrotVelocityPlannerConfig(
+                                model_k_v_, model_k_w_, l_, cruise_speed_, max_w_,
+                                angular_speed_reserve_));
+                u = Eigen::Vector2d(
+                        velocity_plan.raw_linear_command,
+                        velocity_plan.raw_angular_command);
+            }
             else
                 u = NoModelPidControl(s, s_d, u_r);
             if (!eigenVectorIsFinite(u))
@@ -966,8 +1036,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         carrot_pub_->publish(target_ps_map);
     }
     updateAndLogTrackingDiagnostics(
-            pose, velocity, cmd_vel, raw_command, start_heading_alignment_active_,
-            prune_plan, L, theta_trj, kappa, lookahead_pt);
+            pose, velocity, cmd_vel, raw_command, velocity_plan,
+            start_heading_alignment_active_, prune_plan, L, theta_trj, kappa,
+            lookahead_pt);
 
     return cmd_vel;
 }
@@ -1045,13 +1116,11 @@ Eigen::Vector2d PidTrackingController::UseModelPidControl(Eigen::Vector3d  s,
                                                           Eigen::Vector3d  s_d, 
                                                           Eigen::Vector2d  /*u_r*/)
 {
-    Eigen::Vector2d u;
-    Eigen::Vector3d e(s_d - s);
-    const double ex_body = cos(s[2]) * e[0] + sin(s[2]) * e[1];
-    const double ey_body = -sin(s[2]) * e[0] + cos(s[2]) * e[1];
-    u[0] = model_k_v_ * ex_body;
-    u[1] = model_k_w_ / l_ * ey_body;
-    
+    const auto plan = planModelVelocity(
+            s, s_d, makeLegacyCarrotVelocityPlannerConfig(
+                    model_k_v_, model_k_w_, l_, cruise_speed_, max_w_,
+                    angular_speed_reserve_));
+    Eigen::Vector2d u(plan.raw_linear_command, plan.raw_angular_command);
     return u;
 }
 

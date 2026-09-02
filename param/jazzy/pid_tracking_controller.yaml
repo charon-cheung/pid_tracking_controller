@@ -26,9 +26,11 @@ controller_server:
       k_w_i: 0.01
       k_w_d: 0.10
       k_theta: 0.5
-      model_k_v: 1.9
-      model_k_w: 2.1
+      model_k_v: 1.7
+      model_k_w: 1.9
       l: 0.2
+      cruise_speed: 0.51
+      angular_speed_reserve: 0.10
       enable_start_heading_alignment: true
       start_heading_enter_tolerance: 0.3
       start_heading_exit_tolerance: 0.15

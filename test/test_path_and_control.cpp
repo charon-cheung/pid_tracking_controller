@@ -102,7 +102,7 @@ TEST_F(CommandContractTest, commandUsesMeasuredVelocityAndKeepsLateralVelocityZe
   const auto command = controller_.computeVelocityCommands(
     makeRobotPose(), measured, nullptr);
 
-  EXPECT_NEAR(command.twist.linear.x, 0.3, 1e-12);
+  EXPECT_NEAR(command.twist.linear.x, 0.5, 1e-12);
   EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
   EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
   EXPECT_EQ(command.header.frame_id, "base_link");

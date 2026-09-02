@@ -28,6 +28,7 @@ namespace pid_tracking_controller
 {
 
 class PidTrackingControllerTestAccess;
+struct LegacyCarrotVelocityPlan;
 
 class PidTrackingController : public nav2_core::Controller
 {
@@ -119,6 +120,7 @@ private:
     const geometry_msgs::msg::Twist & velocity,
     const geometry_msgs::msg::TwistStamped & command,
     const Eigen::Vector2d & raw_command,
+    const LegacyCarrotVelocityPlan & velocity_plan,
     bool alignment_phase,
     const std::vector<geometry_msgs::msg::PoseStamped> & prune_plan,
     double lookahead_distance,
@@ -156,6 +158,8 @@ private:
   double model_k_v_{1.0};
   double model_k_w_{1.0};
   double l_{0.2};
+  double cruise_speed_{0.51};
+  double angular_speed_reserve_{0.10};
 
   bool enable_start_heading_alignment_{true};
   double start_heading_enter_tolerance_{0.6};

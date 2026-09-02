@@ -20,6 +20,15 @@ public:
     controller.l_ = l;
   }
 
+  static void setModelSpeedParameters(
+    PidTrackingController & controller, double cruise_speed,
+    double angular_speed_reserve, double max_angular_speed)
+  {
+    controller.cruise_speed_ = cruise_speed;
+    controller.angular_speed_reserve_ = angular_speed_reserve;
+    controller.max_w_ = max_angular_speed;
+  }
+
   static void setLookaheadParameters(
     PidTrackingController & controller, double time, double minimum, double maximum)
   {

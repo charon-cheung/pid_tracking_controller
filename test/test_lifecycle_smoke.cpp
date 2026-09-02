@@ -165,6 +165,18 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
       log_capture.output().find("tracking_lateral_error_p95_abs="), std::string::npos);
     EXPECT_NE(
       log_capture.output().find("tracking_lateral_error_max_abs="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("carrot_alpha="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("carrot_alpha_deg="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("carrot_sin_alpha="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("carrot_cos_alpha="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("steering_gain_ratio="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("cruise_speed="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("angular_planning_limit="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("angular_limited_speed="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("reference_speed="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("speed_limit_reason=cruise"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("required_angular_at_cruise="), std::string::npos);
     EXPECT_NE(log_capture.output().find("kappa="), std::string::npos);
 
     if (costmap_configured) {
