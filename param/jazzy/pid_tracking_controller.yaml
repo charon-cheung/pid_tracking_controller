@@ -1,0 +1,36 @@
+controller_server:
+  ros__parameters:
+    controller_frequency: 15.0
+    failure_tolerance: 0.0
+    publish_zero_velocity: true
+
+    PidTrackingController:
+      plugin: "pid_tracking_controller::PidTrackingController"
+      goal_dist_tolerance: 0.05
+      rotate_tolerance: 0.5
+      base_frame: "base_link"
+      map_frame: "map"
+      lookahead_time: 0.6
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.9
+      max_v: 0.6
+      min_v: 0.05
+      max_v_inc: 0.5
+      max_w: 0.6
+      min_w: 0.0
+      max_w_inc: 0.2
+      k_v_p: 2.0
+      k_v_i: 0.01
+      k_v_d: 0.10
+      k_w_p: 1.0
+      k_w_i: 0.01
+      k_w_d: 0.10
+      k_theta: 0.5
+      k: 2.0  # 1.0
+      l: 0.2
+      enable_start_heading_alignment: true
+      start_heading_enter_tolerance: 0.6
+      start_heading_exit_tolerance: 0.15
+      start_heading_kp: 1.0
+      pid_frequency: 15.0
+      use_model: true

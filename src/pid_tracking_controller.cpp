@@ -5,129 +5,238 @@
  *	@note:
  */
 #include "pid_tracking_controller/pid_tracking_controller.hpp"
-#include "common/geometry/polygon2d.h"
-#include "common/geometry/point.h"
+
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+#include "angles/angles.h"
 #include "common/geometry/vec2d.h"
 #include "common/math/math_helper.h"
+#include "nav2_core/controller_exceptions.hpp"
+#include "nav2_util/geometry_utils.hpp"
+#include "nav2_util/node_utils.hpp"
+#include "pluginlib/class_list_macros.hpp"
+#include "tf2/LinearMath/Matrix3x3.h"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+
 #include <sstream>
 
 using namespace nav2_util::geometry_utils;
 using nav2_util::declare_parameter_if_not_declared;
 
-namespace pid_tracking_controller {
-
-PidTrackingController::PidTrackingController()
+namespace pid_tracking_controller
 {
+namespace
+{
+
+bool scalarIsFinite(double value)
+{
+    return std::isfinite(value);
 }
 
-PidTrackingController::~PidTrackingController()
+bool quaternionIsFinite(const geometry_msgs::msg::Quaternion& quaternion)
 {
+    return scalarIsFinite(quaternion.x) && scalarIsFinite(quaternion.y) &&
+           scalarIsFinite(quaternion.z) && scalarIsFinite(quaternion.w);
 }
 
-
-void PidTrackingController::configure(const rclcpp::Node::SharedPtr _node, std::string name, 
-                                      std::shared_ptr<tf2_ros::Buffer> tf,
-                                      std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
+bool pointIsFinite(const geometry_msgs::msg::Point& point)
 {
-    controller_plugin_name = name;
-    node_                = _node;
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".goal_dist_tolerance", rclcpp::ParameterValue(0.05) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".rotate_tolerance", rclcpp::ParameterValue(0.5) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".base_frame", rclcpp::ParameterValue("base_link") );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".map_frame", rclcpp::ParameterValue("map") );
-    
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".lookahead_time", rclcpp::ParameterValue(0.5) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".min_lookahead_dist", rclcpp::ParameterValue(0.3) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".max_lookahead_dist", rclcpp::ParameterValue(0.9) );
-    
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".max_v", rclcpp::ParameterValue(0.7));   // 0.46
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".min_v", rclcpp::ParameterValue(0.05) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".max_v_inc", rclcpp::ParameterValue(0.5) );
-    
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".max_w", rclcpp::ParameterValue(0.2));   // 1.57
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".min_w", rclcpp::ParameterValue(0.0) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".max_w_inc", rclcpp::ParameterValue(0.2) );  // 1.57
-    
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_v_p", rclcpp::ParameterValue(2.00) );   // 1
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_v_i", rclcpp::ParameterValue(0.01) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_v_d", rclcpp::ParameterValue(0.10) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_w_p", rclcpp::ParameterValue(1.00) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_w_i", rclcpp::ParameterValue(0.01) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_w_d", rclcpp::ParameterValue(0.10) );
-    
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k_theta", rclcpp::ParameterValue(0.5));
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".k", rclcpp::ParameterValue(1.0) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".l", rclcpp::ParameterValue(0.2) );
-    
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".pid_frequency", rclcpp::ParameterValue(15.0) );
-    declare_parameter_if_not_declared(node_, controller_plugin_name + ".use_model", rclcpp::ParameterValue(true) );
-    
-    node_->get_parameter(controller_plugin_name + ".goal_dist_tolerance", goal_dist_tol_);
-    node_->get_parameter(controller_plugin_name + ".rotate_tolerance", rotate_tol_);
-    node_->get_parameter(controller_plugin_name + ".base_frame", base_frame_);
-    node_->get_parameter(controller_plugin_name + ".map_frame", map_frame_);
-    
-    
-    node_->get_parameter(controller_plugin_name + ".lookahead_time", lookahead_time_);
-    node_->get_parameter(controller_plugin_name + ".min_lookahead_dist", min_lookahead_dist_);
-    node_->get_parameter(controller_plugin_name + ".max_lookahead_dist", max_lookahead_dist_);
-    node_->get_parameter(controller_plugin_name + ".max_v", max_v_);
-    node_->get_parameter(controller_plugin_name + ".min_v", min_v_);
-    node_->get_parameter(controller_plugin_name + ".max_v_inc", max_v_inc_);
-    
-    node_->get_parameter(controller_plugin_name + ".max_w", max_w_);
-    node_->get_parameter(controller_plugin_name + ".min_w", min_w_);
-    node_->get_parameter(controller_plugin_name + ".max_w_inc", max_w_inc_);
-    
-    node_->get_parameter(controller_plugin_name + ".k_v_p", k_v_p_);
-    node_->get_parameter(controller_plugin_name + ".k_v_i", k_v_i_);
-    node_->get_parameter(controller_plugin_name + ".k_v_d", k_v_d_);
-    node_->get_parameter(controller_plugin_name + ".k_w_p", k_w_p_);
-    node_->get_parameter(controller_plugin_name + ".k_w_i", k_w_i_);
-    node_->get_parameter(controller_plugin_name + ".k_w_d", k_w_d_);
-    
-    node_->get_parameter(controller_plugin_name + ".k_theta", k_theta_);
-    node_->get_parameter(controller_plugin_name + ".k", k_);
-    node_->get_parameter(controller_plugin_name + ".l", l_);
-    
+    return scalarIsFinite(point.x) && scalarIsFinite(point.y) && scalarIsFinite(point.z);
+}
+
+bool poseIsFinite(const geometry_msgs::msg::PoseStamped& pose)
+{
+    return pointIsFinite(pose.pose.position) && quaternionIsFinite(pose.pose.orientation);
+}
+
+bool pathIsFinite(const nav_msgs::msg::Path& path)
+{
+    return std::all_of(path.poses.begin(), path.poses.end(), poseIsFinite);
+}
+
+bool twistIsFinite(const geometry_msgs::msg::Twist& twist)
+{
+    return scalarIsFinite(twist.linear.x) && scalarIsFinite(twist.linear.y) &&
+           scalarIsFinite(twist.linear.z) && scalarIsFinite(twist.angular.x) &&
+           scalarIsFinite(twist.angular.y) && scalarIsFinite(twist.angular.z);
+}
+
+bool eigenVectorIsFinite(const Eigen::Vector2d& vector)
+{
+    return vector.allFinite();
+}
+
+}  // namespace
+
+void PidTrackingController::configure(
+  const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
+  std::string name,
+  std::shared_ptr<tf2_ros::Buffer> tf,
+  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
+{
+    const auto node = parent.lock();
+    if (!node) {
+        throw std::runtime_error("Unable to lock lifecycle node in PidTrackingController");
+    }
+    if (!costmap_ros) {
+        throw std::runtime_error("PidTrackingController requires a valid local costmap");
+    }
+
+    controller_plugin_name = std::move(name);
+    logger_ = node->get_logger();
+    clock_ = node->get_clock();
+    tf_ = std::move(tf);
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".goal_dist_tolerance", rclcpp::ParameterValue(0.05) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".rotate_tolerance", rclcpp::ParameterValue(0.5) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".base_frame", rclcpp::ParameterValue("base_link") );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".map_frame", rclcpp::ParameterValue("map") );
+
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".lookahead_time", rclcpp::ParameterValue(0.5) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".min_lookahead_dist", rclcpp::ParameterValue(0.3) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".max_lookahead_dist", rclcpp::ParameterValue(0.9) );
+
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".max_v", rclcpp::ParameterValue(0.7));   // 0.46
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".min_v", rclcpp::ParameterValue(0.05) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".max_v_inc", rclcpp::ParameterValue(0.5) );
+
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".max_w", rclcpp::ParameterValue(0.2));   // 1.57
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".min_w", rclcpp::ParameterValue(0.0) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".max_w_inc", rclcpp::ParameterValue(0.2) );  // 1.57
+
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_v_p", rclcpp::ParameterValue(2.00) );   // 1
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_v_i", rclcpp::ParameterValue(0.01) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_v_d", rclcpp::ParameterValue(0.10) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_w_p", rclcpp::ParameterValue(1.00) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_w_i", rclcpp::ParameterValue(0.01) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_w_d", rclcpp::ParameterValue(0.10) );
+
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k_theta", rclcpp::ParameterValue(0.5));
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".k", rclcpp::ParameterValue(1.0) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".l", rclcpp::ParameterValue(0.2) );
+
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".enable_start_heading_alignment",
+      rclcpp::ParameterValue(true));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".start_heading_enter_tolerance",
+      rclcpp::ParameterValue(0.6));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".start_heading_exit_tolerance",
+      rclcpp::ParameterValue(0.15));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".start_heading_kp", rclcpp::ParameterValue(1.0));
+
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".pid_frequency", rclcpp::ParameterValue(15.0) );
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".use_model", rclcpp::ParameterValue(true) );
+
+    node->get_parameter(controller_plugin_name + ".goal_dist_tolerance", goal_dist_tol_);
+    node->get_parameter(controller_plugin_name + ".rotate_tolerance", rotate_tol_);
+    node->get_parameter(controller_plugin_name + ".base_frame", base_frame_);
+    node->get_parameter(controller_plugin_name + ".map_frame", map_frame_);
+
+
+    node->get_parameter(controller_plugin_name + ".lookahead_time", lookahead_time_);
+    node->get_parameter(controller_plugin_name + ".min_lookahead_dist", min_lookahead_dist_);
+    node->get_parameter(controller_plugin_name + ".max_lookahead_dist", max_lookahead_dist_);
+    node->get_parameter(controller_plugin_name + ".max_v", max_v_);
+    node->get_parameter(controller_plugin_name + ".min_v", min_v_);
+    node->get_parameter(controller_plugin_name + ".max_v_inc", max_v_inc_);
+
+    node->get_parameter(controller_plugin_name + ".max_w", max_w_);
+    node->get_parameter(controller_plugin_name + ".min_w", min_w_);
+    node->get_parameter(controller_plugin_name + ".max_w_inc", max_w_inc_);
+
+    node->get_parameter(controller_plugin_name + ".k_v_p", k_v_p_);
+    node->get_parameter(controller_plugin_name + ".k_v_i", k_v_i_);
+    node->get_parameter(controller_plugin_name + ".k_v_d", k_v_d_);
+    node->get_parameter(controller_plugin_name + ".k_w_p", k_w_p_);
+    node->get_parameter(controller_plugin_name + ".k_w_i", k_w_i_);
+    node->get_parameter(controller_plugin_name + ".k_w_d", k_w_d_);
+
+    node->get_parameter(controller_plugin_name + ".k_theta", k_theta_);
+    node->get_parameter(controller_plugin_name + ".k", k_);
+    node->get_parameter(controller_plugin_name + ".l", l_);
+
+    node->get_parameter(
+      controller_plugin_name + ".enable_start_heading_alignment",
+      enable_start_heading_alignment_);
+    node->get_parameter(
+      controller_plugin_name + ".start_heading_enter_tolerance",
+      start_heading_enter_tolerance_);
+    node->get_parameter(
+      controller_plugin_name + ".start_heading_exit_tolerance",
+      start_heading_exit_tolerance_);
+    node->get_parameter(controller_plugin_name + ".start_heading_kp", start_heading_kp_);
+
     double pid_frequency;
-    node_->get_parameter(controller_plugin_name + ".pid_frequency", pid_frequency);
+    node->get_parameter(controller_plugin_name + ".pid_frequency", pid_frequency);
     d_t_ = 1 / pid_frequency;
     
-    node_->get_parameter(controller_plugin_name + ".use_model", use_model_);
+    node->get_parameter(controller_plugin_name + ".use_model", use_model_);
     
-    costmap_ros_ = costmap_ros;
+    costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
     
     goal_reached_ = false;
     e_v_ = i_v_ = 0.0;
     e_w_ = i_w_ = 0.0;
-    goal_x_ = goal_y_ = DBL_MAX;
-    m_clock = _node->get_clock();
-    
-    carrot_pub = std::make_shared<Msg::rcmsg_pub<geometry_msgs::msg::PoseStamped>>("/carrot");
-    odom_sub_ = std::make_unique<nav_2d_utils::OdomSubscriber>(_node);
+    goal_x_ = goal_y_ = std::numeric_limits<double>::max();
+
+    carrot_pub_ = node->create_publisher<geometry_msgs::msg::PoseStamped>(
+      "pid_tracking_controller/carrot", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
+
+    tracking_statistics_ = TrackingStatistics();
+    plan_revision_ = 0;
+    tracking_start_time_valid_ = false;
+    force_diagnostics_log_ = true;
+    start_heading_check_pending_ = false;
+    start_heading_alignment_active_ = false;
 }
 
 void PidTrackingController::activate()
 {
+    if (carrot_pub_) {
+        carrot_pub_->on_activate();
+    }
+    force_diagnostics_log_ = true;
 }
 
 void PidTrackingController::deactivate()
 {
+    if (carrot_pub_) {
+        carrot_pub_->on_deactivate();
+    }
 }
 
 void PidTrackingController::cleanup()
 {
-    
+    carrot_pub_.reset();
+    costmap_ = nullptr;
+    costmap_ros_.reset();
+    tf_.reset();
+    clock_.reset();
 }
 
 // 先执行 setPlan，再执行旋转，转到位后，再执行 computeVelocityCommands
 void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
-    LOG_INFO("PidTracking Controller setPlan");
+    RCLCPP_INFO(logger_, "PidTrackingController received a path");
     global_plan_.clear();
+    if (orig_global_plan.poses.empty() || !pathIsFinite(orig_global_plan))
+    {
+        throw nav2_core::InvalidPath(
+                controller_plugin_name + " received an empty or non-finite path");
+    }
     global_plan_ = orig_global_plan.poses;
+    ++plan_revision_;
     // receive a plan for a new goal
     if (goal_x_ != global_plan_.back().pose.position.x || goal_y_ != global_plan_.back().pose.position.y)
     {
@@ -138,17 +247,152 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
         
         e_v_ = i_v_ = 0.0;
         e_w_ = i_w_ = 0.0;
+        start_heading_check_pending_ = enable_start_heading_alignment_;
+        start_heading_alignment_active_ = false;
+        resetTrackingStatistics();
     }
     std::ostringstream oss_goal;
     oss_goal << std::fixed << std::setprecision(2) << goal_x_ << ", " << goal_y_ << ",  " << goal_theta_;
     // LOG_INFO("PID goal: ({})", oss_goal.str() );
 }
 
+void PidTrackingController::resetTrackingStatistics()
+{
+    tracking_statistics_ = TrackingStatistics();
+    tracking_start_time_valid_ = false;
+    if (clock_)
+    {
+        tracking_start_time_seconds_ = clock_->now().seconds();
+        tracking_start_time_valid_ = true;
+    }
+    force_diagnostics_log_ = true;
+}
+
+void PidTrackingController::updateAndLogTrackingDiagnostics(
+  const geometry_msgs::msg::PoseStamped& pose,
+  const geometry_msgs::msg::Twist& velocity,
+  const geometry_msgs::msg::TwistStamped& command,
+  const std::vector<geometry_msgs::msg::PoseStamped>& prune_plan,
+  double lookahead_distance,
+  double theta_trj,
+  double kappa,
+  const geometry_msgs::msg::PointStamped& carrot)
+{
+    double lateral_error = 0.0;
+    bool segment_found = false;
+    for (std::size_t index = 0; index + 1 < prune_plan.size(); ++index)
+    {
+        const auto& start = prune_plan[index].pose.position;
+        const auto& end = prune_plan[index + 1].pose.position;
+        const double dx = end.x - start.x;
+        const double dy = end.y - start.y;
+        const double length_squared = dx * dx + dy * dy;
+        if (length_squared <= rmp::common::math::kMathEpsilon)
+        {
+            continue;
+        }
+
+        const double relative_x = pose.pose.position.x - start.x;
+        const double relative_y = pose.pose.position.y - start.y;
+        const double projection = std::clamp(
+                (relative_x * dx + relative_y * dy) / length_squared, 0.0, 1.0);
+        const double projected_x = start.x + projection * dx;
+        const double projected_y = start.y + projection * dy;
+        const double distance = std::hypot(
+                pose.pose.position.x - projected_x, pose.pose.position.y - projected_y);
+        const double cross = dx * relative_y - dy * relative_x;
+        lateral_error = cross < 0.0 ? -distance : distance;
+        segment_found = true;
+        break;
+    }
+    if (!segment_found)
+    {
+        lateral_error = std::hypot(
+                pose.pose.position.x - prune_plan.front().pose.position.x,
+                pose.pose.position.y - prune_plan.front().pose.position.y);
+    }
+
+    const double absolute_lateral_error = std::abs(lateral_error);
+    const double actual_planar_speed = std::hypot(velocity.linear.x, velocity.linear.y);
+    ++tracking_statistics_.sample_count;
+    tracking_statistics_.sum_squared_lateral_error += lateral_error * lateral_error;
+    tracking_statistics_.maximum_absolute_lateral_error = std::max(
+            tracking_statistics_.maximum_absolute_lateral_error, absolute_lateral_error);
+    tracking_statistics_.absolute_lateral_error_samples.push_back(absolute_lateral_error);
+    tracking_statistics_.sum_actual_planar_speed += actual_planar_speed;
+    if (tracking_statistics_.previous_position_valid)
+    {
+        tracking_statistics_.traveled_distance += std::hypot(
+                pose.pose.position.x - tracking_statistics_.previous_position.x,
+                pose.pose.position.y - tracking_statistics_.previous_position.y);
+    }
+    tracking_statistics_.previous_position = pose.pose.position;
+    tracking_statistics_.previous_position_valid = true;
+    if (std::abs(command.twist.linear.x) >= max_v_ - rmp::common::math::kMathEpsilon)
+    {
+        ++tracking_statistics_.linear_saturation_count;
+    }
+    if (std::abs(command.twist.angular.z) >= max_w_ - rmp::common::math::kMathEpsilon)
+    {
+        ++tracking_statistics_.angular_saturation_count;
+    }
+
+    const double now_seconds = clock_->now().seconds();
+    if (!tracking_start_time_valid_)
+    {
+        tracking_start_time_seconds_ = now_seconds;
+        tracking_start_time_valid_ = true;
+    }
+    if (!force_diagnostics_log_ && now_seconds >= last_diagnostics_log_time_seconds_ &&
+        now_seconds - last_diagnostics_log_time_seconds_ < 1.0)
+    {
+        return;
+    }
+
+    auto samples = tracking_statistics_.absolute_lateral_error_samples;
+    const std::size_t p95_index =
+            static_cast<std::size_t>(std::ceil(0.95 * samples.size())) - 1u;
+    std::nth_element(samples.begin(), samples.begin() + p95_index, samples.end());
+    const double p95 = samples[p95_index];
+    const double sample_count = static_cast<double>(tracking_statistics_.sample_count);
+    const double lateral_error_rms = std::sqrt(
+            tracking_statistics_.sum_squared_lateral_error / sample_count);
+    const double average_actual_planar_speed =
+            tracking_statistics_.sum_actual_planar_speed / sample_count;
+    const double linear_saturation_ratio =
+            static_cast<double>(tracking_statistics_.linear_saturation_count) / sample_count;
+    const double angular_saturation_ratio =
+            static_cast<double>(tracking_statistics_.angular_saturation_count) / sample_count;
+    const double elapsed_tracking_time = std::max(
+            0.0, now_seconds - tracking_start_time_seconds_);
+
+    RCLCPP_INFO(
+            logger_,
+            "PID_LOG plan_revision=%zu sample_count=%zu lateral_error=%.6f "
+            "lateral_error_rms=%.6f lateral_error_p95_abs=%.6f "
+            "lateral_error_max_abs=%.6f traveled_distance=%.6f "
+            "average_actual_planar_speed=%.6f commanded_linear_speed=%.6f "
+            "actual_linear_speed=%.6f commanded_angular_speed=%.6f "
+            "actual_angular_speed=%.6f linear_saturation_ratio=%.6f "
+            "angular_saturation_ratio=%.6f lookahead_distance=%.6f "
+            "theta_trj=%.6f kappa=%.6f carrot_x=%.6f carrot_y=%.6f "
+            "elapsed_tracking_time=%.6f",
+            plan_revision_, tracking_statistics_.sample_count, lateral_error,
+            lateral_error_rms, p95, tracking_statistics_.maximum_absolute_lateral_error,
+            tracking_statistics_.traveled_distance, average_actual_planar_speed,
+            command.twist.linear.x, actual_planar_speed, command.twist.angular.z,
+            velocity.angular.z, linear_saturation_ratio, angular_saturation_ratio,
+            lookahead_distance, theta_trj, kappa, carrot.point.x, carrot.point.y,
+            elapsed_tracking_time);
+    last_diagnostics_log_time_seconds_ = now_seconds;
+    force_diagnostics_log_ = false;
+}
+
 bool PidTrackingController::isGoalReached()
 {
     if (goal_reached_)
     {
-        LOG_INFO("\033[42;37m PID Goal Reached !\033[0m");
+        RCLCPP_INFO(logger_, "PidTrackingController goal reached");
         return true;
     }
     return false;
@@ -194,11 +438,12 @@ bool PidTrackingController::shouldRotateToPath(double angle_to_path, double tole
  * @param v_d           desired velocity magnitude
  * @return v            regulated linear velocity
  */
-double PidTrackingController::linearRegularization(nav_2d_msgs::msg::Twist2D& odom_twist, double v_d)
+double PidTrackingController::linearRegularization(
+  const geometry_msgs::msg::Twist & measured_twist, double v_d)
 {
     std::ostringstream oss_v;
     
-    double v = std::hypot(odom_twist.x, odom_twist.y);
+    double v = std::hypot(measured_twist.linear.x, measured_twist.linear.y);
     double v_inc = v_d - v;
     oss_v << std::fixed << std::setprecision(2) << "v: " << v << ", " <<"v_d: " << v_d << ", " << "v_inc: " << v_inc;
     if (std::fabs(v_inc) > max_v_inc_)
@@ -222,12 +467,13 @@ double PidTrackingController::linearRegularization(nav_2d_msgs::msg::Twist2D& od
  * @param w_d           desired angular velocity
  * @return w            regulated angular velocity
  */
-double PidTrackingController::angularRegularization(nav_2d_msgs::msg::Twist2D& odom_twist, double w_d)
+double PidTrackingController::angularRegularization(
+  const geometry_msgs::msg::Twist & measured_twist, double w_d)
 {
     if (std::fabs(w_d) > max_w_)
         w_d = std::copysign(max_w_, w_d);
     
-    double w = odom_twist.theta;
+    double w = measured_twist.angular.z;
     double w_inc = w_d - w;
     // LOG_INFO("w_d:{}, w_inc: {}", w_inc);
     if (std::fabs(w_inc) > max_w_inc_)
@@ -255,7 +501,7 @@ double PidTrackingController::getLookAheadDistance(double vt)
     return rmp::common::math::clamp(lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
 }
 
-void PidTrackingController::setSpeedLimit(const double& speed_limit, const bool& percentage)
+void PidTrackingController::setSpeedLimit(const double &, const bool &)
 {
     
 }
@@ -273,6 +519,11 @@ void PidTrackingController::getLookAheadPoint(double lookahead_dist, geometry_ms
                                               const std::vector<geometry_msgs::msg::PoseStamped>& prune_plan,
                                               geometry_msgs::msg::PointStamped& pt, double& theta, double& kappa)
 {
+    if (prune_plan.empty())
+    {
+        throw nav2_core::InvalidPath(controller_plugin_name + " has no path for carrot selection");
+    }
+
     double rx = robot_pose_global.pose.position.x;
     double ry = robot_pose_global.pose.position.y;
     
@@ -319,6 +570,11 @@ void PidTrackingController::getLookAheadPoint(double lookahead_dist, geometry_ms
         
         std::vector<rmp::common::geometry::Vec2d> i_points =
                 rmp::common::math::circleSegmentIntersection(prev_p, goal_p, lookahead_dist);
+        if (i_points.empty())
+        {
+            throw nav2_core::NoValidControl(
+                    controller_plugin_name + " could not compute a finite lookahead carrot");
+        }
         
         double dist_to_goal = std::numeric_limits<double>::max();
         for (const auto& i_point : i_points)
@@ -330,6 +586,11 @@ void PidTrackingController::getLookAheadPoint(double lookahead_dist, geometry_ms
                 pt.point.x = i_point.x() + rx;
                 pt.point.y = i_point.y() + ry;
             }
+        }
+        if (dist_to_goal == std::numeric_limits<double>::max())
+        {
+            throw nav2_core::NoValidControl(
+                    controller_plugin_name + " could not select a finite lookahead carrot");
         }
         
         auto next_pose_it = std::next(goal_pose_it);
@@ -399,7 +660,7 @@ std::vector<geometry_msgs::msg::PoseStamped> PidTrackingController::prune(const 
         return min_iter;
     };
     auto closest_pose_upper_bound = firstIntegratedDistance(global_plan_.begin(), global_plan_.end(), calPoseDistance,
-                                                            costmap_ros_->getCostmap()->getSizeInMetersX() / 2.0);
+                                                            costmap_->getSizeInMetersX() / 2.0);
     // find the closest pose on the path to the robot
     auto transform_begin =
             getMinFuncVal(global_plan_.begin(), closest_pose_upper_bound,
@@ -420,6 +681,21 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                                                                                 const geometry_msgs::msg::Twist& velocity,
                                                                                 nav2_core::GoalChecker* /*goal_checker*/)
 {
+    if (!poseIsFinite(pose) || !twistIsFinite(velocity))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " received a non-finite pose or velocity");
+    }
+    if (global_plan_.empty())
+    {
+        throw nav2_core::InvalidPath(controller_plugin_name + " has no path to track");
+    }
+    if (costmap_ == nullptr || !clock_)
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " is not configured for control");
+    }
+
     std::ostringstream oss_pose;
     oss_pose << std::fixed << std::setprecision(2) << pose.pose.position.x << ", " << pose.pose.position.y;
     // LOG_INFO("current pose: ({})", oss_pose.str() );
@@ -427,34 +703,62 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
     // LOG_INFO("PID input_linear: {}, input_angular: {}", velocity.linear.x, velocity.angular.z);
     geometry_msgs::msg::TwistStamped cmd_vel;
     
-    nav_2d_msgs::msg::Twist2D twist_2d = odom_sub_->getTwist();
     // calculate look-ahead distance
-    double vt = std::hypot(twist_2d.x, twist_2d.y);
-    double wt = twist_2d.theta;
-    LOG_INFO("vt: {}, wt: {}", vt, wt);
+    double vt = std::hypot(velocity.linear.x, velocity.linear.y);
+    double wt = velocity.angular.z;
     
     geometry_msgs::msg::PoseStamped current_ps_map = pose;
     std::vector<geometry_msgs::msg::PoseStamped> prune_plan = prune(current_ps_map);
+    if (prune_plan.empty())
+    {
+        throw nav2_core::InvalidPath(controller_plugin_name + " produced an empty pruned path");
+    }
     
     double L = getLookAheadDistance(vt);
+    if (!scalarIsFinite(L))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " produced a non-finite lookahead distance");
+    }
     
     // get the particular point on the path at the lookahead distance
     geometry_msgs::msg::PointStamped lookahead_pt;
     double theta_d, theta_dir, theta_trj, kappa;
     getLookAheadPoint(L, current_ps_map, prune_plan, lookahead_pt, theta_trj, kappa);
+    if (!pointIsFinite(lookahead_pt.point) || !scalarIsFinite(theta_trj) ||
+        !scalarIsFinite(kappa))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " produced a non-finite lookahead reference");
+    }
     
     geometry_msgs::msg::PoseStamped target_ps_map;
     target_ps_map.pose.position.x = lookahead_pt.point.x;
     target_ps_map.pose.position.y = lookahead_pt.point.y;
     theta_dir = atan2((target_ps_map.pose.position.y - current_ps_map.pose.position.y),
                       (target_ps_map.pose.position.x - current_ps_map.pose.position.x));
-    
-    theta_d = nav2_util::geometry_utils::normalize_angle((1 - k_theta_) * theta_trj + k_theta_ * theta_dir);
+    if (!scalarIsFinite(theta_dir))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " produced a non-finite target direction");
+    }
+
+    theta_d = angles::normalize_angle((1 - k_theta_) * theta_trj + k_theta_ * theta_dir);
+    if (!scalarIsFinite(theta_d))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " produced a non-finite target heading");
+    }
     tf2::Quaternion q;
     q.setRPY(0, 0, theta_d);
     tf2::convert(q, target_ps_map.pose.orientation);
     
     double theta = tf2::getYaw(current_ps_map.pose.orientation);
+    if (!scalarIsFinite(theta))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " could not compute a finite robot heading");
+    }
     
 #if 0
     // position reached
@@ -476,26 +780,80 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         {
             LOG_INFO("4444444444444444444444444444444");
             cmd_vel.twist.linear.x = 0.0;
-            cmd_vel.twist.angular.z = angularRegularization(twist_2d, e_theta / d_t_);
+            cmd_vel.twist.angular.z = angularRegularization(velocity, e_theta / d_t_);
         }
     }
     // posistion not reached
     else
 #endif
     {
-        
-        Eigen::Vector3d s(current_ps_map.pose.position.x, current_ps_map.pose.position.y, theta);
-        Eigen::Vector3d s_d(target_ps_map.pose.position.x, target_ps_map.pose.position.y, theta_d);
-        Eigen::Vector2d u_r(vt, wt);
-        // ZZP: 根据参数选择
-        Eigen::Vector2d u;
-        if(use_model_)
-            u = UseModelPidControl(s, s_d, u_r);
+        if (start_heading_check_pending_)
+        {
+            start_heading_check_pending_ = false;
+            const double carrot_distance = std::hypot(
+                    target_ps_map.pose.position.x - current_ps_map.pose.position.x,
+                    target_ps_map.pose.position.y - current_ps_map.pose.position.y);
+            if (carrot_distance > rmp::common::math::kMathEpsilon)
+            {
+                start_heading_target_ = theta_dir;
+                const double start_heading_error = angles::normalize_angle(
+                        start_heading_target_ - theta);
+                if (std::abs(start_heading_error) > start_heading_enter_tolerance_)
+                {
+                    start_heading_alignment_active_ = true;
+                    RCLCPP_INFO(
+                            logger_,
+                            "PID_LOG start_heading_alignment=entered plan_revision=%zu "
+                            "target_yaw=%.6f current_yaw=%.6f heading_error=%.6f",
+                            plan_revision_, start_heading_target_, theta, start_heading_error);
+                }
+            }
+        }
+
+        const double start_heading_error = angles::normalize_angle(
+                start_heading_target_ - theta);
+        if (start_heading_alignment_active_ &&
+            std::abs(start_heading_error) <= start_heading_exit_tolerance_)
+        {
+            start_heading_alignment_active_ = false;
+            RCLCPP_INFO(
+                    logger_,
+                    "PID_LOG start_heading_alignment=completed plan_revision=%zu "
+                    "target_yaw=%.6f current_yaw=%.6f heading_error=%.6f",
+                    plan_revision_, start_heading_target_, theta, start_heading_error);
+        }
+
+        if (start_heading_alignment_active_)
+        {
+            cmd_vel.twist.linear.x = 0.0;
+            cmd_vel.twist.linear.y = 0.0;
+            cmd_vel.twist.angular.z = angularRegularization(
+                    velocity, start_heading_kp_ * start_heading_error);
+        }
         else
-            u = NoModelPidControl(s, s_d, u_r);
-        
-        cmd_vel.twist.linear.x = linearRegularization(twist_2d, u[0]);
-        cmd_vel.twist.angular.z = angularRegularization(twist_2d, u[1]);
+        {
+            Eigen::Vector3d s(
+                    current_ps_map.pose.position.x, current_ps_map.pose.position.y, theta);
+            Eigen::Vector3d s_d(
+                    target_ps_map.pose.position.x, target_ps_map.pose.position.y, theta_d);
+            Eigen::Vector2d u_r(vt, wt);
+            // ZZP: 根据参数选择
+            Eigen::Vector2d u;
+            if(use_model_)
+                u = UseModelPidControl(s, s_d, u_r);
+            else
+                u = NoModelPidControl(s, s_d, u_r);
+            if (!eigenVectorIsFinite(u))
+            {
+                throw nav2_core::NoValidControl(
+                        controller_plugin_name + " produced a non-finite raw control command");
+            }
+
+            cmd_vel.twist.linear.x = std::max(
+                    0.0, linearRegularization(velocity, u[0]));
+            cmd_vel.twist.linear.y = 0.0;
+            cmd_vel.twist.angular.z = angularRegularization(velocity, u[1]);
+        }
     }
     // publish next target_ps_map pose
 #if 0
@@ -508,6 +866,24 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
     current_ps_map.header.stamp = ros::Time::now();
     current_pose_pub_.publish(current_ps_map);
 #endif
+    cmd_vel.header.stamp = clock_->now();
+    cmd_vel.header.frame_id = base_frame_;
+    cmd_vel.twist.linear.y = 0.0;
+    if (!twistIsFinite(cmd_vel.twist))
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " produced a non-finite velocity command");
+    }
+
+    target_ps_map.header.frame_id = lookahead_pt.header.frame_id;
+    target_ps_map.header.stamp = cmd_vel.header.stamp;
+    if (carrot_pub_ && carrot_pub_->is_activated())
+    {
+        carrot_pub_->publish(target_ps_map);
+    }
+    updateAndLogTrackingDiagnostics(
+            pose, velocity, cmd_vel, prune_plan, L, theta_trj, kappa, lookahead_pt);
+
     return cmd_vel;
 }
 
@@ -582,7 +958,7 @@ Eigen::Vector2d PidTrackingController::NoModelPidControl(Eigen::Vector3d s, Eige
  */
 Eigen::Vector2d PidTrackingController::UseModelPidControl(Eigen::Vector3d  s, 
                                                           Eigen::Vector3d  s_d, 
-                                                          Eigen::Vector2d  u_r)
+                                                          Eigen::Vector2d  /*u_r*/)
 {
     Eigen::Vector2d u;
     Eigen::Vector3d e(s_d - s);
@@ -601,4 +977,7 @@ Eigen::Vector2d PidTrackingController::UseModelPidControl(Eigen::Vector3d  s,
 }
 
 }  // namespace pid_tracking_controller
-CLASS_LOADER_REGISTER_CLASS(pid_tracking_controller::PidTrackingController, nav2_core::Controller)
+
+PLUGINLIB_EXPORT_CLASS(
+  pid_tracking_controller::PidTrackingController,
+  nav2_core::Controller)

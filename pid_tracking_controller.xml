@@ -1,0 +1,10 @@
+<library path="pid_tracking_controller">
+  <class
+    name="pid_tracking_controller::PidTrackingController"
+    type="pid_tracking_controller::PidTrackingController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Legacy differential path-tracking baseline commanding vx and wz with vy fixed to zero.
+    </description>
+  </class>
+</library>

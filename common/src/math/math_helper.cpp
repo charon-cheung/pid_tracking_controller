@@ -75,26 +75,53 @@ std::vector<rmp::common::geometry::Vec2d> circleSegmentIntersection(const rmp::c
 
   double dx = x2 - x1;
   double dy = y2 - y1;
-  double dr2 = dx * dx + dy * dy;
-  double D = x1 * y2 - x2 * y1;
+  const double dr2 = dx * dx + dy * dy;
+  if (!std::isfinite(dr2) || dr2 <= kMathEpsilon || !std::isfinite(r))
+  {
+    return {};
+  }
+
+  const double determinant = x1 * y2 - x2 * y1;
+  double discriminant = r * r * dr2 - determinant * determinant;
+  const double discriminant_scale = std::max(
+    { 1.0, std::abs(r * r * dr2), std::abs(determinant * determinant) });
+  const double discriminant_tolerance = kMathEpsilon * discriminant_scale;
+  if (!std::isfinite(discriminant) || discriminant < -discriminant_tolerance)
+  {
+    return {};
+  }
+  discriminant = std::max(0.0, discriminant);
+  const double delta = std::sqrt(discriminant);
 
   // the first element is the point within segment
   double d1 = x1 * x1 + y1 * y1;
   double d2 = x2 * x2 + y2 * y2;
   double dd = d2 - d1;
-    printf("ttttt: %f", r * r * dr2 - D * D );
-  double delta = std::sqrt(r * r * dr2 - D * D);
 
-  if (delta >= 0)
+  if (delta == 0)
   {
-    if (delta == 0)
-      i_points.emplace_back(D * dy / dr2, -D * dx / dr2);
-    else
+    const double x = determinant * dy / dr2;
+    const double y = -determinant * dx / dr2;
+    if (std::isfinite(x) && std::isfinite(y))
     {
-      i_points.emplace_back((D * dy + std::copysign(1.0, dd) * dx * delta) / dr2,
-                            (-D * dx + std::copysign(1.0, dd) * dy * delta) / dr2);
-      i_points.emplace_back((D * dy - std::copysign(1.0, dd) * dx * delta) / dr2,
-                            (-D * dx - std::copysign(1.0, dd) * dy * delta) / dr2);
+      i_points.emplace_back(x, y);
+    }
+  }
+  else
+  {
+    const double direction = std::copysign(1.0, dd);
+    const double first_x = (determinant * dy + direction * dx * delta) / dr2;
+    const double first_y = (-determinant * dx + direction * dy * delta) / dr2;
+    if (std::isfinite(first_x) && std::isfinite(first_y))
+    {
+      i_points.emplace_back(first_x, first_y);
+    }
+
+    const double second_x = (determinant * dy - direction * dx * delta) / dr2;
+    const double second_y = (-determinant * dx - direction * dy * delta) / dr2;
+    if (std::isfinite(second_x) && std::isfinite(second_y))
+    {
+      i_points.emplace_back(second_x, second_y);
     }
   }
 

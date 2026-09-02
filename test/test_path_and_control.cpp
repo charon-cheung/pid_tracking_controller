@@ -1,0 +1,200 @@
+#include <cmath>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <vector>
+
+#include "gtest/gtest.h"
+
+#include "controller_test_access.hpp"
+#include "nav2_core/controller_exceptions.hpp"
+#include "rclcpp/clock.hpp"
+
+namespace pid_tracking_controller
+{
+namespace
+{
+
+nav_msgs::msg::Path makeStraightPath(std::initializer_list<double> x_coordinates)
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (const double x : x_coordinates) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = x;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  return path;
+}
+
+geometry_msgs::msg::PoseStamped makeRobotPose(double yaw = 0.0)
+{
+  geometry_msgs::msg::PoseStamped pose;
+  pose.header.frame_id = "map";
+  pose.pose.orientation.z = std::sin(yaw / 2.0);
+  pose.pose.orientation.w = std::cos(yaw / 2.0);
+  return pose;
+}
+
+class CommandContractTest : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+    PidTrackingControllerTestAccess::setCostmap(controller_, &costmap_);
+    PidTrackingControllerTestAccess::setClock(
+      controller_, std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME));
+    PidTrackingControllerTestAccess::setMaximumVelocityIncrements(
+      controller_, 0.1, 0.2);
+    controller_.setPlan(makeStraightPath({0.0, 0.3, 0.6}));
+  }
+
+  nav2_costmap_2d::Costmap2D costmap_{100, 100, 0.05, -2.5, -2.5};
+  PidTrackingController controller_;
+};
+
+TEST(PathValidation, nonFinitePathClearsOldPlanAndThrowsInvalidPath)
+{
+  PidTrackingController controller;
+  controller.setPlan(makeStraightPath({0.0, 0.3}));
+
+  auto invalid = makeStraightPath({0.0, 0.3});
+  invalid.poses.back().pose.position.x =
+    std::numeric_limits<double>::quiet_NaN();
+
+  EXPECT_THROW(controller.setPlan(invalid), nav2_core::InvalidPath);
+  EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
+}
+
+TEST(PathValidation, emptyPathClearsOldPlanAndThrowsInvalidPath)
+{
+  PidTrackingController controller;
+  controller.setPlan(makeStraightPath({0.0, 0.3}));
+
+  EXPECT_THROW(controller.setPlan(nav_msgs::msg::Path()), nav2_core::InvalidPath);
+  EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
+}
+
+TEST(PathContract, onePointPathKeepsFiniteTerminalCarrot)
+{
+  PidTrackingController controller;
+  const auto path = makeStraightPath({0.2});
+  geometry_msgs::msg::PointStamped carrot;
+  double theta_trj = std::numeric_limits<double>::quiet_NaN();
+  double kappa = std::numeric_limits<double>::quiet_NaN();
+
+  controller.getLookAheadPoint(
+    0.3, makeRobotPose(), path.poses, carrot, theta_trj, kappa);
+
+  EXPECT_DOUBLE_EQ(carrot.point.x, 0.2);
+  EXPECT_DOUBLE_EQ(carrot.point.y, 0.0);
+  EXPECT_TRUE(std::isfinite(theta_trj));
+  EXPECT_DOUBLE_EQ(kappa, 0.0);
+}
+
+TEST_F(CommandContractTest, commandUsesMeasuredVelocityAndKeepsLateralVelocityZero)
+{
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.4;
+
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPose(), measured, nullptr);
+
+  EXPECT_NEAR(command.twist.linear.x, 0.3, 1e-12);
+  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+  EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
+  EXPECT_EQ(command.header.frame_id, "base_link");
+  EXPECT_TRUE(std::isfinite(command.twist.linear.x));
+  EXPECT_TRUE(std::isfinite(command.twist.angular.z));
+}
+
+TEST_F(CommandContractTest, largeInitialHeadingErrorRotatesBeforeTranslating)
+{
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+  EXPECT_LT(command.twist.angular.z, 0.0);
+}
+
+TEST_F(CommandContractTest, headingAlignmentDoesNotReenterDuringSameGoal)
+{
+  const auto aligning = controller_.computeVelocityCommands(
+    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+  EXPECT_DOUBLE_EQ(aligning.twist.linear.x, 0.0);
+
+  const auto tracking = controller_.computeVelocityCommands(
+    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
+  EXPECT_GT(tracking.twist.linear.x, 0.0);
+
+  controller_.setPlan(makeStraightPath({0.0, 0.2, 0.6}));
+
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.05);
+}
+
+TEST_F(CommandContractTest, newGoalCanStartHeadingAlignmentAgain)
+{
+  controller_.computeVelocityCommands(
+    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
+  controller_.setPlan(makeStraightPath({0.0, 0.3, 0.9}));
+
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+  EXPECT_LT(command.twist.angular.z, 0.0);
+}
+
+TEST_F(CommandContractTest, normalTrackingNeverCommandsReverseMotion)
+{
+  controller_.computeVelocityCommands(
+    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
+
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPose(M_PI), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+}
+
+TEST_F(CommandContractTest, nonFinitePoseThrowsNoValidControl)
+{
+  auto pose = makeRobotPose();
+  pose.pose.position.x = std::numeric_limits<double>::quiet_NaN();
+
+  EXPECT_THROW(
+    controller_.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr),
+    nav2_core::NoValidControl);
+}
+
+TEST_F(CommandContractTest, nonFiniteVelocityThrowsNoValidControl)
+{
+  geometry_msgs::msg::Twist measured;
+  measured.linear.y = std::numeric_limits<double>::infinity();
+
+  EXPECT_THROW(
+    controller_.computeVelocityCommands(makeRobotPose(), measured, nullptr),
+    nav2_core::NoValidControl);
+}
+
+TEST(PathContract, missingFiniteIntersectionThrowsNoValidControl)
+{
+  PidTrackingController controller;
+  const auto path = makeStraightPath({1e-6});
+  geometry_msgs::msg::PointStamped carrot;
+  double theta_trj = 0.0;
+  double kappa = 0.0;
+
+  EXPECT_THROW(
+    controller.getLookAheadPoint(
+      1e-6, makeRobotPose(), path.poses, carrot, theta_trj, kappa),
+    nav2_core::NoValidControl);
+}
+
+}  // namespace
+}  // namespace pid_tracking_controller
