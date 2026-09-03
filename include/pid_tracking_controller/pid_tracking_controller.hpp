@@ -29,6 +29,7 @@ namespace pid_tracking_controller
 
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
+struct PreparedPath;
 struct PathProgressReference;
 struct LegacyCarrotVelocityPlan;
 
@@ -172,6 +173,7 @@ private:
   double goal_theta_{0.0};
 
   std::vector<geometry_msgs::msg::PoseStamped> global_plan_;
+  std::shared_ptr<const PreparedPath> prepared_path_;
   std::unique_ptr<PathProgressTracker> path_progress_tracker_;
   std::string controller_plugin_name;
   bool use_model_{true};

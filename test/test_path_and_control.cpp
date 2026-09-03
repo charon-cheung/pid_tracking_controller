@@ -110,6 +110,22 @@ TEST(PathValidation, emptyPathClearsOldPlanAndThrowsInvalidPath)
   EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
 }
 
+TEST(PathValidation, zeroNormQuaternionClearsOldPlanAndThrowsInvalidPath)
+{
+  PidTrackingController controller;
+  controller.setPlan(makeStraightPath({0.0, 0.3}));
+
+  auto invalid = makeStraightPath({0.0, 0.3});
+  auto & quaternion = invalid.poses.back().pose.orientation;
+  quaternion.x = 0.0;
+  quaternion.y = 0.0;
+  quaternion.z = 0.0;
+  quaternion.w = 0.0;
+
+  EXPECT_THROW(controller.setPlan(invalid), nav2_core::InvalidPath);
+  EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
+}
+
 TEST_F(CommandContractTest, commandUsesMeasuredVelocityAndKeepsLateralVelocityZero)
 {
   geometry_msgs::msg::Twist measured;

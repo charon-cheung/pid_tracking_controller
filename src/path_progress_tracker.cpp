@@ -18,7 +18,8 @@ namespace
 struct InterpolationResult
 {
   geometry_msgs::msg::Point point;
-  std::size_t segment_index{0};
+  std::size_t prepared_segment_index{0};
+  std::size_t source_segment_index{0};
   double segment_fraction{0.0};
 };
 
@@ -35,48 +36,49 @@ double planarDistance(
 }
 
 InterpolationResult interpolateAtArcLength(
-  const std::vector<geometry_msgs::msg::PoseStamped> & path,
-  const std::vector<double> & cumulative_lengths,
-  double total_path_length,
+  const PreparedPath & path,
   double arc_length)
 {
-  if (path.size() == 1u || total_path_length <= rmp::common::math::kMathEpsilon) {
-    return {path.front().pose.position, 0u, 0.0};
+  if (path.total_translation_length <= rmp::common::math::kMathEpsilon) {
+    return {path.poses.front().pose.position, 0u, 0u, 0.0};
   }
 
-  const double clamped_arc_length = std::clamp(arc_length, 0.0, total_path_length);
-  for (std::size_t index = 0; index + 1u < path.size(); ++index) {
-    const double segment_length = cumulative_lengths[index + 1u] -
-      cumulative_lengths[index];
-    if (segment_length <= rmp::common::math::kMathEpsilon) {
+  const double clamped_arc_length = std::clamp(
+    arc_length, 0.0, path.total_translation_length);
+  for (std::size_t index = 0; index < path.segments.size(); ++index) {
+    const auto & segment = path.segments[index];
+    if (segment.type != PathSegmentType::kTranslation) {
       continue;
     }
-    if (clamped_arc_length > cumulative_lengths[index + 1u] +
+    if (clamped_arc_length > segment.translation_s_end +
       rmp::common::math::kMathEpsilon)
     {
       continue;
     }
 
     const double fraction = std::clamp(
-      (clamped_arc_length - cumulative_lengths[index]) / segment_length,
+      (clamped_arc_length - segment.translation_s_begin) / segment.translation_length,
       0.0, 1.0);
-    const auto & start = path[index].pose.position;
-    const auto & end = path[index + 1u].pose.position;
+    const auto & start = path.poses[segment.start_pose_index].pose.position;
+    const auto & end = path.poses[segment.end_pose_index].pose.position;
     geometry_msgs::msg::Point point;
     point.x = start.x + fraction * (end.x - start.x);
     point.y = start.y + fraction * (end.y - start.y);
     point.z = start.z + fraction * (end.z - start.z);
-    return {point, index, fraction};
+    return {point, index, segment.start_pose_index, fraction};
   }
 
-  for (std::size_t index = path.size() - 1u; index > 0u; --index) {
-    if (cumulative_lengths[index] - cumulative_lengths[index - 1u] >
-      rmp::common::math::kMathEpsilon)
-    {
-      return {path[index].pose.position, index - 1u, 1.0};
+  for (std::size_t index = path.segments.size(); index > 0u; --index) {
+    const auto & segment = path.segments[index - 1u];
+    if (segment.type == PathSegmentType::kTranslation) {
+      return {
+        path.poses[segment.end_pose_index].pose.position,
+        index - 1u,
+        segment.start_pose_index,
+        1.0};
     }
   }
-  return {path.front().pose.position, 0u, 0.0};
+  return {path.poses.front().pose.position, 0u, 0u, 0.0};
 }
 
 double curvatureAtSegment(
@@ -109,6 +111,8 @@ double curvatureAtSegment(
 bool referenceIsFinite(const PathProgressReference & reference)
 {
   return pointIsFinite(reference.projection) && pointIsFinite(reference.carrot) &&
+         std::isfinite(reference.cursor.segment_fraction) &&
+         std::isfinite(reference.cursor.translation_arc_length) &&
          std::isfinite(reference.segment_fraction) &&
          std::isfinite(reference.progress_arc_length) &&
          std::isfinite(reference.carrot_arc_length) &&
@@ -120,26 +124,17 @@ bool referenceIsFinite(const PathProgressReference & reference)
 
 }  // namespace
 
-void PathProgressTracker::setPath(const nav_msgs::msg::Path & path)
+void PathProgressTracker::setPath(PreparedPathPtr path)
 {
-  if (path.poses.empty()) {
+  if (!path || path->poses.empty()) {
     throw std::invalid_argument("path must not be empty");
   }
-  for (const auto & pose : path.poses) {
-    if (!pointIsFinite(pose.pose.position)) {
-      throw std::invalid_argument("path positions must be finite");
-    }
-  }
 
-  std::vector<double> cumulative_lengths(path.poses.size(), 0.0);
   std::vector<double> nonzero_segment_lengths;
-  nonzero_segment_lengths.reserve(path.poses.size() - 1u);
-  for (std::size_t index = 0; index + 1u < path.poses.size(); ++index) {
-    const double segment_length = planarDistance(
-      path.poses[index].pose.position, path.poses[index + 1u].pose.position);
-    cumulative_lengths[index + 1u] = cumulative_lengths[index] + segment_length;
-    if (segment_length > rmp::common::math::kMathEpsilon) {
-      nonzero_segment_lengths.push_back(segment_length);
+  nonzero_segment_lengths.reserve(path->segments.size());
+  for (const auto & segment : path->segments) {
+    if (segment.type == PathSegmentType::kTranslation) {
+      nonzero_segment_lengths.push_back(segment.translation_length);
     }
   }
 
@@ -154,18 +149,7 @@ void PathProgressTracker::setPath(const nav_msgs::msg::Path & path)
     }
   }
 
-  path_ = path.poses;
-  cumulative_lengths_ = std::move(cumulative_lengths);
-  frame_id_ = path.header.frame_id;
-  if (frame_id_.empty()) {
-    for (const auto & pose : path_) {
-      if (!pose.header.frame_id.empty()) {
-        frame_id_ = pose.header.frame_id;
-        break;
-      }
-    }
-  }
-  total_path_length_ = cumulative_lengths_.back();
+  path_ = std::move(path);
   progress_arc_length_ = 0.0;
   maximum_progress_budget_ = 2.0 * representative_spacing;
   progress_budget_ = maximum_progress_budget_;
@@ -199,10 +183,10 @@ PathProgressReference PathProgressTracker::update(
   }
 
   PathProgressReference reference;
-  reference.frame_id = frame_id_;
-  if (total_path_length_ <= rmp::common::math::kMathEpsilon) {
-    reference.projection = path_.front().pose.position;
-    reference.carrot = path_.front().pose.position;
+  reference.frame_id = path_->frame_id;
+  if (path_->total_translation_length <= rmp::common::math::kMathEpsilon) {
+    reference.projection = path_->poses.front().pose.position;
+    reference.carrot = path_->poses.front().pose.position;
     reference.remaining_path_length = 0.0;
     reference.progress_budget = progress_budget_;
     reference.signed_lateral_error = planarDistance(robot_position, reference.projection);
@@ -215,40 +199,42 @@ PathProgressReference PathProgressTracker::update(
   }
 
   const double admissible_end = std::min(
-    total_path_length_, progress_arc_length_ + progress_budget_);
+    path_->total_translation_length, progress_arc_length_ + progress_budget_);
   bool projection_found = false;
   double best_distance_squared = std::numeric_limits<double>::infinity();
   double best_arc_length = progress_arc_length_;
-  std::size_t best_segment_index = 0u;
+  std::size_t best_prepared_segment_index = 0u;
   double best_segment_fraction = 0.0;
   geometry_msgs::msg::Point best_projection;
 
-  for (std::size_t index = 0; index + 1u < path_.size(); ++index) {
-    const double segment_start = cumulative_lengths_[index];
-    const double segment_end = cumulative_lengths_[index + 1u];
-    const double segment_length = segment_end - segment_start;
-    if (segment_length <= rmp::common::math::kMathEpsilon ||
-      segment_end + rmp::common::math::kMathEpsilon < progress_arc_length_ ||
-      segment_start > admissible_end + rmp::common::math::kMathEpsilon)
+  for (std::size_t index = 0; index < path_->segments.size(); ++index) {
+    const auto & segment = path_->segments[index];
+    if (segment.type != PathSegmentType::kTranslation ||
+      segment.translation_s_end + rmp::common::math::kMathEpsilon <
+      progress_arc_length_ ||
+      segment.translation_s_begin > admissible_end + rmp::common::math::kMathEpsilon)
     {
       continue;
     }
 
-    const double allowed_start = std::max(segment_start, progress_arc_length_);
-    const double allowed_end = std::min(segment_end, admissible_end);
+    const double allowed_start = std::max(
+      segment.translation_s_begin, progress_arc_length_);
+    const double allowed_end = std::min(segment.translation_s_end, admissible_end);
     if (allowed_start > allowed_end + rmp::common::math::kMathEpsilon) {
       continue;
     }
 
-    const auto & start = path_[index].pose.position;
-    const auto & end = path_[index + 1u].pose.position;
+    const auto & start = path_->poses[segment.start_pose_index].pose.position;
+    const auto & end = path_->poses[segment.end_pose_index].pose.position;
     const double dx = end.x - start.x;
     const double dy = end.y - start.y;
     const double length_squared = dx * dx + dy * dy;
     const double minimum_fraction = std::clamp(
-      (allowed_start - segment_start) / segment_length, 0.0, 1.0);
+      (allowed_start - segment.translation_s_begin) / segment.translation_length,
+      0.0, 1.0);
     const double maximum_fraction = std::clamp(
-      (allowed_end - segment_start) / segment_length, 0.0, 1.0);
+      (allowed_end - segment.translation_s_begin) / segment.translation_length,
+      0.0, 1.0);
     const double unconstrained_fraction =
       ((robot_position.x - start.x) * dx + (robot_position.y - start.y) * dy) /
       length_squared;
@@ -262,7 +248,8 @@ PathProgressReference PathProgressTracker::update(
     const double error_x = robot_position.x - projection.x;
     const double error_y = robot_position.y - projection.y;
     const double distance_squared = error_x * error_x + error_y * error_y;
-    const double candidate_arc_length = segment_start + fraction * segment_length;
+    const double candidate_arc_length = segment.translation_s_begin +
+      fraction * segment.translation_length;
     if (!projection_found ||
       distance_squared < best_distance_squared - rmp::common::math::kMathEpsilon ||
       (std::abs(distance_squared - best_distance_squared) <=
@@ -271,7 +258,7 @@ PathProgressReference PathProgressTracker::update(
       projection_found = true;
       best_distance_squared = distance_squared;
       best_arc_length = candidate_arc_length;
-      best_segment_index = index;
+      best_prepared_segment_index = index;
       best_segment_fraction = fraction;
       best_projection = projection;
     }
@@ -285,32 +272,35 @@ PathProgressReference PathProgressTracker::update(
   progress_arc_length_ = std::max(progress_arc_length_, best_arc_length);
   progress_budget_ = std::max(0.0, progress_budget_ - advance);
 
-  const auto & accepted_start = path_[best_segment_index].pose.position;
-  const auto & accepted_end = path_[best_segment_index + 1u].pose.position;
-  const double accepted_dx = accepted_end.x - accepted_start.x;
-  const double accepted_dy = accepted_end.y - accepted_start.y;
-  const double accepted_length = std::hypot(accepted_dx, accepted_dy);
-  previous_accepted_tangent_x_ = accepted_dx / accepted_length;
-  previous_accepted_tangent_y_ = accepted_dy / accepted_length;
+  const auto & accepted_segment = path_->segments[best_prepared_segment_index];
+  const auto & accepted_start =
+    path_->poses[accepted_segment.start_pose_index].pose.position;
+  const auto & accepted_end =
+    path_->poses[accepted_segment.end_pose_index].pose.position;
+  previous_accepted_tangent_x_ = std::cos(accepted_segment.path_tangent);
+  previous_accepted_tangent_y_ = std::sin(accepted_segment.path_tangent);
   previous_accepted_tangent_valid_ = true;
   previous_robot_position_ = robot_position;
   previous_robot_position_valid_ = true;
 
   reference.projection = best_projection;
-  reference.segment_index = best_segment_index;
+  reference.cursor.segment_index = best_prepared_segment_index;
+  reference.cursor.segment_fraction = best_segment_fraction;
+  reference.cursor.translation_arc_length = progress_arc_length_;
+  reference.segment_index = accepted_segment.start_pose_index;
   reference.segment_fraction = best_segment_fraction;
   reference.progress_arc_length = progress_arc_length_;
   reference.carrot_arc_length = std::min(
-    progress_arc_length_ + lookahead_distance, total_path_length_);
+    progress_arc_length_ + lookahead_distance, path_->total_translation_length);
   reference.remaining_path_length = std::max(
-    0.0, total_path_length_ - reference.progress_arc_length);
+    0.0, path_->total_translation_length - reference.progress_arc_length);
   reference.progress_budget = progress_budget_;
   const auto carrot = interpolateAtArcLength(
-    path_, cumulative_lengths_, total_path_length_, reference.carrot_arc_length);
+    *path_, reference.carrot_arc_length);
   reference.carrot = carrot.point;
 
-  const auto & projection_start = path_[best_segment_index].pose.position;
-  const auto & projection_end = path_[best_segment_index + 1u].pose.position;
+  const auto & projection_start = accepted_start;
+  const auto & projection_end = accepted_end;
   const double projection_dx = projection_end.x - projection_start.x;
   const double projection_dy = projection_end.y - projection_start.y;
   const double relative_x = robot_position.x - reference.projection.x;
@@ -319,11 +309,10 @@ PathProgressReference PathProgressTracker::update(
   const double lateral_distance = std::sqrt(best_distance_squared);
   reference.signed_lateral_error = cross < 0.0 ? -lateral_distance : lateral_distance;
 
-  const auto & carrot_start = path_[carrot.segment_index].pose.position;
-  const auto & carrot_end = path_[carrot.segment_index + 1u].pose.position;
-  reference.tangent = std::atan2(
-    carrot_end.y - carrot_start.y, carrot_end.x - carrot_start.x);
-  reference.curvature = curvatureAtSegment(path_, carrot.segment_index);
+  const auto & carrot_segment = path_->segments[carrot.prepared_segment_index];
+  reference.tangent = carrot_segment.path_tangent;
+  reference.curvature = curvatureAtSegment(
+    path_->poses, carrot.source_segment_index);
 
   if (!referenceIsFinite(reference)) {
     throw std::domain_error("path progress tracker produced a non-finite reference");
@@ -333,7 +322,7 @@ PathProgressReference PathProgressTracker::update(
 
 bool PathProgressTracker::hasPath() const
 {
-  return !path_.empty();
+  return path_ && !path_->poses.empty();
 }
 
 }  // namespace pid_tracking_controller

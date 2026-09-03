@@ -21,6 +21,7 @@
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "path_progress_tracker.hpp"
+#include "prepared_path.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/utils.h"
@@ -307,6 +308,7 @@ void PidTrackingController::deactivate()
 void PidTrackingController::cleanup()
 {
     carrot_pub_.reset();
+    prepared_path_.reset();
     costmap_ = nullptr;
     costmap_ros_.reset();
     tf_.reset();
@@ -318,13 +320,24 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
     RCLCPP_INFO(logger_, "PidTrackingController received a path");
     global_plan_.clear();
+    prepared_path_.reset();
     if (orig_global_plan.poses.empty() || !pathIsFinite(orig_global_plan))
     {
         throw nav2_core::InvalidPath(
                 controller_plugin_name + " received an empty or non-finite path");
     }
+    try
+    {
+        auto prepared_path = preparePath(orig_global_plan);
+        path_progress_tracker_->setPath(prepared_path);
+        prepared_path_ = std::move(prepared_path);
+    }
+    catch (const std::exception & exception)
+    {
+        throw nav2_core::InvalidPath(
+                controller_plugin_name + " received an invalid path: " + exception.what());
+    }
     global_plan_ = orig_global_plan.poses;
-    path_progress_tracker_->setPath(orig_global_plan);
     ++plan_revision_;
     // receive a plan for a new goal
     if (goal_x_ != global_plan_.back().pose.position.x || goal_y_ != global_plan_.back().pose.position.y)

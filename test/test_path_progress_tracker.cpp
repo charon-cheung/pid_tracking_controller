@@ -7,6 +7,7 @@
 #include "gtest/gtest.h"
 
 #include "path_progress_tracker.hpp"
+#include "prepared_path.hpp"
 
 namespace pid_tracking_controller
 {
@@ -59,6 +60,11 @@ nav_msgs::msg::Path makeDenseHairpinPath()
   return path;
 }
 
+void setPreparedPath(PathProgressTracker & tracker, const nav_msgs::msg::Path & path)
+{
+  tracker.setPath(preparePath(path));
+}
+
 void advanceAlongOutboundBranch(PathProgressTracker & tracker)
 {
   for (int index = 0; index <= 8; ++index) {
@@ -85,7 +91,7 @@ void expectFinite(const PathProgressReference & reference)
 TEST(PathProgressTracker, futureNearbyBranchCannotReplaceCurrentOrderedBranch)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makeDenseHairpinPath());
+  setPreparedPath(tracker, makeDenseHairpinPath());
   advanceAlongOutboundBranch(tracker);
 
   const auto reference = tracker.update(makePoint(0.40, 0.08), 0.10);
@@ -100,7 +106,7 @@ TEST(PathProgressTracker, futureNearbyBranchCannotReplaceCurrentOrderedBranch)
 TEST(PathProgressTracker, unchangedRobotPoseCannotRatchetProgressForward)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makeDenseHairpinPath());
+  setPreparedPath(tracker, makeDenseHairpinPath());
   advanceAlongOutboundBranch(tracker);
 
   const auto robot_position = makePoint(0.40, 0.08);
@@ -117,7 +123,7 @@ TEST(PathProgressTracker, unchangedRobotPoseCannotRatchetProgressForward)
 TEST(PathProgressTracker, sparsePathCarrotInterpolatesAcrossSegmentsByArcLength)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}));
+  setPreparedPath(tracker, makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}));
 
   const auto reference = tracker.update(makePoint(0.0, 0.0), 1.20);
 
@@ -134,8 +140,9 @@ TEST(PathProgressTracker, sparsePathCarrotInterpolatesAcrossSegmentsByArcLength)
 TEST(PathProgressTracker, nonuniformSamplingPreservesArcLengthProgressAndProvenance)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makePath(
-      {{0.0, 0.0}, {0.05, 0.0}, {0.15, 0.0}, {0.90, 0.0}, {1.0, 0.0}}));
+  setPreparedPath(
+    tracker,
+    makePath({{0.0, 0.0}, {0.05, 0.0}, {0.15, 0.0}, {0.90, 0.0}, {1.0, 0.0}}));
 
   const auto first = tracker.update(makePoint(0.07, 0.0), 0.30);
   const auto second = tracker.update(makePoint(0.17, 0.0), 0.30);
@@ -144,6 +151,9 @@ TEST(PathProgressTracker, nonuniformSamplingPreservesArcLengthProgressAndProvena
   EXPECT_NEAR(first.progress_arc_length, 0.07, 1e-12);
   EXPECT_EQ(first.segment_index, 1u);
   EXPECT_NEAR(first.segment_fraction, 0.20, 1e-12);
+  EXPECT_EQ(first.cursor.segment_index, 1u);
+  EXPECT_NEAR(first.cursor.segment_fraction, 0.20, 1e-12);
+  EXPECT_NEAR(first.cursor.translation_arc_length, 0.07, 1e-12);
   EXPECT_NEAR(first.carrot_arc_length, 0.37, 1e-12);
   EXPECT_NEAR(first.carrot.x, 0.37, 1e-12);
   EXPECT_NEAR(first.remaining_path_length, 0.93, 1e-12);
@@ -167,7 +177,9 @@ TEST(PathProgressTracker, nonuniformSamplingPreservesArcLengthProgressAndProvena
 TEST(PathProgressTracker, repeatedLateralMotionCannotRatchetProgressForward)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makePath(
+  setPreparedPath(
+    tracker,
+    makePath(
       {{0.0, 0.0}, {0.05, 0.0}, {0.10, 0.0}, {0.15, 0.0}, {0.20, 0.0},
         {0.25, 0.0}, {0.30, 0.0}, {0.35, 0.0}, {0.40, 0.0}, {0.45, 0.0},
         {0.50, 0.0}}));
@@ -187,7 +199,7 @@ TEST(PathProgressTracker, repeatedLateralMotionCannotRatchetProgressForward)
 TEST(PathProgressTracker, lateralErrorUsesAcceptedProgressSegment)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makeDenseHairpinPath());
+  setPreparedPath(tracker, makeDenseHairpinPath());
   advanceAlongOutboundBranch(tracker);
 
   const auto reference = tracker.update(makePoint(0.40, 0.08), 0.10);
@@ -198,7 +210,7 @@ TEST(PathProgressTracker, lateralErrorUsesAcceptedProgressSegment)
 TEST(PathProgressTracker, onePointPathReturnsFiniteStationaryReference)
 {
   PathProgressTracker tracker;
-  tracker.setPath(makePath({{0.2, -0.1}}));
+  setPreparedPath(tracker, makePath({{0.2, -0.1}}));
 
   const auto reference = tracker.update(makePoint(0.2, -0.1), 0.30);
 
@@ -209,17 +221,12 @@ TEST(PathProgressTracker, onePointPathReturnsFiniteStationaryReference)
   EXPECT_DOUBLE_EQ(reference.signed_lateral_error, 0.0);
 }
 
-TEST(PathProgressTracker, rejectsInvalidPathAndUpdateInputs)
+TEST(PathProgressTracker, rejectsMissingPathAndInvalidUpdateInputs)
 {
   PathProgressTracker tracker;
-  EXPECT_THROW(tracker.setPath(nav_msgs::msg::Path()), std::invalid_argument);
+  EXPECT_THROW(tracker.setPath(PreparedPathPtr()), std::invalid_argument);
 
-  auto invalid_path = makePath({{0.0, 0.0}, {0.1, 0.0}});
-  invalid_path.poses.back().pose.position.x =
-    std::numeric_limits<double>::quiet_NaN();
-  EXPECT_THROW(tracker.setPath(invalid_path), std::invalid_argument);
-
-  tracker.setPath(makePath({{0.0, 0.0}, {0.1, 0.0}}));
+  setPreparedPath(tracker, makePath({{0.0, 0.0}, {0.1, 0.0}}));
   auto invalid_position = makePoint(0.0, 0.0);
   invalid_position.y = std::numeric_limits<double>::infinity();
   EXPECT_THROW(tracker.update(invalid_position, 0.1), std::domain_error);
@@ -228,6 +235,41 @@ TEST(PathProgressTracker, rejectsInvalidPathAndUpdateInputs)
     tracker.update(
       makePoint(0.0, 0.0), std::numeric_limits<double>::quiet_NaN()),
     std::domain_error);
+}
+
+TEST(PathProgressTracker, cursorUsesPreparedSegmentIndexAndKeepsLegacyProvenance)
+{
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, makePath({{0.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}}));
+
+  const auto reference = tracker.update(makePoint(0.20, 0.0), 0.30);
+
+  EXPECT_EQ(reference.cursor.segment_index, 0u);
+  EXPECT_NEAR(reference.cursor.segment_fraction, 0.20, 1e-12);
+  EXPECT_NEAR(reference.cursor.translation_arc_length, 0.20, 1e-12);
+  EXPECT_EQ(reference.segment_index, 1u);
+  EXPECT_NEAR(reference.segment_fraction, 0.20, 1e-12);
+  EXPECT_NEAR(reference.progress_arc_length, 0.20, 1e-12);
+}
+
+TEST(PathProgressTracker, legacyCarrotStillCrossesShadowRotationSegment)
+{
+  auto path = makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+  path.poses[2].pose.orientation.z = std::sin(M_PI_4);
+  path.poses[2].pose.orientation.w = std::cos(M_PI_4);
+  path.poses[3].pose.orientation = path.poses[2].pose.orientation;
+
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, path);
+  const auto reference = tracker.update(makePoint(0.80, 0.0), 0.50);
+
+  EXPECT_EQ(reference.cursor.segment_index, 0u);
+  EXPECT_EQ(reference.segment_index, 0u);
+  EXPECT_NEAR(reference.progress_arc_length, 0.80, 1e-12);
+  EXPECT_NEAR(reference.carrot_arc_length, 1.30, 1e-12);
+  EXPECT_NEAR(reference.carrot.x, 1.0, 1e-12);
+  EXPECT_NEAR(reference.carrot.y, 0.30, 1e-12);
+  EXPECT_NEAR(reference.tangent, M_PI_2, 1e-12);
 }
 
 }  // namespace

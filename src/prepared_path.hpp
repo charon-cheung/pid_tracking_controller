@@ -32,6 +32,13 @@ struct PreparedPathSegment
   double target_yaw_rate_per_meter{0.0};
 };
 
+struct PathCursor
+{
+  std::size_t segment_index{0};
+  double segment_fraction{0.0};
+  double translation_arc_length{0.0};
+};
+
 struct PreparedPath
 {
   std::string frame_id;
