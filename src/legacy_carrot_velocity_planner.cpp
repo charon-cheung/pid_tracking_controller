@@ -4,12 +4,12 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "common/math/math_helper.h"
-
 namespace pid_tracking_controller
 {
 namespace
 {
+
+constexpr double kGeometryEpsilon = 1e-10;
 
 bool planIsFinite(const LegacyCarrotVelocityPlan & plan)
 {
@@ -110,7 +110,7 @@ LegacyCarrotVelocityPlan planLegacyCarrotVelocity(
     config.max_angular_speed - config.angular_speed_reserve;
   plan.angular_limited_speed = config.cruise_speed;
 
-  if (plan.carrot_distance <= rmp::common::math::kMathEpsilon) {
+  if (plan.carrot_distance <= kGeometryEpsilon) {
     plan.speed_limit_reason = SpeedLimitReason::kZeroCarrotDistance;
     if (!planIsFinite(plan)) {
       throw std::domain_error("velocity planner produced non-finite output");

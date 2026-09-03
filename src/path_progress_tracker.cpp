@@ -7,13 +7,12 @@
 #include <utility>
 #include <vector>
 
-#include "common/geometry/vec2d.h"
-#include "common/math/math_helper.h"
-
 namespace pid_tracking_controller
 {
 namespace
 {
+
+constexpr double kGeometryEpsilon = 1e-10;
 
 struct InterpolationResult
 {
@@ -35,11 +34,70 @@ double planarDistance(
   return std::hypot(first.x - second.x, first.y - second.y);
 }
 
+double arcCenter(
+  const geometry_msgs::msg::Point & previous,
+  const geometry_msgs::msg::Point & current,
+  const geometry_msgs::msg::Point & next,
+  bool is_cusp,
+  geometry_msgs::msg::Point * center = nullptr)
+{
+  const double first_dx = current.x - previous.x;
+  const double first_dy = current.y - previous.y;
+  const double second_dx = is_cusp ? current.x - next.x : next.x - current.x;
+  const double second_dy = is_cusp ? current.y - next.y : next.y - current.y;
+  const double determinant = first_dx * second_dy - first_dy * second_dx;
+  if (std::abs(determinant) < kGeometryEpsilon) {
+    if (center != nullptr) {
+      center->x = std::numeric_limits<double>::infinity();
+      center->y = std::numeric_limits<double>::infinity();
+    }
+    return 0.0;
+  }
+
+  geometry_msgs::msg::Point first_midpoint;
+  first_midpoint.x = 0.5 * (previous.x + current.x);
+  first_midpoint.y = 0.5 * (previous.y + current.y);
+  geometry_msgs::msg::Point second_midpoint;
+  second_midpoint.x = is_cusp ?
+    0.5 * (2.0 * current.x + second_dx) : 0.5 * (next.x + current.x);
+  second_midpoint.y = is_cusp ?
+    0.5 * (2.0 * current.y + second_dy) : 0.5 * (next.y + current.y);
+
+  const double first_normal_x = -first_dy;
+  const double first_normal_y = first_dx;
+  const double second_normal_x = -second_dy;
+  const double second_normal_y = second_dx;
+  const double first_line_determinant =
+    (first_midpoint.x + first_normal_x) * first_midpoint.y -
+    (first_midpoint.y + first_normal_y) * first_midpoint.x;
+  const double second_line_determinant =
+    (second_midpoint.x + second_normal_x) * second_midpoint.y -
+    (second_midpoint.y + second_normal_y) * second_midpoint.x;
+
+  geometry_msgs::msg::Point arc_center;
+  arc_center.x =
+    (first_line_determinant * second_normal_x -
+    second_line_determinant * first_normal_x) / determinant;
+  arc_center.y =
+    (first_line_determinant * second_normal_y -
+    second_line_determinant * first_normal_y) / determinant;
+  if (center != nullptr) {
+    *center = arc_center;
+  }
+
+  const double radius = planarDistance(current, arc_center);
+  const double turn_cross_product =
+    (current.x - previous.x) * (arc_center.y - previous.y) -
+    (arc_center.x - previous.x) * (current.y - previous.y);
+  return radius < kGeometryEpsilon ?
+    0.0 : std::copysign(1.0 / radius, turn_cross_product);
+}
+
 InterpolationResult interpolateAtArcLength(
   const PreparedPath & path,
   double arc_length)
 {
-  if (path.total_translation_length <= rmp::common::math::kMathEpsilon) {
+  if (path.total_translation_length <= kGeometryEpsilon) {
     return {path.poses.front().pose.position, 0u, 0u, 0.0};
   }
 
@@ -51,7 +109,7 @@ InterpolationResult interpolateAtArcLength(
       continue;
     }
     if (clamped_arc_length > segment.translation_s_end +
-      rmp::common::math::kMathEpsilon)
+      kGeometryEpsilon)
     {
       continue;
     }
@@ -94,7 +152,7 @@ double curvatureAtSegment(
   std::size_t next_index = segment_index + 2u;
   while (next_index < path.size() &&
     planarDistance(middle, path[next_index].pose.position) <=
-    rmp::common::math::kMathEpsilon)
+    kGeometryEpsilon)
   {
     ++next_index;
   }
@@ -103,8 +161,7 @@ double curvatureAtSegment(
   }
 
   const auto & last = path[next_index].pose.position;
-  const double curvature = rmp::common::math::arcCenter(
-    {first.x, first.y}, {middle.x, middle.y}, {last.x, last.y}, false);
+  const double curvature = arcCenter(first, middle, last, false);
   return std::isfinite(curvature) ? curvature : 0.0;
 }
 
@@ -184,7 +241,7 @@ PathProgressReference PathProgressTracker::update(
 
   PathProgressReference reference;
   reference.frame_id = path_->frame_id;
-  if (path_->total_translation_length <= rmp::common::math::kMathEpsilon) {
+  if (path_->total_translation_length <= kGeometryEpsilon) {
     reference.projection = path_->poses.front().pose.position;
     reference.carrot = path_->poses.front().pose.position;
     reference.remaining_path_length = 0.0;
@@ -210,9 +267,9 @@ PathProgressReference PathProgressTracker::update(
   for (std::size_t index = 0; index < path_->segments.size(); ++index) {
     const auto & segment = path_->segments[index];
     if (segment.type != PathSegmentType::kTranslation ||
-      segment.translation_s_end + rmp::common::math::kMathEpsilon <
+      segment.translation_s_end + kGeometryEpsilon <
       progress_arc_length_ ||
-      segment.translation_s_begin > admissible_end + rmp::common::math::kMathEpsilon)
+      segment.translation_s_begin > admissible_end + kGeometryEpsilon)
     {
       continue;
     }
@@ -220,7 +277,7 @@ PathProgressReference PathProgressTracker::update(
     const double allowed_start = std::max(
       segment.translation_s_begin, progress_arc_length_);
     const double allowed_end = std::min(segment.translation_s_end, admissible_end);
-    if (allowed_start > allowed_end + rmp::common::math::kMathEpsilon) {
+    if (allowed_start > allowed_end + kGeometryEpsilon) {
       continue;
     }
 
@@ -251,9 +308,9 @@ PathProgressReference PathProgressTracker::update(
     const double candidate_arc_length = segment.translation_s_begin +
       fraction * segment.translation_length;
     if (!projection_found ||
-      distance_squared < best_distance_squared - rmp::common::math::kMathEpsilon ||
+      distance_squared < best_distance_squared - kGeometryEpsilon ||
       (std::abs(distance_squared - best_distance_squared) <=
-      rmp::common::math::kMathEpsilon && candidate_arc_length < best_arc_length))
+      kGeometryEpsilon && candidate_arc_length < best_arc_length))
     {
       projection_found = true;
       best_distance_squared = distance_squared;

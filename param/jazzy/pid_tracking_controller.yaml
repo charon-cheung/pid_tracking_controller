@@ -10,8 +10,8 @@ controller_server:
       rotate_tolerance: 0.5
       base_frame: "base_link"
       map_frame: "map"
-      lookahead_time: 0.6
-      min_lookahead_dist: 0.3
+      lookahead_time: 1.0
+      min_lookahead_dist: 0.5
       max_lookahead_dist: 0.9
       max_v: 0.8
       min_v: 0.05

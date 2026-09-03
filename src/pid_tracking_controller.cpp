@@ -15,7 +15,6 @@
 #include <utility>
 
 #include "angles/angles.h"
-#include "common/math/math_helper.h"
 #include "holonomic_tracking_reference.hpp"
 #include "legacy_carrot_velocity_planner.hpp"
 #include "nav2_core/controller_exceptions.hpp"
@@ -38,6 +37,8 @@ namespace pid_tracking_controller
 {
 namespace
 {
+
+constexpr double kGeometryEpsilon = 1e-10;
 
 bool scalarIsFinite(double value)
 {
@@ -719,7 +720,7 @@ double PidTrackingController::getLookAheadDistance(double vt)
 {
     double lookahead_dist = fabs(vt) * lookahead_time_;
 
-    return rmp::common::math::clamp(lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
+    return std::clamp(lookahead_dist, min_lookahead_dist_, max_lookahead_dist_);
 }
 
 void PidTrackingController::setSpeedLimit(const double &, const bool &)
@@ -870,7 +871,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             const double carrot_distance = std::hypot(
                     target_ps_map.pose.position.x - current_ps_map.pose.position.x,
                     target_ps_map.pose.position.y - current_ps_map.pose.position.y);
-            if (carrot_distance > rmp::common::math::kMathEpsilon)
+            if (carrot_distance > kGeometryEpsilon)
             {
                 start_heading_target_ = theta_dir;
                 const double start_heading_error = angles::normalize_angle(

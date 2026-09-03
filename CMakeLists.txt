@@ -45,12 +45,9 @@ add_library(${PROJECT_NAME} SHARED
   src/legacy_carrot_velocity_planner.cpp
   src/path_progress_tracker.cpp
   src/prepared_path.cpp
-  common/src/geometry/vec2d.cpp
-  common/src/math/math_helper.cpp
 )
 target_include_directories(${PROJECT_NAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/common/include
 )
 ament_target_dependencies(${PROJECT_NAME} ${dependencies})
 target_link_libraries(${PROJECT_NAME} Eigen3::Eigen)
@@ -67,10 +64,6 @@ install(TARGETS ${PROJECT_NAME}
 )
 
 install(DIRECTORY include/
-  DESTINATION include
-)
-
-install(DIRECTORY common/include/
   DESTINATION include
 )
 
@@ -92,16 +85,6 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_plugin_loading
     nav2_core
     pluginlib
-  )
-
-  ament_add_gtest(test_math_helper
-    test/test_math_helper.cpp
-  )
-  target_include_directories(test_math_helper PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/common/include
-  )
-  target_link_libraries(test_math_helper
-    ${PROJECT_NAME}
   )
 
   ament_add_gtest(test_legacy_carrot_velocity_planner
@@ -161,7 +144,6 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_legacy_behavior PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   ament_target_dependencies(test_legacy_behavior
@@ -178,7 +160,6 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_path_and_control PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   ament_target_dependencies(test_path_and_control
@@ -201,7 +182,6 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_lifecycle_smoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/common/include
   )
   ament_target_dependencies(test_lifecycle_smoke
     geometry_msgs

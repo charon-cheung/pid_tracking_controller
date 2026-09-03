@@ -207,6 +207,31 @@ TEST(PathProgressTracker, lateralErrorUsesAcceptedProgressSegment)
   EXPECT_NEAR(reference.signed_lateral_error, 0.08, 1e-12);
 }
 
+TEST(PathProgressTracker, curvaturePreservesLegacyTurnSignAndMagnitude)
+{
+  const double diagonal = std::sqrt(0.5);
+
+  PathProgressTracker left_turn_tracker;
+  setPreparedPath(
+    left_turn_tracker,
+    makePath({{1.0, 0.0}, {diagonal, diagonal}, {0.0, 1.0}}));
+  const auto left_turn = left_turn_tracker.update(makePoint(1.0, 0.0), 0.10);
+
+  PathProgressTracker right_turn_tracker;
+  setPreparedPath(
+    right_turn_tracker,
+    makePath({{1.0, 0.0}, {diagonal, -diagonal}, {0.0, -1.0}}));
+  const auto right_turn = right_turn_tracker.update(makePoint(1.0, 0.0), 0.10);
+
+  PathProgressTracker straight_tracker;
+  setPreparedPath(straight_tracker, makePath({{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}}));
+  const auto straight = straight_tracker.update(makePoint(0.0, 0.0), 0.10);
+
+  EXPECT_NEAR(left_turn.curvature, 1.0, 1e-12);
+  EXPECT_NEAR(right_turn.curvature, -1.0, 1e-12);
+  EXPECT_DOUBLE_EQ(straight.curvature, 0.0);
+}
+
 TEST(PathProgressTracker, onePointPathReturnsFiniteStationaryReference)
 {
   PathProgressTracker tracker;
