@@ -81,6 +81,20 @@ nav_msgs::msg::Path makeLifecyclePath()
   return path;
 }
 
+nav_msgs::msg::Path makeAngularLimitedLifecyclePath()
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (const double y : {0.0, 0.3, 0.6}) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.y = y;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  return path;
+}
+
 TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticTopic)
 {
   rclcpp::init(0, nullptr);
@@ -90,8 +104,16 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
   ScopedLogCapture log_capture;
 
   {
+    rclcpp::NodeOptions parent_options;
+    parent_options.append_parameter_override("PidTrackingController.max_v", 0.8);
+    parent_options.append_parameter_override("PidTrackingController.max_w", 0.8);
+    parent_options.append_parameter_override("PidTrackingController.model_k_v", 1.9);
+    parent_options.append_parameter_override("PidTrackingController.model_k_w", 2.1);
+    parent_options.append_parameter_override("PidTrackingController.cruise_speed", 0.8);
+    parent_options.append_parameter_override(
+      "PidTrackingController.enable_start_heading_alignment", false);
     auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
-      "pid_tracking_controller_test_node");
+      "pid_tracking_controller_test_node", parent_options);
     auto observer = std::make_shared<rclcpp::Node>(
       "pid_tracking_controller_test_observer");
     auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
@@ -133,7 +155,7 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
       pose.header.frame_id = "map";
       pose.pose.orientation.w = 1.0;
       geometry_msgs::msg::Twist velocity;
-      velocity.linear.x = 0.4;
+      velocity.linear.x = 0.2995;
       controller.computeVelocityCommands(pose, velocity, nullptr);
     }
 
@@ -149,8 +171,20 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     EXPECT_NEAR(received_carrot.point.x, 0.3, 1e-12);
     EXPECT_DOUBLE_EQ(received_carrot.point.y, 0.0);
     EXPECT_DOUBLE_EQ(received_carrot.point.z, 0.0);
+    if (costmap_configured) {
+      controller.setPlan(makeAngularLimitedLifecyclePath());
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header.frame_id = "map";
+      pose.pose.orientation.w = 1.0;
+      controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
+    }
     EXPECT_EQ(
       observer->count_publishers("/pid_tracking_controller/tracking_diagnostics"), 0u);
+    EXPECT_NE(
+      log_capture.output().find("PID_LOG effective_parameters"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("max_v=0.800000"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("max_w=0.800000"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("cruise_speed=0.800000"), std::string::npos);
     EXPECT_NE(log_capture.output().find("PID_LOG plan_revision=1"), std::string::npos);
     EXPECT_NE(log_capture.output().find("angular_saturation_ratio="), std::string::npos);
     EXPECT_NE(log_capture.output().find("phase=TRACKING"), std::string::npos);
@@ -160,6 +194,18 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     EXPECT_NE(log_capture.output().find("raw_angular_command="), std::string::npos);
     EXPECT_NE(
       log_capture.output().find("tracking_raw_angular_saturation_ratio="),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("planner_limit_active_ratio=1.000000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("linear_speed_tracking_error=0.500000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("tracking_linear_speed_error_rms=0.500000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("tracking_linear_saturation_ratio=1.000000"),
       std::string::npos);
     EXPECT_NE(
       log_capture.output().find("tracking_lateral_error_rms="), std::string::npos);
@@ -180,6 +226,12 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     EXPECT_NE(
       log_capture.output().find("required_angular_at_cruise="), std::string::npos);
     EXPECT_NE(log_capture.output().find("kappa="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("progress_arc_length="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("carrot_arc_length="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("segment_index="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("segment_fraction="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("remaining_path_length="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("progress_budget="), std::string::npos);
 
     if (costmap_configured) {
       controller.deactivate();

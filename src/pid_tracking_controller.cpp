@@ -74,6 +74,13 @@ bool eigenVectorIsFinite(const Eigen::Vector2d& vector)
     return vector.allFinite();
 }
 
+bool isNearAbsoluteLimit(double value, double limit)
+{
+    const double absolute_limit = std::abs(limit);
+    const double tolerance = std::max(1e-4, absolute_limit * 1e-3);
+    return std::abs(value) >= absolute_limit - tolerance;
+}
+
 LegacyCarrotVelocityPlannerConfig makeLegacyCarrotVelocityPlannerConfig(
   double model_k_v, double model_k_w, double characteristic_length,
   double cruise_speed, double max_angular_speed, double angular_speed_reserve)
@@ -220,11 +227,6 @@ void PidTrackingController::configure(
       controller_plugin_name + ".angular_speed_reserve", angular_speed_reserve_);
     node->get_parameter(controller_plugin_name + ".use_model", use_model_);
 
-    validateLegacyCarrotVelocityPlannerActivation(
-            use_model_, max_v_, makeLegacyCarrotVelocityPlannerConfig(
-                    model_k_v_, model_k_w_, l_, cruise_speed_, max_w_,
-                    angular_speed_reserve_));
-
     node->get_parameter(
       controller_plugin_name + ".enable_start_heading_alignment",
       enable_start_heading_alignment_);
@@ -239,6 +241,11 @@ void PidTrackingController::configure(
     double pid_frequency;
     node->get_parameter(controller_plugin_name + ".pid_frequency", pid_frequency);
     d_t_ = 1 / pid_frequency;
+
+    validateLegacyCarrotVelocityPlannerActivation(
+            use_model_, max_v_, makeLegacyCarrotVelocityPlannerConfig(
+                    model_k_v_, model_k_w_, l_, cruise_speed_, max_w_,
+                    angular_speed_reserve_));
     
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
@@ -257,6 +264,29 @@ void PidTrackingController::configure(
     force_diagnostics_log_ = true;
     start_heading_check_pending_ = false;
     start_heading_alignment_active_ = false;
+
+    RCLCPP_INFO(
+            logger_,
+            "PID_LOG effective_parameters goal_dist_tolerance=%.6f "
+            "rotate_tolerance=%.6f lookahead_time=%.6f "
+            "min_lookahead_dist=%.6f max_lookahead_dist=%.6f "
+            "max_v=%.6f min_v=%.6f max_v_inc=%.6f "
+            "max_w=%.6f min_w=%.6f max_w_inc=%.6f "
+            "k_v_p=%.6f k_v_i=%.6f k_v_d=%.6f "
+            "k_w_p=%.6f k_w_i=%.6f k_w_d=%.6f "
+            "k_theta=%.6f model_k_v=%.6f model_k_w=%.6f l=%.6f "
+            "cruise_speed=%.6f angular_speed_reserve=%.6f "
+            "enable_start_heading_alignment=%s "
+            "start_heading_enter_tolerance=%.6f "
+            "start_heading_exit_tolerance=%.6f start_heading_kp=%.6f "
+            "pid_frequency=%.6f use_model=%s",
+            goal_dist_tol_, rotate_tol_, lookahead_time_, min_lookahead_dist_,
+            max_lookahead_dist_, max_v_, min_v_, max_v_inc_, max_w_, min_w_,
+            max_w_inc_, k_v_p_, k_v_i_, k_v_d_, k_w_p_, k_w_i_, k_w_d_,
+            k_theta_, model_k_v_, model_k_w_, l_, cruise_speed_,
+            angular_speed_reserve_, enable_start_heading_alignment_ ? "true" : "false",
+            start_heading_enter_tolerance_, start_heading_exit_tolerance_,
+            start_heading_kp_, pid_frequency, use_model_ ? "true" : "false");
 }
 
 void PidTrackingController::activate()
@@ -334,14 +364,14 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
   const Eigen::Vector2d& raw_command,
   const LegacyCarrotVelocityPlan& velocity_plan,
   bool alignment_phase,
-  double lateral_error,
   double lookahead_distance,
-  double theta_trj,
-  double kappa,
-  const geometry_msgs::msg::PointStamped& carrot)
+  const PathProgressReference& path_reference)
 {
+    const double lateral_error = path_reference.signed_lateral_error;
     const double absolute_lateral_error = std::abs(lateral_error);
     const double actual_planar_speed = std::hypot(velocity.linear.x, velocity.linear.y);
+    const double linear_speed_tracking_error =
+            command.twist.linear.x - actual_planar_speed;
     ++tracking_statistics_.sample_count;
     tracking_statistics_.sum_squared_lateral_error += lateral_error * lateral_error;
     tracking_statistics_.maximum_absolute_lateral_error = std::max(
@@ -356,18 +386,18 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
     }
     tracking_statistics_.previous_position = pose.pose.position;
     tracking_statistics_.previous_position_valid = true;
-    if (std::abs(command.twist.linear.x) >= max_v_ - rmp::common::math::kMathEpsilon)
+    if (isNearAbsoluteLimit(command.twist.linear.x, max_v_))
     {
         ++tracking_statistics_.linear_saturation_count;
     }
-    if (std::abs(command.twist.angular.z) >= max_w_ - rmp::common::math::kMathEpsilon)
+    if (isNearAbsoluteLimit(command.twist.angular.z, max_w_))
     {
         ++tracking_statistics_.angular_saturation_count;
     }
     if (alignment_phase)
     {
         ++tracking_statistics_.alignment_sample_count;
-        if (std::abs(command.twist.angular.z) >= max_w_ - rmp::common::math::kMathEpsilon)
+        if (isNearAbsoluteLimit(command.twist.angular.z, max_w_))
         {
             ++tracking_statistics_.alignment_angular_saturation_count;
         }
@@ -382,17 +412,23 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
                 absolute_lateral_error);
         tracking_statistics_.tracking_absolute_lateral_error_samples.push_back(
                 absolute_lateral_error);
-        if (std::abs(command.twist.linear.x) >= max_v_ - rmp::common::math::kMathEpsilon)
+        tracking_statistics_.tracking_sum_squared_linear_speed_error +=
+                linear_speed_tracking_error * linear_speed_tracking_error;
+        if (isNearAbsoluteLimit(command.twist.linear.x, max_v_))
         {
             ++tracking_statistics_.tracking_linear_saturation_count;
         }
-        if (std::abs(command.twist.angular.z) >= max_w_ - rmp::common::math::kMathEpsilon)
+        if (isNearAbsoluteLimit(command.twist.angular.z, max_w_))
         {
             ++tracking_statistics_.tracking_angular_saturation_count;
         }
         if (std::abs(raw_command.y()) > max_w_)
         {
             ++tracking_statistics_.tracking_raw_angular_saturation_count;
+        }
+        if (velocity_plan.speed_limit_reason == SpeedLimitReason::kAngular)
+        {
+            ++tracking_statistics_.tracking_planner_limit_active_count;
         }
     }
 
@@ -424,10 +460,14 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             static_cast<double>(tracking_statistics_.angular_saturation_count) / sample_count;
     double tracking_lateral_error_rms = 0.0;
     double tracking_lateral_error_p95 = 0.0;
+    double tracking_linear_speed_error_rms = 0.0;
     if (tracking_statistics_.tracking_sample_count > 0u)
     {
         tracking_lateral_error_rms = std::sqrt(
                 tracking_statistics_.tracking_sum_squared_lateral_error /
+                static_cast<double>(tracking_statistics_.tracking_sample_count));
+        tracking_linear_speed_error_rms = std::sqrt(
+                tracking_statistics_.tracking_sum_squared_linear_speed_error /
                 static_cast<double>(tracking_statistics_.tracking_sample_count));
         auto tracking_samples = tracking_statistics_.tracking_absolute_lateral_error_samples;
         const std::size_t tracking_p95_index =
@@ -452,6 +492,9 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
     const double tracking_raw_angular_saturation_ratio = ratio(
             tracking_statistics_.tracking_raw_angular_saturation_count,
             tracking_statistics_.tracking_sample_count);
+    const double planner_limit_active_ratio = ratio(
+            tracking_statistics_.tracking_planner_limit_active_count,
+            tracking_statistics_.tracking_sample_count);
     const double elapsed_tracking_time = std::max(
             0.0, now_seconds - tracking_start_time_seconds_);
 
@@ -464,19 +507,24 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             "tracking_lateral_error_p95_abs=%.6f "
             "tracking_lateral_error_max_abs=%.6f traveled_distance=%.6f "
             "average_actual_planar_speed=%.6f commanded_linear_speed=%.6f "
-            "actual_linear_speed=%.6f commanded_angular_speed=%.6f "
+            "actual_linear_speed=%.6f linear_speed_tracking_error=%.6f "
+            "tracking_linear_speed_error_rms=%.6f commanded_angular_speed=%.6f "
             "actual_angular_speed=%.6f linear_saturation_ratio=%.6f "
             "angular_saturation_ratio=%.6f raw_linear_command=%.6f "
             "raw_angular_command=%.6f tracking_linear_saturation_ratio=%.6f "
             "tracking_angular_saturation_ratio=%.6f "
             "alignment_angular_saturation_ratio=%.6f "
-            "tracking_raw_angular_saturation_ratio=%.6f carrot_alpha=%.6f "
+            "tracking_raw_angular_saturation_ratio=%.6f "
+            "planner_limit_active_ratio=%.6f carrot_alpha=%.6f "
             "carrot_alpha_deg=%.6f carrot_sin_alpha=%.6f carrot_cos_alpha=%.6f "
             "steering_gain_ratio=%.6f cruise_speed=%.6f "
             "angular_planning_limit=%.6f angular_limited_speed=%.6f "
             "reference_speed=%.6f speed_limit_reason=%s "
             "required_angular_at_cruise=%.6f lookahead_distance=%.6f "
             "theta_trj=%.6f kappa=%.6f carrot_x=%.6f carrot_y=%.6f "
+            "progress_arc_length=%.6f carrot_arc_length=%.6f "
+            "segment_index=%zu segment_fraction=%.6f "
+            "remaining_path_length=%.6f progress_budget=%.6f "
             "elapsed_tracking_time=%.6f",
             plan_revision_, alignment_phase ? "START_ALIGNMENT" : "TRACKING",
             tracking_statistics_.sample_count, tracking_statistics_.tracking_sample_count,
@@ -485,11 +533,12 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             tracking_lateral_error_rms, tracking_lateral_error_p95,
             tracking_statistics_.tracking_maximum_absolute_lateral_error,
             tracking_statistics_.traveled_distance, average_actual_planar_speed,
-            command.twist.linear.x, actual_planar_speed, command.twist.angular.z,
+            command.twist.linear.x, actual_planar_speed, linear_speed_tracking_error,
+            tracking_linear_speed_error_rms, command.twist.angular.z,
             velocity.angular.z, linear_saturation_ratio, angular_saturation_ratio,
             raw_command.x(), raw_command.y(), tracking_linear_saturation_ratio,
             tracking_angular_saturation_ratio, alignment_angular_saturation_ratio,
-            tracking_raw_angular_saturation_ratio,
+            tracking_raw_angular_saturation_ratio, planner_limit_active_ratio,
             velocity_plan.alpha, velocity_plan.alpha * 180.0 / std::acos(-1.0),
             velocity_plan.sin_alpha, velocity_plan.cos_alpha,
             velocity_plan.steering_gain_ratio, velocity_plan.cruise_speed,
@@ -497,7 +546,11 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             velocity_plan.angular_limited_speed, velocity_plan.reference_speed,
             speedLimitReasonName(velocity_plan.speed_limit_reason),
             velocity_plan.required_angular_at_cruise,
-            lookahead_distance, theta_trj, kappa, carrot.point.x, carrot.point.y,
+            lookahead_distance, path_reference.tangent, path_reference.curvature,
+            path_reference.carrot.x, path_reference.carrot.y,
+            path_reference.progress_arc_length, path_reference.carrot_arc_length,
+            path_reference.segment_index, path_reference.segment_fraction,
+            path_reference.remaining_path_length, path_reference.progress_budget,
             elapsed_tracking_time);
     last_diagnostics_log_time_seconds_ = now_seconds;
     force_diagnostics_log_ = false;
@@ -847,9 +900,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
     }
     updateAndLogTrackingDiagnostics(
             pose, velocity, cmd_vel, raw_command, velocity_plan,
-            start_heading_alignment_active_, path_reference.signed_lateral_error,
-            L, theta_trj, kappa,
-            lookahead_pt);
+            start_heading_alignment_active_, L, path_reference);
 
     return cmd_vel;
 }

@@ -29,6 +29,7 @@ namespace pid_tracking_controller
 
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
+struct PathProgressReference;
 struct LegacyCarrotVelocityPlan;
 
 class PidTrackingController : public nav2_core::Controller
@@ -92,10 +93,12 @@ private:
     std::size_t tracking_linear_saturation_count{0};
     std::size_t tracking_angular_saturation_count{0};
     std::size_t tracking_raw_angular_saturation_count{0};
+    std::size_t tracking_planner_limit_active_count{0};
     std::size_t alignment_sample_count{0};
     std::size_t alignment_angular_saturation_count{0};
     double tracking_sum_squared_lateral_error{0.0};
     double tracking_maximum_absolute_lateral_error{0.0};
+    double tracking_sum_squared_linear_speed_error{0.0};
     std::vector<double> tracking_absolute_lateral_error_samples;
     double sum_squared_lateral_error{0.0};
     double maximum_absolute_lateral_error{0.0};
@@ -114,11 +117,8 @@ private:
     const Eigen::Vector2d & raw_command,
     const LegacyCarrotVelocityPlan & velocity_plan,
     bool alignment_phase,
-    double signed_lateral_error,
     double lookahead_distance,
-    double theta_trj,
-    double kappa,
-    const geometry_msgs::msg::PointStamped & carrot);
+    const PathProgressReference & path_reference);
 
   double factor_{0.0};
 

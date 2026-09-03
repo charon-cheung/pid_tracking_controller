@@ -21,6 +21,8 @@ struct PathProgressReference
   double segment_fraction{0.0};
   double progress_arc_length{0.0};
   double carrot_arc_length{0.0};
+  double remaining_path_length{0.0};
+  double progress_budget{0.0};
   double tangent{0.0};
   double curvature{0.0};
   double signed_lateral_error{0.0};
@@ -46,7 +48,10 @@ private:
   double progress_budget_{0.0};
   double maximum_progress_budget_{0.0};
   geometry_msgs::msg::Point previous_robot_position_;
+  double previous_accepted_tangent_x_{0.0};
+  double previous_accepted_tangent_y_{0.0};
   bool previous_robot_position_valid_{false};
+  bool previous_accepted_tangent_valid_{false};
 };
 
 }  // namespace pid_tracking_controller

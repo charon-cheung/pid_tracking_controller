@@ -16,7 +16,7 @@ controller_server:
       max_v: 0.8
       min_v: 0.05
       max_v_inc: 0.5
-      max_w: 0.6  # 0.6
+      max_w: 0.8
       min_w: 0.0
       max_w_inc: 0.2
       k_v_p: 2.0
@@ -29,7 +29,7 @@ controller_server:
       model_k_v: 1.9
       model_k_w: 2.1
       l: 0.2
-      cruise_speed: 0.6  # 0.5
+      cruise_speed: 0.8
       angular_speed_reserve: 0.10
       enable_start_heading_alignment: true
       start_heading_enter_tolerance: 0.3

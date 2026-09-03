@@ -112,6 +112,8 @@ bool referenceIsFinite(const PathProgressReference & reference)
          std::isfinite(reference.segment_fraction) &&
          std::isfinite(reference.progress_arc_length) &&
          std::isfinite(reference.carrot_arc_length) &&
+         std::isfinite(reference.remaining_path_length) &&
+         std::isfinite(reference.progress_budget) &&
          std::isfinite(reference.tangent) && std::isfinite(reference.curvature) &&
          std::isfinite(reference.signed_lateral_error);
 }
@@ -168,6 +170,7 @@ void PathProgressTracker::setPath(const nav_msgs::msg::Path & path)
   maximum_progress_budget_ = 2.0 * representative_spacing;
   progress_budget_ = maximum_progress_budget_;
   previous_robot_position_valid_ = false;
+  previous_accepted_tangent_valid_ = false;
 }
 
 PathProgressReference PathProgressTracker::update(
@@ -183,10 +186,16 @@ PathProgressReference PathProgressTracker::update(
     throw std::domain_error("robot position and lookahead distance must be finite");
   }
 
-  if (previous_robot_position_valid_) {
+  if (previous_robot_position_valid_ && previous_accepted_tangent_valid_) {
+    const double displacement_x = robot_position.x - previous_robot_position_.x;
+    const double displacement_y = robot_position.y - previous_robot_position_.y;
+    const double forward_displacement = std::max(
+      0.0,
+      displacement_x * previous_accepted_tangent_x_ +
+      displacement_y * previous_accepted_tangent_y_);
     progress_budget_ = std::min(
       maximum_progress_budget_,
-      progress_budget_ + planarDistance(robot_position, previous_robot_position_));
+      progress_budget_ + forward_displacement);
   }
 
   PathProgressReference reference;
@@ -194,6 +203,8 @@ PathProgressReference PathProgressTracker::update(
   if (total_path_length_ <= rmp::common::math::kMathEpsilon) {
     reference.projection = path_.front().pose.position;
     reference.carrot = path_.front().pose.position;
+    reference.remaining_path_length = 0.0;
+    reference.progress_budget = progress_budget_;
     reference.signed_lateral_error = planarDistance(robot_position, reference.projection);
     previous_robot_position_ = robot_position;
     previous_robot_position_valid_ = true;
@@ -273,6 +284,15 @@ PathProgressReference PathProgressTracker::update(
   const double advance = std::max(0.0, best_arc_length - progress_arc_length_);
   progress_arc_length_ = std::max(progress_arc_length_, best_arc_length);
   progress_budget_ = std::max(0.0, progress_budget_ - advance);
+
+  const auto & accepted_start = path_[best_segment_index].pose.position;
+  const auto & accepted_end = path_[best_segment_index + 1u].pose.position;
+  const double accepted_dx = accepted_end.x - accepted_start.x;
+  const double accepted_dy = accepted_end.y - accepted_start.y;
+  const double accepted_length = std::hypot(accepted_dx, accepted_dy);
+  previous_accepted_tangent_x_ = accepted_dx / accepted_length;
+  previous_accepted_tangent_y_ = accepted_dy / accepted_length;
+  previous_accepted_tangent_valid_ = true;
   previous_robot_position_ = robot_position;
   previous_robot_position_valid_ = true;
 
@@ -282,6 +302,9 @@ PathProgressReference PathProgressTracker::update(
   reference.progress_arc_length = progress_arc_length_;
   reference.carrot_arc_length = std::min(
     progress_arc_length_ + lookahead_distance, total_path_length_);
+  reference.remaining_path_length = std::max(
+    0.0, total_path_length_ - reference.progress_arc_length);
+  reference.progress_budget = progress_budget_;
   const auto carrot = interpolateAtArcLength(
     path_, cumulative_lengths_, total_path_length_, reference.carrot_arc_length);
   reference.carrot = carrot.point;

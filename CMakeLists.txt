@@ -43,6 +43,7 @@ add_library(${PROJECT_NAME} SHARED
   src/pid_tracking_controller.cpp
   src/legacy_carrot_velocity_planner.cpp
   src/path_progress_tracker.cpp
+  src/prepared_path.cpp
   common/src/geometry/vec2d.cpp
   common/src/math/math_helper.cpp
 )
@@ -123,6 +124,20 @@ if(BUILD_TESTING)
     nav_msgs
   )
   target_link_libraries(test_path_progress_tracker
+    ${PROJECT_NAME}
+  )
+
+  ament_add_gtest(test_prepared_path
+    test/test_prepared_path.cpp
+  )
+  target_include_directories(test_prepared_path PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_target_dependencies(test_prepared_path
+    geometry_msgs
+    nav_msgs
+  )
+  target_link_libraries(test_prepared_path
     ${PROJECT_NAME}
   )
 

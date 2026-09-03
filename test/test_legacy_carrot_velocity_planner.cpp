@@ -14,11 +14,11 @@ namespace
 LegacyCarrotVelocityPlannerConfig baselineConfig()
 {
   LegacyCarrotVelocityPlannerConfig config;
-  config.model_k_v = 1.7;
-  config.model_k_w = 1.9;
+  config.model_k_v = 1.9;
+  config.model_k_w = 2.1;
   config.characteristic_length = 0.2;
-  config.cruise_speed = 0.51;
-  config.max_angular_speed = 0.6;
+  config.cruise_speed = 0.8;
+  config.max_angular_speed = 0.8;
   config.angular_speed_reserve = 0.1;
   return config;
 }
@@ -43,9 +43,9 @@ TEST(LegacyCarrotVelocityPlanner, straightCarrotUsesIndependentCruiseSpeed)
 {
   const auto plan = planLegacyCarrotVelocity(0.3, 0.0, baselineConfig());
 
-  EXPECT_NEAR(plan.raw_linear_command, 0.51, 1e-12);
+  EXPECT_NEAR(plan.raw_linear_command, 0.8, 1e-12);
   EXPECT_NEAR(plan.raw_angular_command, 0.0, 1e-12);
-  EXPECT_NEAR(plan.reference_speed, 0.51, 1e-12);
+  EXPECT_NEAR(plan.reference_speed, 0.8, 1e-12);
   EXPECT_EQ(plan.speed_limit_reason, SpeedLimitReason::kCruise);
 }
 
@@ -66,12 +66,12 @@ TEST(LegacyCarrotVelocityPlanner, angularDemandReducesCommonCommandScaleBeforeSa
       baselineConfig());
 
   EXPECT_EQ(plan.speed_limit_reason, SpeedLimitReason::kAngular);
-  EXPECT_NEAR(plan.angular_planning_limit, 0.5, 1e-12);
-  EXPECT_NEAR(plan.angular_limited_speed, 0.261603551593539, 1e-12);
-  EXPECT_NEAR(plan.reference_speed, 0.261603551593539, 1e-12);
-  EXPECT_NEAR(plan.raw_linear_command, 0.245826927003835, 1e-12);
-  EXPECT_NEAR(plan.raw_angular_command, 0.5, 1e-12);
-  EXPECT_NEAR(plan.required_angular_at_cruise, 0.974757408478156, 1e-12);
+  EXPECT_NEAR(plan.angular_planning_limit, 0.7, 1e-12);
+  EXPECT_NEAR(plan.angular_limited_speed, 0.370348557353991, 1e-12);
+  EXPECT_NEAR(plan.reference_speed, 0.370348557353991, 1e-12);
+  EXPECT_NEAR(plan.raw_linear_command, 0.348013806464252, 1e-12);
+  EXPECT_NEAR(plan.raw_angular_command, 0.7, 1e-12);
+  EXPECT_NEAR(plan.required_angular_at_cruise, 1.512089054702956, 1e-12);
 }
 
 TEST(LegacyCarrotVelocityPlanner, zeroDistanceReturnsFiniteZeroCommand)
@@ -113,7 +113,7 @@ TEST(LegacyCarrotVelocityPlanner, unconstrainedTinySteeringRatioKeepsFiniteCruis
 
   EXPECT_TRUE(allFieldsAreFinite(plan));
   EXPECT_EQ(plan.speed_limit_reason, SpeedLimitReason::kCruise);
-  EXPECT_NEAR(plan.reference_speed, 0.51, 1e-12);
+  EXPECT_NEAR(plan.reference_speed, 0.8, 1e-12);
 }
 
 TEST(LegacyCarrotVelocityPlanner, acceptsFiniteStrictlyPositiveParametersBelowMathEpsilon)
