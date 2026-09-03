@@ -101,6 +101,7 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
 
   bool carrot_received = false;
   geometry_msgs::msg::PointStamped received_carrot;
+  geometry_msgs::msg::TwistStamped legacy_command;
   ScopedLogCapture log_capture;
 
   {
@@ -156,7 +157,7 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
       pose.pose.orientation.w = 1.0;
       geometry_msgs::msg::Twist velocity;
       velocity.linear.x = 0.2995;
-      controller.computeVelocityCommands(pose, velocity, nullptr);
+      legacy_command = controller.computeVelocityCommands(pose, velocity, nullptr);
     }
 
     const auto message_deadline = std::chrono::steady_clock::now() + 1s;
@@ -171,6 +172,9 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     EXPECT_NEAR(received_carrot.point.x, 0.3, 1e-12);
     EXPECT_DOUBLE_EQ(received_carrot.point.y, 0.0);
     EXPECT_DOUBLE_EQ(received_carrot.point.z, 0.0);
+    EXPECT_NEAR(legacy_command.twist.linear.x, 0.7995, 1e-12);
+    EXPECT_DOUBLE_EQ(legacy_command.twist.linear.y, 0.0);
+    EXPECT_DOUBLE_EQ(legacy_command.twist.angular.z, 0.0);
     if (costmap_configured) {
       controller.setPlan(makeAngularLimitedLifecyclePath());
       geometry_msgs::msg::PoseStamped pose;
@@ -232,6 +236,37 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     EXPECT_NE(log_capture.output().find("segment_fraction="), std::string::npos);
     EXPECT_NE(log_capture.output().find("remaining_path_length="), std::string::npos);
     EXPECT_NE(log_capture.output().find("progress_budget="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("reference_mode=translation"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("current_segment_index=0"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("current_segment_fraction=0.000000"),
+      std::string::npos);
+    EXPECT_NE(log_capture.output().find("current_ref_x=0.000000"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("current_ref_y=0.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("current_path_tangent=0.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("current_target_yaw=0.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("current_target_yaw_rate_per_meter=0.000000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("preview_segment_index=0"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("preview_segment_fraction=1.000000"),
+      std::string::npos);
+    EXPECT_NE(log_capture.output().find("preview_ref_x=0.300000"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("preview_ref_y=0.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("preview_path_tangent=0.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("preview_target_yaw=0.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("preview_clamped_by_rotation=false"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("rotation_target_yaw=0.000000"), std::string::npos);
 
     if (costmap_configured) {
       controller.deactivate();

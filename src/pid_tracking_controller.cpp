@@ -10,11 +10,13 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 #include "angles/angles.h"
 #include "common/math/math_helper.h"
+#include "holonomic_tracking_reference.hpp"
 #include "legacy_carrot_velocity_planner.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
@@ -80,6 +82,20 @@ bool isNearAbsoluteLimit(double value, double limit)
     const double absolute_limit = std::abs(limit);
     const double tolerance = std::max(1e-4, absolute_limit * 1e-3);
     return std::abs(value) >= absolute_limit - tolerance;
+}
+
+const char * holonomicReferenceModeName(HolonomicReferenceMode mode)
+{
+    switch (mode)
+    {
+        case HolonomicReferenceMode::kTranslation:
+            return "translation";
+        case HolonomicReferenceMode::kRotationPending:
+            return "rotation_pending";
+        case HolonomicReferenceMode::kTerminal:
+            return "terminal";
+    }
+    return "unknown";
 }
 
 LegacyCarrotVelocityPlannerConfig makeLegacyCarrotVelocityPlannerConfig(
@@ -378,7 +394,8 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
   const LegacyCarrotVelocityPlan& velocity_plan,
   bool alignment_phase,
   double lookahead_distance,
-  const PathProgressReference& path_reference)
+  const PathProgressReference& path_reference,
+  const HolonomicTrackingReference * holonomic_reference)
 {
     const double lateral_error = path_reference.signed_lateral_error;
     const double absolute_lateral_error = std::abs(lateral_error);
@@ -510,6 +527,11 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             tracking_statistics_.tracking_sample_count);
     const double elapsed_tracking_time = std::max(
             0.0, now_seconds - tracking_start_time_seconds_);
+    const HolonomicTrackingReference unavailable_reference;
+    const auto & shadow_reference = holonomic_reference ?
+            *holonomic_reference : unavailable_reference;
+    const char * reference_mode = holonomic_reference ?
+            holonomicReferenceModeName(shadow_reference.mode) : "unavailable";
 
     RCLCPP_INFO(
             logger_,
@@ -538,6 +560,13 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             "progress_arc_length=%.6f carrot_arc_length=%.6f "
             "segment_index=%zu segment_fraction=%.6f "
             "remaining_path_length=%.6f progress_budget=%.6f "
+            "reference_mode=%s current_segment_index=%zu "
+            "current_segment_fraction=%.6f current_ref_x=%.6f current_ref_y=%.6f "
+            "current_path_tangent=%.6f current_target_yaw=%.6f "
+            "current_target_yaw_rate_per_meter=%.6f preview_segment_index=%zu "
+            "preview_segment_fraction=%.6f preview_ref_x=%.6f preview_ref_y=%.6f "
+            "preview_path_tangent=%.6f preview_target_yaw=%.6f "
+            "preview_clamped_by_rotation=%s rotation_target_yaw=%.6f "
             "elapsed_tracking_time=%.6f",
             plan_revision_, alignment_phase ? "START_ALIGNMENT" : "TRACKING",
             tracking_statistics_.sample_count, tracking_statistics_.tracking_sample_count,
@@ -564,6 +593,17 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             path_reference.progress_arc_length, path_reference.carrot_arc_length,
             path_reference.segment_index, path_reference.segment_fraction,
             path_reference.remaining_path_length, path_reference.progress_budget,
+            reference_mode, shadow_reference.current.cursor.segment_index,
+            shadow_reference.current.cursor.segment_fraction,
+            shadow_reference.current.position.x, shadow_reference.current.position.y,
+            shadow_reference.current.path_tangent, shadow_reference.current.target_yaw,
+            shadow_reference.current.target_yaw_rate_per_meter,
+            shadow_reference.preview.cursor.segment_index,
+            shadow_reference.preview.cursor.segment_fraction,
+            shadow_reference.preview.position.x, shadow_reference.preview.position.y,
+            shadow_reference.preview.path_tangent, shadow_reference.preview.target_yaw,
+            shadow_reference.preview_clamped_by_rotation ? "true" : "false",
+            shadow_reference.rotation_target_yaw,
             elapsed_tracking_time);
     last_diagnostics_log_time_seconds_ = now_seconds;
     force_diagnostics_log_ = false;
@@ -735,6 +775,23 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         throw nav2_core::NoValidControl(
                 controller_plugin_name + " could not update ordered path progress: " +
                 exception.what());
+    }
+
+    std::optional<HolonomicTrackingReference> holonomic_reference;
+    try
+    {
+        if (!prepared_path_)
+        {
+            throw std::logic_error("prepared path is unavailable");
+        }
+        holonomic_reference = buildHolonomicTrackingReference(
+                *prepared_path_, path_reference, L);
+    }
+    catch (const std::exception & exception)
+    {
+        RCLCPP_WARN_THROTTLE(
+                logger_, *clock_, 5000,
+                "PID_LOG shadow_reference=unavailable reason=%s", exception.what());
     }
 
     geometry_msgs::msg::PointStamped lookahead_pt;
@@ -913,7 +970,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
     }
     updateAndLogTrackingDiagnostics(
             pose, velocity, cmd_vel, raw_command, velocity_plan,
-            start_heading_alignment_active_, L, path_reference);
+            start_heading_alignment_active_, L, path_reference,
+            holonomic_reference ? &holonomic_reference.value() : nullptr);
 
     return cmd_vel;
 }

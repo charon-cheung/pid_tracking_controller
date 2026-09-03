@@ -32,6 +32,7 @@ class PathProgressTracker;
 struct PreparedPath;
 struct PathProgressReference;
 struct LegacyCarrotVelocityPlan;
+struct HolonomicTrackingReference;
 
 class PidTrackingController : public nav2_core::Controller
 {
@@ -119,7 +120,8 @@ private:
     const LegacyCarrotVelocityPlan & velocity_plan,
     bool alignment_phase,
     double lookahead_distance,
-    const PathProgressReference & path_reference);
+    const PathProgressReference & path_reference,
+    const HolonomicTrackingReference * holonomic_reference);
 
   double factor_{0.0};
 
