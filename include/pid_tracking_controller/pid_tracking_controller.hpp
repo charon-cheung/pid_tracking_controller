@@ -28,13 +28,14 @@ namespace pid_tracking_controller
 {
 
 class PidTrackingControllerTestAccess;
+class PathProgressTracker;
 struct LegacyCarrotVelocityPlan;
 
 class PidTrackingController : public nav2_core::Controller
 {
 public:
-  PidTrackingController() = default;
-  ~PidTrackingController() override = default;
+  PidTrackingController();
+  ~PidTrackingController() override;
 
   void configure(
     const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
@@ -68,16 +69,7 @@ public:
     const geometry_msgs::msg::Twist & measured_twist, double desired_velocity);
   double angularRegularization(
     const geometry_msgs::msg::Twist & measured_twist, double desired_velocity);
-  std::vector<geometry_msgs::msg::PoseStamped> prune(
-    const geometry_msgs::msg::PoseStamped robot_pose_global);
   double getLookAheadDistance(double velocity);
-  void getLookAheadPoint(
-    double lookahead_dist,
-    geometry_msgs::msg::PoseStamped robot_pose_global,
-    const std::vector<geometry_msgs::msg::PoseStamped> & prune_plan,
-    geometry_msgs::msg::PointStamped & point,
-    double & theta,
-    double & kappa);
 
   Eigen::Vector2d NoModelPidControl(
     Eigen::Vector3d state,
@@ -122,7 +114,7 @@ private:
     const Eigen::Vector2d & raw_command,
     const LegacyCarrotVelocityPlan & velocity_plan,
     bool alignment_phase,
-    const std::vector<geometry_msgs::msg::PoseStamped> & prune_plan,
+    double signed_lateral_error,
     double lookahead_distance,
     double theta_trj,
     double kappa,
@@ -180,6 +172,7 @@ private:
   double goal_theta_{0.0};
 
   std::vector<geometry_msgs::msg::PoseStamped> global_plan_;
+  std::unique_ptr<PathProgressTracker> path_progress_tracker_;
   std::string controller_plugin_name;
   bool use_model_{true};
 
@@ -195,7 +188,7 @@ private:
   std::shared_ptr<tf2_ros::Buffer> tf_;
   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros_;
   nav2_costmap_2d::Costmap2D * costmap_{nullptr};
-  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PointStamped>::SharedPtr
     carrot_pub_;
 };
 

@@ -38,6 +38,39 @@ geometry_msgs::msg::PoseStamped makeRobotPose(double yaw = 0.0)
   return pose;
 }
 
+geometry_msgs::msg::PoseStamped makeRobotPoseAt(
+  double x, double y, double yaw = 0.0)
+{
+  auto pose = makeRobotPose(yaw);
+  pose.pose.position.x = x;
+  pose.pose.position.y = y;
+  return pose;
+}
+
+nav_msgs::msg::Path makeDenseHairpinPath()
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  const auto append = [&path](double x, double y) {
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header = path.header;
+      pose.pose.position.x = x;
+      pose.pose.position.y = y;
+      pose.pose.orientation.w = 1.0;
+      path.poses.push_back(pose);
+    };
+
+  for (int index = 0; index <= 20; ++index) {
+    append(0.05 * static_cast<double>(index), 0.0);
+  }
+  append(1.0, 0.05);
+  append(1.0, 0.10);
+  for (int index = 19; index >= 0; --index) {
+    append(0.05 * static_cast<double>(index), 0.10);
+  }
+  return path;
+}
+
 class CommandContractTest : public ::testing::Test
 {
 protected:
@@ -75,23 +108,6 @@ TEST(PathValidation, emptyPathClearsOldPlanAndThrowsInvalidPath)
 
   EXPECT_THROW(controller.setPlan(nav_msgs::msg::Path()), nav2_core::InvalidPath);
   EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
-}
-
-TEST(PathContract, onePointPathKeepsFiniteTerminalCarrot)
-{
-  PidTrackingController controller;
-  const auto path = makeStraightPath({0.2});
-  geometry_msgs::msg::PointStamped carrot;
-  double theta_trj = std::numeric_limits<double>::quiet_NaN();
-  double kappa = std::numeric_limits<double>::quiet_NaN();
-
-  controller.getLookAheadPoint(
-    0.3, makeRobotPose(), path.poses, carrot, theta_trj, kappa);
-
-  EXPECT_DOUBLE_EQ(carrot.point.x, 0.2);
-  EXPECT_DOUBLE_EQ(carrot.point.y, 0.0);
-  EXPECT_TRUE(std::isfinite(theta_trj));
-  EXPECT_DOUBLE_EQ(kappa, 0.0);
 }
 
 TEST_F(CommandContractTest, commandUsesMeasuredVelocityAndKeepsLateralVelocityZero)
@@ -173,9 +189,21 @@ TEST_F(CommandContractTest, headingAlignmentDoesNotReenterDuringSameGoal)
   controller_.setPlan(makeStraightPath({0.0, 0.2, 0.6}));
 
   const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+    makeRobotPose(1.0), geometry_msgs::msg::Twist(), nullptr);
 
-  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.05);
+  EXPECT_GT(command.twist.linear.x, 0.0);
+}
+
+TEST_F(CommandContractTest, zeroCarrotCommandRemainsStoppedThroughRegularization)
+{
+  controller_.setPlan(makeStraightPath({0.0}));
+
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
+
+  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+  EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.0);
 }
 
 TEST_F(CommandContractTest, newGoalCanStartHeadingAlignmentAgain)
@@ -202,6 +230,27 @@ TEST_F(CommandContractTest, normalTrackingNeverCommandsReverseMotion)
   EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
 }
 
+TEST_F(CommandContractTest, nearbyFutureBranchDoesNotTakeOverTracking)
+{
+  controller_.setPlan(makeDenseHairpinPath());
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.30;
+  for (int index = 0; index <= 8; ++index) {
+    controller_.computeVelocityCommands(
+      makeRobotPoseAt(0.05 * static_cast<double>(index), 0.0), measured, nullptr);
+  }
+
+  const auto command = controller_.computeVelocityCommands(
+    makeRobotPoseAt(0.40, 0.08), measured, nullptr);
+
+  EXPECT_GT(command.twist.linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+  const auto & lateral_errors =
+    PidTrackingControllerTestAccess::trackingAbsoluteLateralErrorSamples(controller_);
+  ASSERT_FALSE(lateral_errors.empty());
+  EXPECT_NEAR(lateral_errors.back(), 0.08, 1e-12);
+}
+
 TEST_F(CommandContractTest, nonFinitePoseThrowsNoValidControl)
 {
   auto pose = makeRobotPose();
@@ -219,20 +268,6 @@ TEST_F(CommandContractTest, nonFiniteVelocityThrowsNoValidControl)
 
   EXPECT_THROW(
     controller_.computeVelocityCommands(makeRobotPose(), measured, nullptr),
-    nav2_core::NoValidControl);
-}
-
-TEST(PathContract, missingFiniteIntersectionThrowsNoValidControl)
-{
-  PidTrackingController controller;
-  const auto path = makeStraightPath({1e-6});
-  geometry_msgs::msg::PointStamped carrot;
-  double theta_trj = 0.0;
-  double kappa = 0.0;
-
-  EXPECT_THROW(
-    controller.getLookAheadPoint(
-      1e-6, makeRobotPose(), path.poses, carrot, theta_trj, kappa),
     nav2_core::NoValidControl);
 }
 

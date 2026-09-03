@@ -8,20 +8,19 @@
 
 #include <algorithm>
 #include <cmath>
-#include <functional>
 #include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 #include "angles/angles.h"
-#include "common/geometry/vec2d.h"
 #include "common/math/math_helper.h"
 #include "legacy_carrot_velocity_planner.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
+#include "path_progress_tracker.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/utils.h"
@@ -112,6 +111,13 @@ LegacyCarrotVelocityPlan planModelVelocity(
 }
 
 }  // namespace
+
+PidTrackingController::PidTrackingController()
+: path_progress_tracker_(std::make_unique<PathProgressTracker>())
+{
+}
+
+PidTrackingController::~PidTrackingController() = default;
 
 void PidTrackingController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
@@ -242,7 +248,7 @@ void PidTrackingController::configure(
     e_w_ = i_w_ = 0.0;
     goal_x_ = goal_y_ = std::numeric_limits<double>::max();
 
-    carrot_pub_ = node->create_publisher<geometry_msgs::msg::PoseStamped>(
+    carrot_pub_ = node->create_publisher<geometry_msgs::msg::PointStamped>(
       "pid_tracking_controller/carrot", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
 
     tracking_statistics_ = TrackingStatistics();
@@ -288,6 +294,7 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
                 controller_plugin_name + " received an empty or non-finite path");
     }
     global_plan_ = orig_global_plan.poses;
+    path_progress_tracker_->setPath(orig_global_plan);
     ++plan_revision_;
     // receive a plan for a new goal
     if (goal_x_ != global_plan_.back().pose.position.x || goal_y_ != global_plan_.back().pose.position.y)
@@ -327,46 +334,12 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
   const Eigen::Vector2d& raw_command,
   const LegacyCarrotVelocityPlan& velocity_plan,
   bool alignment_phase,
-  const std::vector<geometry_msgs::msg::PoseStamped>& prune_plan,
+  double lateral_error,
   double lookahead_distance,
   double theta_trj,
   double kappa,
   const geometry_msgs::msg::PointStamped& carrot)
 {
-    double lateral_error = 0.0;
-    bool segment_found = false;
-    for (std::size_t index = 0; index + 1 < prune_plan.size(); ++index)
-    {
-        const auto& start = prune_plan[index].pose.position;
-        const auto& end = prune_plan[index + 1].pose.position;
-        const double dx = end.x - start.x;
-        const double dy = end.y - start.y;
-        const double length_squared = dx * dx + dy * dy;
-        if (length_squared <= rmp::common::math::kMathEpsilon)
-        {
-            continue;
-        }
-
-        const double relative_x = pose.pose.position.x - start.x;
-        const double relative_y = pose.pose.position.y - start.y;
-        const double projection = std::clamp(
-                (relative_x * dx + relative_y * dy) / length_squared, 0.0, 1.0);
-        const double projected_x = start.x + projection * dx;
-        const double projected_y = start.y + projection * dy;
-        const double distance = std::hypot(
-                pose.pose.position.x - projected_x, pose.pose.position.y - projected_y);
-        const double cross = dx * relative_y - dy * relative_x;
-        lateral_error = cross < 0.0 ? -distance : distance;
-        segment_found = true;
-        break;
-    }
-    if (!segment_found)
-    {
-        lateral_error = std::hypot(
-                pose.pose.position.x - prune_plan.front().pose.position.x,
-                pose.pose.position.y - prune_plan.front().pose.position.y);
-    }
-
     const double absolute_lateral_error = std::abs(lateral_error);
     const double actual_planar_speed = std::hypot(velocity.linear.x, velocity.linear.y);
     ++tracking_statistics_.sample_count;
@@ -648,177 +621,6 @@ void PidTrackingController::setSpeedLimit(const double &, const bool &)
     
 }
 
-/**
- * @brief find the point on the path that is exactly the lookahead distance away from the robot
- * @param lookahead_dist    the lookahead distance
- * @param robot_pose_global the robot's pose  [global]
- * @param prune_plan        the pruned plan
- * @param pt                the lookahead point
- * @param theta             the angle on traj
- * @param kappa             the curvature on traj
- */
-void PidTrackingController::getLookAheadPoint(double lookahead_dist, geometry_msgs::msg::PoseStamped robot_pose_global,
-                                              const std::vector<geometry_msgs::msg::PoseStamped>& prune_plan,
-                                              geometry_msgs::msg::PointStamped& pt, double& theta, double& kappa)
-{
-    if (prune_plan.empty())
-    {
-        throw nav2_core::InvalidPath(controller_plugin_name + " has no path for carrot selection");
-    }
-
-    double rx = robot_pose_global.pose.position.x;
-    double ry = robot_pose_global.pose.position.y;
-    
-    // Find the first pose which is at a distance greater than the lookahead distance
-    auto goal_pose_it = std::find_if(prune_plan.begin(), prune_plan.end(), [&](const geometry_msgs::msg::PoseStamped& ps) {
-        return std::hypot(ps.pose.position.x - robot_pose_global.pose.position.x,
-                          ps.pose.position.y - robot_pose_global.pose.position.y) >= lookahead_dist;
-    });
-    
-    // If the no pose is not far enough, take the last pose
-    if (goal_pose_it == prune_plan.end())
-    {
-        goal_pose_it = std::prev(prune_plan.end());
-        pt.point.x = goal_pose_it->pose.position.x;
-        pt.point.y = goal_pose_it->pose.position.y;
-        kappa = 0;
-        theta = atan2(pt.point.y - ry, pt.point.x - rx);
-    }
-    else
-    {
-        // find the point on the line segment between the two poses
-        // that is exactly the lookahead distance away from the robot pose (the origin)
-        // This can be found with a closed form for the intersection of a segment and a circle
-        // Because of the way we did the std::find_if, prev_pose is guaranteed to be inside the circle,
-        // and goal_pose is guaranteed to be outside the circle.
-        double px, py;
-        double gx = goal_pose_it->pose.position.x;
-        double gy = goal_pose_it->pose.position.y;
-        if (goal_pose_it == prune_plan.begin())
-        {
-            px = rx;
-            py = ry;
-        }
-        else
-        {
-            auto prev_pose_it = std::prev(goal_pose_it);
-            px = prev_pose_it->pose.position.x;
-            py = prev_pose_it->pose.position.y;
-        }
-        
-        // transform to the robot frame so that the circle centers at (0,0)
-        rmp::common::geometry::Vec2d prev_p(px - rx, py - ry);
-        rmp::common::geometry::Vec2d goal_p(gx - rx, gy - ry);
-        
-        std::vector<rmp::common::geometry::Vec2d> i_points =
-                rmp::common::math::circleSegmentIntersection(prev_p, goal_p, lookahead_dist);
-        if (i_points.empty())
-        {
-            throw nav2_core::NoValidControl(
-                    controller_plugin_name + " could not compute a finite lookahead carrot");
-        }
-        
-        double dist_to_goal = std::numeric_limits<double>::max();
-        for (const auto& i_point : i_points)
-        {
-            double dist = std::hypot(i_point.x() + rx - gx, i_point.y() + ry - gy);
-            if (dist < dist_to_goal)
-            {
-                dist_to_goal = dist;
-                pt.point.x = i_point.x() + rx;
-                pt.point.y = i_point.y() + ry;
-            }
-        }
-        if (dist_to_goal == std::numeric_limits<double>::max())
-        {
-            throw nav2_core::NoValidControl(
-                    controller_plugin_name + " could not select a finite lookahead carrot");
-        }
-        
-        auto next_pose_it = std::next(goal_pose_it);
-        if (next_pose_it != prune_plan.end())
-        {
-            rmp::common::geometry::Vec2d p1(px, py), p2(gx, gy),
-                    p3(next_pose_it->pose.position.x, next_pose_it->pose.position.y);
-            kappa = rmp::common::math::arcCenter(p1, p2, p3, false);
-        }
-        else
-        {
-            kappa = 0.0;
-        }
-        
-        theta = atan2(gy - py, gx - px);
-    }
-    pt.header.frame_id = goal_pose_it->header.frame_id;
-    pt.header.stamp = goal_pose_it->header.stamp;
-}
-
-
-/**
- * @brief Prune the path, removing the waypoints that the robot has already passed and distant waypoints
- * @param robot_pose_global the robot's pose  [global]
- * @return pruned path
- */
-std::vector<geometry_msgs::msg::PoseStamped> PidTrackingController::prune(const geometry_msgs::msg::PoseStamped robot_pose_global)
-{
-    auto calPoseDistance = [](const geometry_msgs::msg::PoseStamped& ps_1, const geometry_msgs::msg::PoseStamped& ps_2) {
-        return std::hypot(ps_1.pose.position.x - ps_2.pose.position.x, ps_1.pose.position.y - ps_2.pose.position.y);
-    };
-    
-    auto firstIntegratedDistance =
-            [](std::vector<geometry_msgs::msg::PoseStamped>::iterator begin, std::vector<geometry_msgs::msg::PoseStamped>::iterator end,
-            std::function<double(const geometry_msgs::msg::PoseStamped&, const geometry_msgs::msg::PoseStamped&)> dist,
-            double cmp_val) {
-        if (begin == end)
-            return end;
-        double d = 0.0;
-        for (auto it = begin; it != end - 1; it++)
-        {
-            d += dist(*it, *(it + 1));
-            if (d > cmp_val)
-                return it + 1;
-        }
-        return end;
-    };
-    
-    auto getMinFuncVal = [](std::vector<geometry_msgs::msg::PoseStamped>::iterator begin,
-            std::vector<geometry_msgs::msg::PoseStamped>::iterator end,
-            std::function<double(const geometry_msgs::msg::PoseStamped&)> cal)
-    {
-        if (begin == end)
-            return end;
-        
-        auto min_val = cal(*begin);
-        auto min_iter = begin;
-        for (auto it = ++begin; it != end; it++)
-        {
-            auto val = cal(*it);
-            if (val <= min_val)
-            {
-                min_val = val;
-                min_iter = it;
-            }
-        }
-        return min_iter;
-    };
-    auto closest_pose_upper_bound = firstIntegratedDistance(global_plan_.begin(), global_plan_.end(), calPoseDistance,
-                                                            costmap_->getSizeInMetersX() / 2.0);
-    // find the closest pose on the path to the robot
-    auto transform_begin =
-            getMinFuncVal(global_plan_.begin(), closest_pose_upper_bound,
-                          [&](const geometry_msgs::msg::PoseStamped& ps) { return calPoseDistance(robot_pose_global, ps); });
-    // Transform the near part of the global plan into the robot's frame of reference.
-    std::vector<geometry_msgs::msg::PoseStamped> prune_path;
-    for (auto it = transform_begin; it < global_plan_.end(); it++)
-        prune_path.push_back(*it);
-    
-    // path pruning: remove the portion of the global plan that already passed so don't process it on the next iteration
-    global_plan_.erase(std::begin(global_plan_), transform_begin);
-    
-    return prune_path;
-}
-
-
 geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(const geometry_msgs::msg::PoseStamped& pose,
                                                                                 const geometry_msgs::msg::Twist& velocity,
                                                                                 nav2_core::GoalChecker* /*goal_checker*/)
@@ -850,12 +652,6 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
     double wt = velocity.angular.z;
     
     geometry_msgs::msg::PoseStamped current_ps_map = pose;
-    std::vector<geometry_msgs::msg::PoseStamped> prune_plan = prune(current_ps_map);
-    if (prune_plan.empty())
-    {
-        throw nav2_core::InvalidPath(controller_plugin_name + " produced an empty pruned path");
-    }
-    
     double L = getLookAheadDistance(vt);
     if (!scalarIsFinite(L))
     {
@@ -863,10 +659,24 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 controller_plugin_name + " produced a non-finite lookahead distance");
     }
     
-    // get the particular point on the path at the lookahead distance
+    PathProgressReference path_reference;
+    try
+    {
+        path_reference = path_progress_tracker_->update(pose.pose.position, L);
+    }
+    catch (const std::exception & exception)
+    {
+        throw nav2_core::NoValidControl(
+                controller_plugin_name + " could not update ordered path progress: " +
+                exception.what());
+    }
+
     geometry_msgs::msg::PointStamped lookahead_pt;
-    double theta_d, theta_dir, theta_trj, kappa;
-    getLookAheadPoint(L, current_ps_map, prune_plan, lookahead_pt, theta_trj, kappa);
+    lookahead_pt.header.frame_id = path_reference.frame_id;
+    lookahead_pt.point = path_reference.carrot;
+    double theta_d, theta_dir;
+    const double theta_trj = path_reference.tangent;
+    const double kappa = path_reference.curvature;
     if (!pointIsFinite(lookahead_pt.point) || !scalarIsFinite(theta_trj) ||
         !scalarIsFinite(kappa))
     {
@@ -1003,8 +813,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             }
             raw_command = u;
 
-            cmd_vel.twist.linear.x = std::max(
-                    0.0, linearRegularization(velocity, u[0]));
+            cmd_vel.twist.linear.x =
+                    velocity_plan.speed_limit_reason == SpeedLimitReason::kZeroCarrotDistance ?
+                    0.0 : std::max(0.0, linearRegularization(velocity, u[0]));
             cmd_vel.twist.linear.y = 0.0;
             cmd_vel.twist.angular.z = angularRegularization(velocity, u[1]);
         }
@@ -1029,15 +840,15 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 controller_plugin_name + " produced a non-finite velocity command");
     }
 
-    target_ps_map.header.frame_id = lookahead_pt.header.frame_id;
-    target_ps_map.header.stamp = cmd_vel.header.stamp;
+    lookahead_pt.header.stamp = cmd_vel.header.stamp;
     if (carrot_pub_ && carrot_pub_->is_activated())
     {
-        carrot_pub_->publish(target_ps_map);
+        carrot_pub_->publish(lookahead_pt);
     }
     updateAndLogTrackingDiagnostics(
             pose, velocity, cmd_vel, raw_command, velocity_plan,
-            start_heading_alignment_active_, prune_plan, L, theta_trj, kappa,
+            start_heading_alignment_active_, path_reference.signed_lateral_error,
+            L, theta_trj, kappa,
             lookahead_pt);
 
     return cmd_vel;

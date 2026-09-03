@@ -10,6 +10,7 @@
 
 #include "gtest/gtest.h"
 
+#include "geometry_msgs/msg/point_stamped.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "pid_tracking_controller/pid_tracking_controller.hpp"
@@ -85,7 +86,7 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
   rclcpp::init(0, nullptr);
 
   bool carrot_received = false;
-  geometry_msgs::msg::PoseStamped received_carrot;
+  geometry_msgs::msg::PointStamped received_carrot;
   ScopedLogCapture log_capture;
 
   {
@@ -108,9 +109,9 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
       controller.activate();
     }
 
-    auto carrot_subscription = observer->create_subscription<geometry_msgs::msg::PoseStamped>(
+    auto carrot_subscription = observer->create_subscription<geometry_msgs::msg::PointStamped>(
       "/pid_tracking_controller/carrot", rclcpp::QoS(10).reliable(),
-      [&](const geometry_msgs::msg::PoseStamped::SharedPtr message) {
+      [&](const geometry_msgs::msg::PointStamped::SharedPtr message) {
         received_carrot = *message;
         carrot_received = true;
       });
@@ -143,10 +144,11 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
       std::this_thread::sleep_for(10ms);
     }
 
-    EXPECT_TRUE(carrot_received);
-    if (carrot_received) {
-      EXPECT_TRUE(std::isfinite(received_carrot.pose.position.x));
-    }
+    ASSERT_TRUE(carrot_received);
+    EXPECT_EQ(received_carrot.header.frame_id, "map");
+    EXPECT_NEAR(received_carrot.point.x, 0.3, 1e-12);
+    EXPECT_DOUBLE_EQ(received_carrot.point.y, 0.0);
+    EXPECT_DOUBLE_EQ(received_carrot.point.z, 0.0);
     EXPECT_EQ(
       observer->count_publishers("/pid_tracking_controller/tracking_diagnostics"), 0u);
     EXPECT_NE(log_capture.output().find("PID_LOG plan_revision=1"), std::string::npos);
