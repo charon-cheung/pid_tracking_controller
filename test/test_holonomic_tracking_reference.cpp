@@ -4,6 +4,7 @@
 #include "gtest/gtest.h"
 
 #include "holonomic_tracking_reference.hpp"
+#include "legacy_carrot_velocity_planner.hpp"
 #include "path_progress_tracker.hpp"
 #include "prepared_path.hpp"
 
@@ -82,6 +83,26 @@ TEST(HolonomicTrackingReference, separatesAcceptedCurrentFromPreviewGeometry)
   EXPECT_NEAR(progress.progress_arc_length, 0.25, 1e-12);
 }
 
+TEST(HolonomicTrackingReference, keepsPathTangentIndependentFromTargetYaw)
+{
+  const auto path = preparePath(
+    makePath({{0.0, 0.0, 0.5 * kPi}, {2.0, 0.0, 0.5 * kPi}}));
+  PathProgressTracker tracker;
+  tracker.setPath(path);
+  const auto progress = tracker.update(makePoint(0.40, 0.0), 0.60);
+
+  const auto reference = buildHolonomicTrackingReference(*path, progress, 0.60);
+
+  EXPECT_NEAR(reference.current.position.x, progress.projection.x, 1e-12);
+  EXPECT_NEAR(reference.current.position.y, progress.projection.y, 1e-12);
+  EXPECT_NEAR(reference.current.path_tangent, 0.0, 1e-12);
+  EXPECT_NEAR(reference.current.target_yaw, 0.5 * kPi, 1e-12);
+  EXPECT_NEAR(reference.current.target_yaw_rate_per_meter, 0.0, 1e-12);
+  EXPECT_NEAR(reference.preview.position.x, 1.0, 1e-12);
+  EXPECT_NEAR(reference.preview.path_tangent, 0.0, 1e-12);
+  EXPECT_NEAR(reference.preview.target_yaw, 0.5 * kPi, 1e-12);
+}
+
 TEST(HolonomicTrackingReference, clampsPreviewBeforeRotationWithoutAdvancingProgress)
 {
   const auto path = preparePath(
@@ -121,8 +142,11 @@ TEST(HolonomicTrackingReference, cursorDistinguishesRotationBoundarySides)
   before_rotation.cursor = {0u, 1.0, 1.0};
   const auto pending = buildHolonomicTrackingReference(
     *path, before_rotation, 0.20);
+  const auto repeated_pending = buildHolonomicTrackingReference(
+    *path, before_rotation, 0.20);
 
   EXPECT_EQ(pending.mode, HolonomicReferenceMode::kRotationPending);
+  EXPECT_EQ(repeated_pending.mode, HolonomicReferenceMode::kRotationPending);
   EXPECT_TRUE(pending.preview_clamped_by_rotation);
   EXPECT_EQ(pending.preview.cursor.segment_index, 0u);
   EXPECT_NEAR(pending.rotation_target_yaw, 0.5 * kPi, 1e-12);
@@ -172,6 +196,65 @@ TEST(HolonomicTrackingReference, reportsTerminalForFinalEndpointAndSinglePose)
   EXPECT_NEAR(single_pose.preview.target_yaw, 0.4, 1e-12);
   EXPECT_TRUE(std::isfinite(single_pose.current.path_tangent));
   EXPECT_TRUE(std::isfinite(single_pose.current.target_yaw_rate_per_meter));
+}
+
+TEST(HolonomicTrackingReference, shadowConstructionPreservesLegacyReferenceAndPlan)
+{
+  const auto path = preparePath(
+    makePath(
+      {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.5 * kPi}, {1.0, 1.0, 0.5 * kPi}}));
+  PathProgressTracker tracker;
+  tracker.setPath(path);
+  const auto robot_position = makePoint(0.80, 0.0);
+  const auto before_reference = tracker.update(robot_position, 0.50);
+
+  LegacyCarrotVelocityPlannerConfig config;
+  config.model_k_v = 1.9;
+  config.model_k_w = 2.1;
+  config.characteristic_length = 0.2;
+  config.cruise_speed = 0.8;
+  config.max_angular_speed = 0.8;
+  config.angular_speed_reserve = 0.1;
+  const auto before_plan = planLegacyCarrotVelocity(
+    before_reference.carrot.x - robot_position.x,
+    before_reference.carrot.y - robot_position.y, config);
+
+  const auto shadow = buildHolonomicTrackingReference(
+    *path, before_reference, 0.50);
+  const auto after_reference = tracker.update(robot_position, 0.50);
+  const auto after_plan = planLegacyCarrotVelocity(
+    after_reference.carrot.x - robot_position.x,
+    after_reference.carrot.y - robot_position.y, config);
+
+  ASSERT_TRUE(shadow.preview_clamped_by_rotation);
+  EXPECT_NEAR(shadow.preview.position.x, 1.0, 1e-12);
+  EXPECT_NEAR(shadow.preview.position.y, 0.0, 1e-12);
+  EXPECT_NEAR(before_reference.carrot.x, 1.0, 1e-12);
+  EXPECT_NEAR(before_reference.carrot.y, 0.30, 1e-12);
+  EXPECT_EQ(
+    after_reference.cursor.segment_index,
+    before_reference.cursor.segment_index);
+  EXPECT_NEAR(
+    after_reference.cursor.segment_fraction,
+    before_reference.cursor.segment_fraction, 1e-12);
+  EXPECT_NEAR(
+    after_reference.progress_arc_length,
+    before_reference.progress_arc_length, 1e-12);
+  EXPECT_NEAR(
+    after_reference.carrot_arc_length,
+    before_reference.carrot_arc_length, 1e-12);
+  EXPECT_NEAR(after_reference.carrot.x, before_reference.carrot.x, 1e-12);
+  EXPECT_NEAR(after_reference.carrot.y, before_reference.carrot.y, 1e-12);
+  EXPECT_NEAR(after_reference.tangent, before_reference.tangent, 1e-12);
+  EXPECT_NEAR(after_reference.curvature, before_reference.curvature, 1e-12);
+  EXPECT_NEAR(
+    after_reference.signed_lateral_error,
+    before_reference.signed_lateral_error, 1e-12);
+  EXPECT_EQ(after_plan.speed_limit_reason, before_plan.speed_limit_reason);
+  EXPECT_NEAR(after_plan.reference_speed, before_plan.reference_speed, 1e-12);
+  EXPECT_NEAR(after_plan.raw_linear_command, before_plan.raw_linear_command, 1e-12);
+  EXPECT_NEAR(after_plan.raw_angular_command, before_plan.raw_angular_command, 1e-12);
 }
 
 }  // namespace

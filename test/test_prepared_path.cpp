@@ -107,6 +107,22 @@ TEST(PreparedPath, usesShortestYawDeltaAcrossPi)
     1e-12);
 }
 
+TEST(PreparedPath, keepsConstantTargetYawAndZeroSpatialRate)
+{
+  auto path = makePath();
+  appendPose(path, 0.0, 0.0, 0.7);
+  appendPose(path, 2.0, 0.0, 0.7);
+
+  const auto prepared = preparePath(path);
+
+  ASSERT_EQ(prepared->segments.size(), 1u);
+  const auto & segment = prepared->segments.front();
+  EXPECT_EQ(segment.type, PathSegmentType::kTranslation);
+  EXPECT_NEAR(segment.target_yaw_begin, 0.7, 1e-12);
+  EXPECT_NEAR(segment.target_yaw_delta, 0.0, 1e-12);
+  EXPECT_NEAR(segment.target_yaw_rate_per_meter, 0.0, 1e-12);
+}
+
 TEST(PreparedPath, classifiesRotationAndIgnoresNoOpWithSourceProvenance)
 {
   auto path = makePath();
