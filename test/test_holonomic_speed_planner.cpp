@@ -260,6 +260,86 @@ TEST(HolonomicSpeedPlanner, terminalStopPropagatesToCurrentPosition)
   EXPECT_NEAR(plan.reference_velocity_target, std::sqrt(2.0), 1e-12);
 }
 
+TEST(HolonomicSpeedPlanner, rotationPendingImmediatelyClearsReferenceState)
+{
+  const auto path = preparePath(
+    makePath(
+      {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.5 * kPi}}));
+  HolonomicSpeedPlanner planner(makeConfig());
+  planner.setPath(path);
+  planner.seed(0.6);
+  const auto reference = makeReference(path, makePoint(1.0, 0.0));
+  ASSERT_EQ(reference.mode, HolonomicReferenceMode::kRotationPending);
+
+  const auto plan = planner.plan(reference, 0.0, 0.1);
+
+  EXPECT_EQ(plan.speed_limit_reason, HolonomicSpeedLimitReason::kRotation);
+  EXPECT_DOUBLE_EQ(plan.reference_velocity_target, 0.0);
+  EXPECT_DOUBLE_EQ(plan.reference_velocity, 0.0);
+}
+
+TEST(HolonomicSpeedPlanner, terminalSentinelImmediatelyClearsReferenceState)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}}));
+  HolonomicSpeedPlanner planner(makeConfig());
+  planner.setPath(path);
+  planner.seed(0.6);
+  const auto reference = makeReference(path, makePoint(1.0, 0.0));
+  ASSERT_EQ(reference.mode, HolonomicReferenceMode::kTerminal);
+
+  const auto plan = planner.plan(reference, 0.0, 0.1);
+
+  EXPECT_EQ(plan.speed_limit_reason, HolonomicSpeedLimitReason::kTerminal);
+  EXPECT_DOUBLE_EQ(plan.reference_velocity_target, 0.0);
+  EXPECT_DOUBLE_EQ(plan.reference_velocity, 0.0);
+}
+
+TEST(HolonomicSpeedPlanner, instantaneousHardLimitsOverrideTemporalRamp)
+{
+  struct HardLimitCase
+  {
+    double max_vx;
+    double max_xy_speed;
+    double external_speed_limit;
+    HolonomicSpeedLimitReason reason;
+  };
+  const HardLimitCase cases[] = {
+    {3.0, 3.0, 0.2, HolonomicSpeedLimitReason::kExternal},
+    {0.2, 3.0, std::numeric_limits<double>::infinity(),
+      HolonomicSpeedLimitReason::kBodyAxis},
+    {3.0, 0.2, std::numeric_limits<double>::infinity(),
+      HolonomicSpeedLimitReason::kCombinedSpeed}};
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}}));
+
+  for (const auto & test_case : cases) {
+    SCOPED_TRACE(static_cast<int>(test_case.reason));
+    auto config = makeConfig();
+    config.nominal_tracking_speed = 1.0;
+    config.max_vx = test_case.max_vx;
+    config.max_xy_speed = test_case.max_xy_speed;
+    config.a_ref_up = 0.1;
+    config.a_ref_down = 0.1;
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(path);
+    planner.seed(0.6);
+
+    const auto plan = planAt(
+      planner, path, makePoint(0.0, 0.0), 0.0, 0.1,
+      test_case.external_speed_limit);
+
+    EXPECT_EQ(plan.speed_limit_reason, test_case.reason);
+    EXPECT_NEAR(plan.reference_velocity_target, 0.2, 1e-12);
+    EXPECT_LE(plan.reference_velocity, 0.2);
+
+    if (test_case.reason == HolonomicSpeedLimitReason::kExternal) {
+      const auto recovery = planAt(
+        planner, path, makePoint(0.0, 0.0), 0.0, 0.1);
+      EXPECT_NEAR(recovery.reference_velocity, 0.21, 1e-12);
+    }
+  }
+}
+
 TEST(HolonomicSpeedPlanner, shortestAngleWindowsIgnoreNoOpsAndStopAtRotation)
 {
   const double yaw_179 = 179.0 * kPi / 180.0;

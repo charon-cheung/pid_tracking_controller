@@ -169,22 +169,24 @@ TEST(HolonomicTrackingReference, cursorDistinguishesRotationBoundarySides)
   EXPECT_NEAR(translation.preview.position.y, 0.20, 1e-12);
 }
 
-TEST(HolonomicTrackingReference, exactPendingRotationClearsAfterAcknowledgement)
+TEST(HolonomicTrackingReference, internalRotationRunUsesFinalYawAndSingleAcknowledgement)
 {
   const auto path = preparePath(
     makePath(
       {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
-        {1.0, 0.0, 0.5 * kPi}, {1.0, 1.0, 0.5 * kPi}}));
+        {1.0, 0.0, 0.25 * kPi}, {1.0, 0.0, 0.5 * kPi},
+        {1.0, 1.0, 0.5 * kPi}}));
   PathProgressTracker tracker;
   tracker.setPath(path);
 
   const auto crossed_progress = tracker.update(makePoint(1.0, 0.20), 0.20);
-  ASSERT_EQ(crossed_progress.cursor.segment_index, 2u);
+  ASSERT_EQ(crossed_progress.cursor.segment_index, 3u);
   const auto pending = buildHolonomicTrackingReference(
     *path, crossed_progress, 0.20);
   ASSERT_EQ(pending.mode, HolonomicReferenceMode::kRotationPending);
   ASSERT_TRUE(pending.pending_rotation_segment_index.has_value());
   EXPECT_EQ(*pending.pending_rotation_segment_index, 1u);
+  EXPECT_NEAR(pending.rotation_target_yaw, 0.5 * kPi, 1e-12);
 
   tracker.acknowledgeRotationComplete(1u);
   const auto acknowledged_progress = tracker.update(makePoint(1.0, 0.20), 0.20);
@@ -192,7 +194,7 @@ TEST(HolonomicTrackingReference, exactPendingRotationClearsAfterAcknowledgement)
     *path, acknowledged_progress, 0.20);
   EXPECT_EQ(translation.mode, HolonomicReferenceMode::kTranslation);
   EXPECT_FALSE(translation.pending_rotation_segment_index.has_value());
-  EXPECT_EQ(translation.current.cursor.segment_index, 2u);
+  EXPECT_EQ(translation.current.cursor.segment_index, 3u);
 }
 
 TEST(HolonomicTrackingReference, oneMeterBoundaryPendingAlwaysPermitsAcknowledgement)
@@ -267,7 +269,7 @@ TEST(HolonomicTrackingReference, finalRotationAcknowledgementProducesTerminalSen
   EXPECT_NEAR(terminal.current.target_yaw, 0.5 * kPi, 1e-12);
 }
 
-TEST(HolonomicTrackingReference, initialAndAllRotationPathsAdvanceInStrictOrder)
+TEST(HolonomicTrackingReference, allRotationRunUsesFinalYawAndSingleAcknowledgement)
 {
   const auto path = preparePath(
     makePath(
@@ -276,20 +278,13 @@ TEST(HolonomicTrackingReference, initialAndAllRotationPathsAdvanceInStrictOrder)
   PathProgressTracker tracker;
   tracker.setPath(path);
 
-  const auto first_progress = tracker.update(makePoint(0.3, -0.2), 0.20);
-  const auto first = buildHolonomicTrackingReference(*path, first_progress, 0.20);
-  ASSERT_EQ(first.mode, HolonomicReferenceMode::kRotationPending);
-  ASSERT_EQ(first.pending_rotation_segment_index, std::optional<std::size_t>(0u));
-  EXPECT_NEAR(first.rotation_target_yaw, 0.25 * kPi, 1e-12);
+  const auto progress = tracker.update(makePoint(0.3, -0.2), 0.20);
+  const auto pending = buildHolonomicTrackingReference(*path, progress, 0.20);
+  ASSERT_EQ(pending.mode, HolonomicReferenceMode::kRotationPending);
+  ASSERT_EQ(pending.pending_rotation_segment_index, std::optional<std::size_t>(0u));
+  EXPECT_NEAR(pending.rotation_target_yaw, 0.5 * kPi, 1e-12);
 
   tracker.acknowledgeRotationComplete(0u);
-  const auto second_progress = tracker.update(makePoint(0.3, -0.2), 0.20);
-  const auto second = buildHolonomicTrackingReference(*path, second_progress, 0.20);
-  ASSERT_EQ(second.mode, HolonomicReferenceMode::kRotationPending);
-  ASSERT_EQ(second.pending_rotation_segment_index, std::optional<std::size_t>(1u));
-  EXPECT_NEAR(second.rotation_target_yaw, 0.5 * kPi, 1e-12);
-
-  tracker.acknowledgeRotationComplete(1u);
   const auto terminal_progress = tracker.update(makePoint(0.3, -0.2), 0.20);
   const auto terminal = buildHolonomicTrackingReference(
     *path, terminal_progress, 0.20);
@@ -316,7 +311,7 @@ TEST(HolonomicTrackingReference, initialRotationBoundaryUsesRotationBeginYaw)
   EXPECT_NEAR(reference.rotation_target_yaw, 0.25 * kPi, 1e-12);
 }
 
-TEST(HolonomicTrackingReference, consecutiveFinalRotationsRemainPendingInOrder)
+TEST(HolonomicTrackingReference, finalRotationRunUsesFinalYawAndSingleAcknowledgement)
 {
   const auto path = preparePath(
     makePath(
@@ -325,27 +320,12 @@ TEST(HolonomicTrackingReference, consecutiveFinalRotationsRemainPendingInOrder)
   PathProgressTracker tracker;
   tracker.setPath(path);
 
-  const auto first_progress = tracker.update(makePoint(1.0, 0.0), 0.20);
-  const auto first = buildHolonomicTrackingReference(*path, first_progress, 0.20);
-  ASSERT_EQ(first.pending_rotation_segment_index, std::optional<std::size_t>(1u));
+  const auto progress = tracker.update(makePoint(1.0, 0.0), 0.20);
+  const auto pending = buildHolonomicTrackingReference(*path, progress, 0.20);
+  ASSERT_EQ(pending.pending_rotation_segment_index, std::optional<std::size_t>(1u));
+  EXPECT_NEAR(pending.rotation_target_yaw, 0.5 * kPi, 1e-12);
 
   tracker.acknowledgeRotationComplete(1u);
-  const auto second_progress = tracker.update(makePoint(1.0, 0.0), 0.20);
-  const auto second = buildHolonomicTrackingReference(*path, second_progress, 0.20);
-  EXPECT_EQ(second_progress.cursor.segment_index, 2u);
-  EXPECT_EQ(second.mode, HolonomicReferenceMode::kRotationPending);
-  EXPECT_EQ(second.pending_rotation_segment_index, std::optional<std::size_t>(2u));
-  EXPECT_GE(
-    second.current.cursor.segment_index,
-    second_progress.prepared_segment_lower_bound);
-  EXPECT_GE(
-    second.preview.cursor.segment_index,
-    second_progress.prepared_segment_lower_bound);
-  EXPECT_NEAR(second.current.target_yaw, 0.25 * kPi, 1e-12);
-  EXPECT_NEAR(second.preview.target_yaw, 0.25 * kPi, 1e-12);
-  EXPECT_NEAR(second.rotation_target_yaw, 0.5 * kPi, 1e-12);
-
-  tracker.acknowledgeRotationComplete(2u);
   const auto terminal_progress = tracker.update(makePoint(1.0, 0.0), 0.20);
   const auto terminal = buildHolonomicTrackingReference(
     *path, terminal_progress, 0.20);

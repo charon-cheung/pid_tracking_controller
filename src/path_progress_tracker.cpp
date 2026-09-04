@@ -445,7 +445,20 @@ void PathProgressTracker::acknowledgeRotationComplete(
     throw std::logic_error("rotation acknowledgement skips an earlier rotation");
   }
 
-  prepared_segment_lower_bound_ = rotation_segment_index + 1u;
+  std::size_t last_rotation_index = rotation_segment_index;
+  while (last_rotation_index + 1u < path_->segments.size()) {
+    const auto & next = path_->segments[last_rotation_index + 1u];
+    if (next.type != PathSegmentType::kRotation ||
+      std::abs(next.translation_s_begin - requested.translation_s_begin) >
+      kGeometryEpsilon ||
+      std::abs(next.translation_s_end - requested.translation_s_end) >
+      kGeometryEpsilon)
+    {
+      break;
+    }
+    ++last_rotation_index;
+  }
+  prepared_segment_lower_bound_ = last_rotation_index + 1u;
 }
 
 bool PathProgressTracker::hasPath() const

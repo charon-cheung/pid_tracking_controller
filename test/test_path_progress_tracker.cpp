@@ -317,9 +317,11 @@ TEST(PathProgressTracker, legacyCarrotStillCrossesShadowRotationSegment)
 
 TEST(PathProgressTracker, acknowledgementPreservesProgressAndExcludesOlderSegments)
 {
-  auto path = makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
-  setYaw(path.poses[2], M_PI_2);
+  auto path = makePath(
+    {{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+  setYaw(path.poses[2], M_PI_4);
   setYaw(path.poses[3], M_PI_2);
+  setYaw(path.poses[4], M_PI_2);
 
   PathProgressTracker tracker;
   setPreparedPath(tracker, path);
@@ -330,15 +332,15 @@ TEST(PathProgressTracker, acknowledgementPreservesProgressAndExcludesOlderSegmen
   tracker.acknowledgeRotationComplete(1u);
   const auto after = tracker.update(makePoint(1.0, 0.0), 0.50);
 
-  EXPECT_EQ(after.prepared_segment_lower_bound, 2u);
-  EXPECT_EQ(after.cursor.segment_index, 2u);
+  EXPECT_EQ(after.prepared_segment_lower_bound, 3u);
+  EXPECT_EQ(after.cursor.segment_index, 3u);
   EXPECT_DOUBLE_EQ(after.progress_arc_length, before.progress_arc_length);
   EXPECT_DOUBLE_EQ(after.progress_budget, before.progress_budget);
 
   for (int sample = 0; sample < 5; ++sample) {
     const auto stationary = tracker.update(makePoint(1.0, 0.0), 0.50);
-    EXPECT_EQ(stationary.prepared_segment_lower_bound, 2u);
-    EXPECT_EQ(stationary.cursor.segment_index, 2u);
+    EXPECT_EQ(stationary.prepared_segment_lower_bound, 3u);
+    EXPECT_EQ(stationary.cursor.segment_index, 3u);
   }
 }
 

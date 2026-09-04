@@ -320,12 +320,14 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   plan.representative_path_spacing = representative_path_spacing_;
   plan.rate_window_length = rate_window_length_;
 
-  if (reference.mode == HolonomicReferenceMode::kRotationPending) {
-    plan.reference_velocity_target = 0.0;
-    plan.speed_limit_reason = HolonomicSpeedLimitReason::kRotation;
-  } else if (path_->segments.empty()) {
-    plan.reference_velocity_target = 0.0;
-    plan.speed_limit_reason = HolonomicSpeedLimitReason::kTerminal;
+  if (reference.mode == HolonomicReferenceMode::kRotationPending ||
+    reference.mode == HolonomicReferenceMode::kTerminal)
+  {
+    plan.speed_limit_reason =
+      reference.mode == HolonomicReferenceMode::kRotationPending ?
+      HolonomicSpeedLimitReason::kRotation : HolonomicSpeedLimitReason::kTerminal;
+    previous_reference_velocity_ = 0.0;
+    return plan;
   } else {
     const auto & cursor = reference.current.cursor;
     validateCursor(*path_, reference.current);
@@ -456,10 +458,6 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
       plan.stopping_speed_limit, HolonomicSpeedLimitReason::kStoppingDistance,
       plan.reference_velocity_target, plan.speed_limit_reason);
 
-    if (reference.mode == HolonomicReferenceMode::kTerminal) {
-      plan.reference_velocity_target = 0.0;
-      plan.speed_limit_reason = HolonomicSpeedLimitReason::kTerminal;
-    }
   }
 
   const double lower = std::max(
@@ -467,6 +465,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   const double upper = previous_reference_velocity_ + config_.a_ref_up * dt;
   plan.reference_velocity = std::clamp(
     plan.reference_velocity_target, lower, upper);
+  plan.reference_velocity = std::min(
+    plan.reference_velocity,
+    std::min({external_speed_limit, plan.axis_speed_limit, config_.max_xy_speed}));
   previous_reference_velocity_ = plan.reference_velocity;
   return plan;
 }

@@ -181,6 +181,28 @@ std::optional<std::size_t> firstReachedRotation(
   return std::nullopt;
 }
 
+double rotationRunTargetYaw(
+  const PreparedPath & path,
+  std::size_t first_rotation_index)
+{
+  const double boundary = path.segments[first_rotation_index].translation_s_begin;
+  std::size_t last_rotation_index = first_rotation_index;
+  while (last_rotation_index + 1u < path.segments.size()) {
+    const auto & next = path.segments[last_rotation_index + 1u];
+    if (next.type != PathSegmentType::kRotation ||
+      std::abs(next.translation_s_begin - boundary) > kGeometryEpsilon ||
+      std::abs(next.translation_s_end - boundary) > kGeometryEpsilon)
+    {
+      break;
+    }
+    ++last_rotation_index;
+  }
+
+  const auto & last_rotation = path.segments[last_rotation_index];
+  return angles::normalize_angle(
+    last_rotation.target_yaw_begin + last_rotation.target_yaw_delta);
+}
+
 HolonomicPathSample sampleAtArcLength(
   const PreparedPath & path,
   const PathCursor & current_cursor,
@@ -266,14 +288,12 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
   if (path.total_translation_length <= kGeometryEpsilon) {
     const auto pending_rotation = firstReachedRotation(path, progress);
     if (pending_rotation) {
-      const auto & rotation = path.segments[*pending_rotation];
       reference.current = sampleRotationBoundary(
         path, *pending_rotation, progress.prepared_segment_lower_bound);
       reference.preview = reference.current;
       reference.mode = HolonomicReferenceMode::kRotationPending;
       reference.preview_clamped_by_rotation = true;
-      reference.rotation_target_yaw = angles::normalize_angle(
-        rotation.target_yaw_begin + rotation.target_yaw_delta);
+      reference.rotation_target_yaw = rotationRunTargetYaw(path, *pending_rotation);
       reference.pending_rotation_segment_index = pending_rotation;
     } else {
       reference.current = sampleSinglePose(path);
@@ -293,14 +313,12 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
     if (!pending_rotation) {
       throw std::invalid_argument("rotation cursor has no pending rotation");
     }
-    const auto & rotation = path.segments[*pending_rotation];
     reference.current = sampleRotationBoundary(
       path, *pending_rotation, progress.prepared_segment_lower_bound);
     reference.preview = reference.current;
     reference.mode = HolonomicReferenceMode::kRotationPending;
     reference.preview_clamped_by_rotation = true;
-    reference.rotation_target_yaw = angles::normalize_angle(
-      rotation.target_yaw_begin + rotation.target_yaw_delta);
+    reference.rotation_target_yaw = rotationRunTargetYaw(path, *pending_rotation);
     reference.pending_rotation_segment_index = pending_rotation;
     if (!referenceIsFinite(reference)) {
       throw std::domain_error("holonomic reference contains non-finite values");
@@ -329,8 +347,7 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
     reference.preview = sampleTranslation(
       path, preceding_segment_index, 1.0, rotation.translation_s_begin);
     reference.preview_clamped_by_rotation = true;
-    reference.rotation_target_yaw = angles::normalize_angle(
-      rotation.target_yaw_begin + rotation.target_yaw_delta);
+    reference.rotation_target_yaw = rotationRunTargetYaw(path, *rotation_index);
   } else {
     reference.preview = sampleAtArcLength(
       path, cursor, desired_preview_arc_length);
@@ -340,13 +357,11 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
   const bool at_current_segment_end =
     cursor.segment_fraction >= 1.0 - kGeometryEpsilon;
   if (pending_rotation) {
-    const auto & rotation = path.segments[*pending_rotation];
     reference.mode = HolonomicReferenceMode::kRotationPending;
     reference.preview = sampleRotationBoundary(
       path, *pending_rotation, progress.prepared_segment_lower_bound);
     reference.preview_clamped_by_rotation = true;
-    reference.rotation_target_yaw = angles::normalize_angle(
-      rotation.target_yaw_begin + rotation.target_yaw_delta);
+    reference.rotation_target_yaw = rotationRunTargetYaw(path, *pending_rotation);
     reference.pending_rotation_segment_index = pending_rotation;
   } else if (at_current_segment_end &&
     cursor.segment_index + 1u == path.segments.size())
