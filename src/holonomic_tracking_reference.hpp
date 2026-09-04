@@ -1,6 +1,8 @@
 #ifndef PID_TRACKING_CONTROLLER__HOLONOMIC_TRACKING_REFERENCE_HPP_
 #define PID_TRACKING_CONTROLLER__HOLONOMIC_TRACKING_REFERENCE_HPP_
 
+#include <optional>
+
 #include "geometry_msgs/msg/point.hpp"
 #include "path_progress_tracker.hpp"
 #include "prepared_path.hpp"
@@ -31,6 +33,7 @@ struct HolonomicTrackingReference
   HolonomicPathSample preview;
   bool preview_clamped_by_rotation{false};
   double rotation_target_yaw{0.0};
+  std::optional<std::size_t> pending_rotation_segment_index;
 };
 
 HolonomicTrackingReference buildHolonomicTrackingReference(

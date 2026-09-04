@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "angles/angles.h"
+#include "holonomic_control_law.hpp"
 #include "holonomic_tracking_reference.hpp"
 #include "legacy_carrot_velocity_planner.hpp"
 #include "nav2_core/controller_exceptions.hpp"
@@ -23,6 +24,7 @@
 #include "pluginlib/class_list_macros.hpp"
 #include "path_progress_tracker.hpp"
 #include "prepared_path.hpp"
+#include "rotation_completion_tracker.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/utils.h"
@@ -144,6 +146,18 @@ PidTrackingController::PidTrackingController()
 
 PidTrackingController::~PidTrackingController() = default;
 
+void PidTrackingController::resetRotationShadow()
+{
+    if (rotation_completion_tracker_) {
+        rotation_completion_tracker_->reset();
+    }
+    shadow_rotation_pending_ = false;
+    shadow_pending_rotation_segment_index_ = 0u;
+    shadow_rotation_last_sample_time_seconds_ = 0.0;
+    shadow_rotation_last_sample_time_valid_ = false;
+    shadow_rotation_ack_candidate_ = false;
+}
+
 void PidTrackingController::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
   std::string name,
@@ -209,6 +223,21 @@ void PidTrackingController::configure(
     declare_parameter_if_not_declared(
       node, controller_plugin_name + ".start_heading_kp", rclcpp::ParameterValue(1.0));
 
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".kp_yaw", rclcpp::ParameterValue(1.0));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".rotation_yaw_tolerance",
+      rclcpp::ParameterValue(0.05));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".rotation_omega_tolerance",
+      rclcpp::ParameterValue(0.05));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".rotation_xy_speed_tolerance",
+      rclcpp::ParameterValue(0.05));
+    declare_parameter_if_not_declared(
+      node, controller_plugin_name + ".rotation_settle_time",
+      rclcpp::ParameterValue(0.30));
+
     declare_parameter_if_not_declared(node, controller_plugin_name + ".pid_frequency", rclcpp::ParameterValue(15.0) );
     declare_parameter_if_not_declared(node, controller_plugin_name + ".use_model", rclcpp::ParameterValue(true) );
 
@@ -256,6 +285,27 @@ void PidTrackingController::configure(
       start_heading_exit_tolerance_);
     node->get_parameter(controller_plugin_name + ".start_heading_kp", start_heading_kp_);
 
+    double shadow_kp_yaw = 1.0;
+    RotationCompletionTrackerConfig rotation_completion_config;
+    node->get_parameter(controller_plugin_name + ".kp_yaw", shadow_kp_yaw);
+    node->get_parameter(
+      controller_plugin_name + ".rotation_yaw_tolerance",
+      rotation_completion_config.rotation_yaw_tolerance);
+    node->get_parameter(
+      controller_plugin_name + ".rotation_omega_tolerance",
+      rotation_completion_config.rotation_omega_tolerance);
+    node->get_parameter(
+      controller_plugin_name + ".rotation_xy_speed_tolerance",
+      rotation_completion_config.rotation_xy_speed_tolerance);
+    node->get_parameter(
+      controller_plugin_name + ".rotation_settle_time",
+      rotation_completion_config.rotation_settle_time);
+    if (!std::isfinite(shadow_kp_yaw) || shadow_kp_yaw < 0.0) {
+        throw std::invalid_argument("kp_yaw must be finite and nonnegative");
+    }
+    auto rotation_completion_tracker =
+            std::make_unique<RotationCompletionTracker>(rotation_completion_config);
+
     double pid_frequency;
     node->get_parameter(controller_plugin_name + ".pid_frequency", pid_frequency);
     d_t_ = 1 / pid_frequency;
@@ -264,6 +314,15 @@ void PidTrackingController::configure(
             use_model_, max_v_, makeLegacyCarrotVelocityPlannerConfig(
                     model_k_v_, model_k_w_, l_, cruise_speed_, max_w_,
                     angular_speed_reserve_));
+
+    kp_yaw_ = shadow_kp_yaw;
+    rotation_yaw_tolerance_ = rotation_completion_config.rotation_yaw_tolerance;
+    rotation_omega_tolerance_ = rotation_completion_config.rotation_omega_tolerance;
+    rotation_xy_speed_tolerance_ =
+            rotation_completion_config.rotation_xy_speed_tolerance;
+    rotation_settle_time_ = rotation_completion_config.rotation_settle_time;
+    rotation_completion_tracker_ = std::move(rotation_completion_tracker);
+    resetRotationShadow();
     
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
@@ -297,6 +356,9 @@ void PidTrackingController::configure(
             "enable_start_heading_alignment=%s "
             "start_heading_enter_tolerance=%.6f "
             "start_heading_exit_tolerance=%.6f start_heading_kp=%.6f "
+            "kp_yaw=%.6f rotation_yaw_tolerance=%.6f "
+            "rotation_omega_tolerance=%.6f rotation_xy_speed_tolerance=%.6f "
+            "rotation_settle_time=%.6f "
             "pid_frequency=%.6f use_model=%s",
             goal_dist_tol_, rotate_tol_, lookahead_time_, min_lookahead_dist_,
             max_lookahead_dist_, max_v_, min_v_, max_v_inc_, max_w_, min_w_,
@@ -304,11 +366,14 @@ void PidTrackingController::configure(
             k_theta_, model_k_v_, model_k_w_, l_, cruise_speed_,
             angular_speed_reserve_, enable_start_heading_alignment_ ? "true" : "false",
             start_heading_enter_tolerance_, start_heading_exit_tolerance_,
-            start_heading_kp_, pid_frequency, use_model_ ? "true" : "false");
+            start_heading_kp_, kp_yaw_, rotation_yaw_tolerance_,
+            rotation_omega_tolerance_, rotation_xy_speed_tolerance_,
+            rotation_settle_time_, pid_frequency, use_model_ ? "true" : "false");
 }
 
 void PidTrackingController::activate()
 {
+    resetRotationShadow();
     if (carrot_pub_) {
         carrot_pub_->on_activate();
     }
@@ -317,6 +382,7 @@ void PidTrackingController::activate()
 
 void PidTrackingController::deactivate()
 {
+    resetRotationShadow();
     if (carrot_pub_) {
         carrot_pub_->on_deactivate();
     }
@@ -324,6 +390,7 @@ void PidTrackingController::deactivate()
 
 void PidTrackingController::cleanup()
 {
+    resetRotationShadow();
     carrot_pub_.reset();
     prepared_path_.reset();
     costmap_ = nullptr;
@@ -336,6 +403,8 @@ void PidTrackingController::cleanup()
 void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
     RCLCPP_INFO(logger_, "PidTrackingController received a path");
+    resetRotationShadow();
+    force_diagnostics_log_ = true;
     global_plan_.clear();
     prepared_path_.reset();
     if (orig_global_plan.poses.empty() || !pathIsFinite(orig_global_plan))
@@ -396,7 +465,9 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
   bool alignment_phase,
   double lookahead_distance,
   const PathProgressReference& path_reference,
-  const HolonomicTrackingReference * holonomic_reference)
+  const HolonomicTrackingReference * holonomic_reference,
+  const HolonomicRawCommand * shadow_rotation_command,
+  const RotationCompletionStatus * shadow_rotation_status)
 {
     const double lateral_error = path_reference.signed_lateral_error;
     const double absolute_lateral_error = std::abs(lateral_error);
@@ -533,6 +604,15 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             *holonomic_reference : unavailable_reference;
     const char * reference_mode = holonomic_reference ?
             holonomicReferenceModeName(shadow_reference.mode) : "unavailable";
+    const HolonomicRawCommand unavailable_shadow_command;
+    const auto & shadow_command = shadow_rotation_command ?
+            *shadow_rotation_command : unavailable_shadow_command;
+    const RotationCompletionStatus unavailable_rotation_status;
+    const auto & rotation_status = shadow_rotation_status ?
+            *shadow_rotation_status : unavailable_rotation_status;
+    const std::string pending_rotation_segment_index =
+            shadow_reference.pending_rotation_segment_index ?
+            std::to_string(*shadow_reference.pending_rotation_segment_index) : "none";
 
     RCLCPP_INFO(
             logger_,
@@ -568,6 +648,12 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             "preview_segment_fraction=%.6f preview_ref_x=%.6f preview_ref_y=%.6f "
             "preview_path_tangent=%.6f preview_target_yaw=%.6f "
             "preview_clamped_by_rotation=%s rotation_target_yaw=%.6f "
+            "shadow_rotation_available=%s pending_rotation_segment_index=%s "
+            "shadow_yaw_error=%.6f shadow_raw_vx=%.6f shadow_raw_vy=%.6f "
+            "shadow_raw_omega=%.6f shadow_measured_vx=%.6f "
+            "shadow_measured_vy=%.6f shadow_measured_omega=%.6f "
+            "shadow_settled_duration=%.6f shadow_rotation_all_conditions=%s "
+            "rotation_ack_candidate=%s "
             "elapsed_tracking_time=%.6f",
             plan_revision_, alignment_phase ? "START_ALIGNMENT" : "TRACKING",
             tracking_statistics_.sample_count, tracking_statistics_.tracking_sample_count,
@@ -605,6 +691,13 @@ void PidTrackingController::updateAndLogTrackingDiagnostics(
             shadow_reference.preview.path_tangent, shadow_reference.preview.target_yaw,
             shadow_reference.preview_clamped_by_rotation ? "true" : "false",
             shadow_reference.rotation_target_yaw,
+            shadow_rotation_command && shadow_rotation_status ? "true" : "false",
+            pending_rotation_segment_index.c_str(), shadow_command.yaw_error,
+            shadow_command.vx, shadow_command.vy, shadow_command.omega,
+            velocity.linear.x, velocity.linear.y, velocity.angular.z,
+            rotation_status.settled_duration,
+            rotation_status.all_conditions ? "true" : "false",
+            rotation_status.acknowledge_candidate ? "true" : "false",
             elapsed_tracking_time);
     last_diagnostics_log_time_seconds_ = now_seconds;
     force_diagnostics_log_ = false;
@@ -944,6 +1037,98 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             cmd_vel.twist.angular.z = angularRegularization(velocity, u[1]);
         }
     }
+
+    std::optional<HolonomicRawCommand> shadow_rotation_command;
+    std::optional<RotationCompletionStatus> shadow_rotation_status;
+    if (holonomic_reference &&
+        holonomic_reference->mode == HolonomicReferenceMode::kRotationPending)
+    {
+        try
+        {
+            if (!rotation_completion_tracker_) {
+                throw std::logic_error("rotation completion tracker is unavailable");
+            }
+            if (!holonomic_reference->pending_rotation_segment_index) {
+                throw std::logic_error("pending rotation segment index is unavailable");
+            }
+
+            const std::size_t pending_index =
+                    *holonomic_reference->pending_rotation_segment_index;
+            const double now_seconds = clock_->now().seconds();
+            if (!std::isfinite(now_seconds)) {
+                throw std::domain_error("rotation shadow clock is non-finite");
+            }
+
+            double elapsed_seconds = 0.0;
+            if (!shadow_rotation_pending_ ||
+                shadow_pending_rotation_segment_index_ != pending_index)
+            {
+                resetRotationShadow();
+                shadow_rotation_pending_ = true;
+                shadow_pending_rotation_segment_index_ = pending_index;
+                shadow_rotation_last_sample_time_seconds_ = now_seconds;
+                shadow_rotation_last_sample_time_valid_ = true;
+                force_diagnostics_log_ = true;
+            }
+            else if (!shadow_rotation_last_sample_time_valid_ ||
+                !std::isfinite(shadow_rotation_last_sample_time_seconds_))
+            {
+                rotation_completion_tracker_->reset();
+                shadow_rotation_last_sample_time_seconds_ = now_seconds;
+                shadow_rotation_last_sample_time_valid_ = true;
+                force_diagnostics_log_ = true;
+            }
+            else
+            {
+                elapsed_seconds =
+                        now_seconds - shadow_rotation_last_sample_time_seconds_;
+                shadow_rotation_last_sample_time_seconds_ = now_seconds;
+                if (!std::isfinite(elapsed_seconds) || elapsed_seconds <= 0.0) {
+                    rotation_completion_tracker_->reset();
+                    elapsed_seconds = 0.0;
+                    force_diagnostics_log_ = true;
+                }
+            }
+
+            HolonomicControlInput shadow_input;
+            shadow_input.robot_x = pose.pose.position.x;
+            shadow_input.robot_y = pose.pose.position.y;
+            shadow_input.robot_yaw = theta;
+            shadow_input.reference_x = pose.pose.position.x;
+            shadow_input.reference_y = pose.pose.position.y;
+            shadow_input.path_tangent = 0.0;
+            shadow_input.target_yaw = holonomic_reference->rotation_target_yaw;
+            shadow_input.target_yaw_rate_per_meter = 0.0;
+            shadow_input.reference_velocity = 0.0;
+            const HolonomicControlGains shadow_gains{0.0, 0.0, kp_yaw_};
+            const auto raw_shadow_command = computeHolonomicRawCommand(
+                    shadow_input, shadow_gains);
+            const auto completion_status = rotation_completion_tracker_->update(
+                    raw_shadow_command.yaw_error, velocity.linear.x, velocity.linear.y,
+                    velocity.angular.z, elapsed_seconds);
+            if (completion_status.acknowledge_candidate !=
+                shadow_rotation_ack_candidate_)
+            {
+                force_diagnostics_log_ = true;
+            }
+            shadow_rotation_ack_candidate_ = completion_status.acknowledge_candidate;
+            shadow_rotation_command = raw_shadow_command;
+            shadow_rotation_status = completion_status;
+        }
+        catch (const std::exception & exception)
+        {
+            resetRotationShadow();
+            RCLCPP_WARN_THROTTLE(
+                    logger_, *clock_, 5000,
+                    "PID_LOG shadow_rotation=unavailable reason=%s", exception.what());
+        }
+    }
+    else if (shadow_rotation_pending_)
+    {
+        resetRotationShadow();
+        force_diagnostics_log_ = true;
+    }
+
     // publish next target_ps_map pose
 #if 0
     target_ps_map.header.frame_id = "map";
@@ -972,7 +1157,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
     updateAndLogTrackingDiagnostics(
             pose, velocity, cmd_vel, raw_command, velocity_plan,
             start_heading_alignment_active_, L, path_reference,
-            holonomic_reference ? &holonomic_reference.value() : nullptr);
+            holonomic_reference ? &holonomic_reference.value() : nullptr,
+            shadow_rotation_command ? &shadow_rotation_command.value() : nullptr,
+            shadow_rotation_status ? &shadow_rotation_status.value() : nullptr);
 
     return cmd_vel;
 }

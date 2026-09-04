@@ -90,7 +90,7 @@ double arcCenter(
     (current.x - previous.x) * (arc_center.y - previous.y) -
     (arc_center.x - previous.x) * (current.y - previous.y);
   return radius < kGeometryEpsilon ?
-    0.0 : std::copysign(1.0 / radius, turn_cross_product);
+         0.0 : std::copysign(1.0 / radius, turn_cross_product);
 }
 
 InterpolationResult interpolateAtArcLength(
@@ -207,6 +207,7 @@ void PathProgressTracker::setPath(PreparedPathPtr path)
   }
 
   path_ = std::move(path);
+  prepared_segment_lower_bound_ = 0u;
   progress_arc_length_ = 0.0;
   maximum_progress_budget_ = 2.0 * representative_spacing;
   progress_budget_ = maximum_progress_budget_;
@@ -241,9 +242,11 @@ PathProgressReference PathProgressTracker::update(
 
   PathProgressReference reference;
   reference.frame_id = path_->frame_id;
+  reference.prepared_segment_lower_bound = prepared_segment_lower_bound_;
   if (path_->total_translation_length <= kGeometryEpsilon) {
     reference.projection = path_->poses.front().pose.position;
     reference.carrot = path_->poses.front().pose.position;
+    reference.cursor.segment_index = prepared_segment_lower_bound_;
     reference.remaining_path_length = 0.0;
     reference.progress_budget = progress_budget_;
     reference.signed_lateral_error = planarDistance(robot_position, reference.projection);
@@ -266,7 +269,8 @@ PathProgressReference PathProgressTracker::update(
 
   for (std::size_t index = 0; index < path_->segments.size(); ++index) {
     const auto & segment = path_->segments[index];
-    if (segment.type != PathSegmentType::kTranslation ||
+    if (index < prepared_segment_lower_bound_ ||
+      segment.type != PathSegmentType::kTranslation ||
       segment.translation_s_end + kGeometryEpsilon <
       progress_arc_length_ ||
       segment.translation_s_begin > admissible_end + kGeometryEpsilon)
@@ -322,7 +326,35 @@ PathProgressReference PathProgressTracker::update(
   }
 
   if (!projection_found) {
-    throw std::domain_error("path progress tracker could not project robot position");
+    if (prepared_segment_lower_bound_ < path_->segments.size() &&
+      path_->segments[prepared_segment_lower_bound_].type != PathSegmentType::kRotation)
+    {
+      throw std::domain_error("path progress tracker could not project robot position");
+    }
+
+    const std::size_t pose_index = prepared_segment_lower_bound_ < path_->segments.size() ?
+      path_->segments[prepared_segment_lower_bound_].start_pose_index :
+      path_->poses.size() - 1u;
+    reference.projection = path_->poses[pose_index].pose.position;
+    reference.carrot = reference.projection;
+    reference.cursor.segment_index = prepared_segment_lower_bound_;
+    reference.cursor.translation_arc_length = progress_arc_length_;
+    reference.segment_index = pose_index;
+    reference.progress_arc_length = progress_arc_length_;
+    reference.carrot_arc_length = progress_arc_length_;
+    reference.remaining_path_length = std::max(
+      0.0, path_->total_translation_length - progress_arc_length_);
+    reference.progress_budget = progress_budget_;
+    reference.tangent = previous_accepted_tangent_valid_ ?
+      std::atan2(previous_accepted_tangent_y_, previous_accepted_tangent_x_) : 0.0;
+    reference.signed_lateral_error = planarDistance(
+      robot_position, reference.projection);
+    previous_robot_position_ = robot_position;
+    previous_robot_position_valid_ = true;
+    if (!referenceIsFinite(reference)) {
+      throw std::domain_error("path progress tracker produced a non-finite reference");
+    }
+    return reference;
   }
 
   const double advance = std::max(0.0, best_arc_length - progress_arc_length_);
@@ -375,6 +407,45 @@ PathProgressReference PathProgressTracker::update(
     throw std::domain_error("path progress tracker produced a non-finite reference");
   }
   return reference;
+}
+
+void PathProgressTracker::acknowledgeRotationComplete(
+  std::size_t rotation_segment_index)
+{
+  if (!hasPath()) {
+    throw std::logic_error("path progress tracker has no path");
+  }
+  if (rotation_segment_index >= path_->segments.size()) {
+    throw std::out_of_range("rotation segment index is out of range");
+  }
+  if (rotation_segment_index < prepared_segment_lower_bound_) {
+    throw std::logic_error("rotation acknowledgement is stale");
+  }
+
+  const auto & requested = path_->segments[rotation_segment_index];
+  if (requested.type != PathSegmentType::kRotation) {
+    throw std::invalid_argument("acknowledgement requires a rotation segment");
+  }
+  if (!translationArcHasReachedRotationBoundary(
+      progress_arc_length_, requested.translation_s_begin))
+  {
+    throw std::logic_error("rotation boundary has not been reached");
+  }
+
+  std::size_t earliest_rotation = path_->segments.size();
+  for (std::size_t index = prepared_segment_lower_bound_;
+    index < path_->segments.size(); ++index)
+  {
+    if (path_->segments[index].type == PathSegmentType::kRotation) {
+      earliest_rotation = index;
+      break;
+    }
+  }
+  if (rotation_segment_index != earliest_rotation) {
+    throw std::logic_error("rotation acknowledgement skips an earlier rotation");
+  }
+
+  prepared_segment_lower_bound_ = rotation_segment_index + 1u;
 }
 
 bool PathProgressTracker::hasPath() const

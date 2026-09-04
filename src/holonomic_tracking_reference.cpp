@@ -79,12 +79,58 @@ HolonomicPathSample sampleSinglePose(const PreparedPath & path)
   return sample;
 }
 
+HolonomicPathSample sampleRotationBoundary(
+  const PreparedPath & path,
+  std::size_t rotation_segment_index,
+  std::size_t prepared_segment_lower_bound)
+{
+  const auto & rotation = path.segments[rotation_segment_index];
+  for (std::size_t index = rotation_segment_index;
+    index > prepared_segment_lower_bound; --index)
+  {
+    const auto & segment = path.segments[index - 1u];
+    if (segment.type == PathSegmentType::kTranslation &&
+      std::abs(segment.translation_s_end - rotation.translation_s_begin) <=
+      kGeometryEpsilon)
+    {
+      return sampleTranslation(
+        path, index - 1u, 1.0, rotation.translation_s_begin);
+    }
+  }
+
+  HolonomicPathSample sample;
+  sample.position = path.poses[rotation.start_pose_index].pose.position;
+  sample.cursor.segment_index = rotation_segment_index;
+  sample.cursor.translation_arc_length = rotation.translation_s_begin;
+  sample.target_yaw = angles::normalize_angle(rotation.target_yaw_begin);
+  return sample;
+}
+
+HolonomicPathSample sampleTerminal(const PreparedPath & path)
+{
+  HolonomicPathSample sample;
+  sample.position = path.poses.back().pose.position;
+  sample.cursor.segment_index = path.segments.size();
+  sample.cursor.translation_arc_length = path.total_translation_length;
+  sample.target_yaw = poseYaw(path.poses.back());
+  for (std::size_t index = path.segments.size(); index > 0u; --index) {
+    const auto & segment = path.segments[index - 1u];
+    if (segment.type == PathSegmentType::kTranslation) {
+      sample.path_tangent = segment.path_tangent;
+      break;
+    }
+  }
+  return sample;
+}
+
 std::optional<std::size_t> firstRotationThroughPreview(
   const PreparedPath & path,
   const PathCursor & current_cursor,
+  std::size_t prepared_segment_lower_bound,
   double preview_arc_length)
 {
-  for (std::size_t index = current_cursor.segment_index + 1u;
+  for (std::size_t index = std::max(
+      current_cursor.segment_index + 1u, prepared_segment_lower_bound);
     index < path.segments.size(); ++index)
   {
     const auto & segment = path.segments[index];
@@ -97,6 +143,40 @@ std::optional<std::size_t> firstRotationThroughPreview(
     {
       return index;
     }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::size_t> firstReachedRotation(
+  const PreparedPath & path,
+  const PathProgressReference & progress)
+{
+  if (progress.prepared_segment_lower_bound >= path.segments.size()) {
+    return std::nullopt;
+  }
+
+  for (std::size_t index = progress.prepared_segment_lower_bound;
+    index < path.segments.size(); ++index)
+  {
+    const auto & segment = path.segments[index];
+    if (!translationArcHasReachedRotationBoundary(
+        progress.cursor.translation_arc_length, segment.translation_s_begin))
+    {
+      return std::nullopt;
+    }
+    if (segment.type != PathSegmentType::kRotation) {
+      continue;
+    }
+    if (index <= progress.cursor.segment_index) {
+      return index;
+    }
+    if (progress.cursor.segment_index < path.segments.size() &&
+      path.segments[progress.cursor.segment_index].type == PathSegmentType::kTranslation &&
+      index == progress.cursor.segment_index + 1u)
+    {
+      return index;
+    }
+    return std::nullopt;
   }
   return std::nullopt;
 }
@@ -168,21 +248,36 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
   {
     throw std::domain_error("holonomic reference inputs must be finite");
   }
+  if (progress.prepared_segment_lower_bound > path.segments.size()) {
+    throw std::invalid_argument("prepared segment lower bound is out of range");
+  }
 
   HolonomicTrackingReference reference;
-  if (path.total_translation_length <= kGeometryEpsilon) {
-    reference.current = sampleSinglePose(path);
+  if (progress.prepared_segment_lower_bound == path.segments.size()) {
+    reference.current = sampleTerminal(path);
     reference.preview = reference.current;
-    if (!path.segments.empty() &&
-      path.segments.front().type == PathSegmentType::kRotation)
-    {
-      const auto & rotation = path.segments.front();
+    reference.mode = HolonomicReferenceMode::kTerminal;
+    if (!referenceIsFinite(reference)) {
+      throw std::domain_error("holonomic reference contains non-finite values");
+    }
+    return reference;
+  }
+
+  if (path.total_translation_length <= kGeometryEpsilon) {
+    const auto pending_rotation = firstReachedRotation(path, progress);
+    if (pending_rotation) {
+      const auto & rotation = path.segments[*pending_rotation];
+      reference.current = sampleRotationBoundary(
+        path, *pending_rotation, progress.prepared_segment_lower_bound);
+      reference.preview = reference.current;
       reference.mode = HolonomicReferenceMode::kRotationPending;
-      reference.current.cursor.segment_index = 0u;
-      reference.preview.cursor.segment_index = 0u;
       reference.preview_clamped_by_rotation = true;
       reference.rotation_target_yaw = angles::normalize_angle(
         rotation.target_yaw_begin + rotation.target_yaw_delta);
+      reference.pending_rotation_segment_index = pending_rotation;
+    } else {
+      reference.current = sampleSinglePose(path);
+      reference.preview = reference.current;
     }
     if (!referenceIsFinite(reference)) {
       throw std::domain_error("holonomic reference contains non-finite values");
@@ -191,6 +286,27 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
   }
 
   const auto & cursor = progress.cursor;
+  if (cursor.segment_index < path.segments.size() &&
+    path.segments[cursor.segment_index].type == PathSegmentType::kRotation)
+  {
+    const auto pending_rotation = firstReachedRotation(path, progress);
+    if (!pending_rotation) {
+      throw std::invalid_argument("rotation cursor has no pending rotation");
+    }
+    const auto & rotation = path.segments[*pending_rotation];
+    reference.current = sampleRotationBoundary(
+      path, *pending_rotation, progress.prepared_segment_lower_bound);
+    reference.preview = reference.current;
+    reference.mode = HolonomicReferenceMode::kRotationPending;
+    reference.preview_clamped_by_rotation = true;
+    reference.rotation_target_yaw = angles::normalize_angle(
+      rotation.target_yaw_begin + rotation.target_yaw_delta);
+    reference.pending_rotation_segment_index = pending_rotation;
+    if (!referenceIsFinite(reference)) {
+      throw std::domain_error("holonomic reference contains non-finite values");
+    }
+    return reference;
+  }
   if (cursor.segment_index >= path.segments.size() ||
     path.segments[cursor.segment_index].type != PathSegmentType::kTranslation ||
     !std::isfinite(cursor.translation_arc_length))
@@ -206,7 +322,7 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
     cursor.translation_arc_length + lookahead_distance,
     path.total_translation_length);
   const auto rotation_index = firstRotationThroughPreview(
-    path, cursor, desired_preview_arc_length);
+    path, cursor, progress.prepared_segment_lower_bound, desired_preview_arc_length);
   if (rotation_index) {
     const auto & rotation = path.segments[*rotation_index];
     const std::size_t preceding_segment_index = *rotation_index - 1u;
@@ -220,19 +336,18 @@ HolonomicTrackingReference buildHolonomicTrackingReference(
       path, cursor, desired_preview_arc_length);
   }
 
-  const auto & current_segment = path.segments[cursor.segment_index];
+  const auto pending_rotation = firstReachedRotation(path, progress);
   const bool at_current_segment_end =
     cursor.segment_fraction >= 1.0 - kGeometryEpsilon;
-  if (at_current_segment_end && cursor.segment_index + 1u < path.segments.size() &&
-    path.segments[cursor.segment_index + 1u].type == PathSegmentType::kRotation)
-  {
-    const auto & rotation = path.segments[cursor.segment_index + 1u];
+  if (pending_rotation) {
+    const auto & rotation = path.segments[*pending_rotation];
     reference.mode = HolonomicReferenceMode::kRotationPending;
-    reference.preview = sampleTranslation(
-      path, cursor.segment_index, 1.0, current_segment.translation_s_end);
+    reference.preview = sampleRotationBoundary(
+      path, *pending_rotation, progress.prepared_segment_lower_bound);
     reference.preview_clamped_by_rotation = true;
     reference.rotation_target_yaw = angles::normalize_angle(
       rotation.target_yaw_begin + rotation.target_yaw_delta);
+    reference.pending_rotation_segment_index = pending_rotation;
   } else if (at_current_segment_end &&
     cursor.segment_index + 1u == path.segments.size())
   {

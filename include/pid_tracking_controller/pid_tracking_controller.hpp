@@ -29,10 +29,13 @@ namespace pid_tracking_controller
 
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
+class RotationCompletionTracker;
 struct PreparedPath;
 struct PathProgressReference;
 struct LegacyCarrotVelocityPlan;
 struct HolonomicTrackingReference;
+struct HolonomicRawCommand;
+struct RotationCompletionStatus;
 
 class PidTrackingController : public nav2_core::Controller
 {
@@ -121,7 +124,10 @@ private:
     bool alignment_phase,
     double lookahead_distance,
     const PathProgressReference & path_reference,
-    const HolonomicTrackingReference * holonomic_reference);
+    const HolonomicTrackingReference * holonomic_reference,
+    const HolonomicRawCommand * shadow_rotation_command,
+    const RotationCompletionStatus * shadow_rotation_status);
+  void resetRotationShadow();
 
   double factor_{0.0};
 
@@ -163,6 +169,18 @@ private:
   bool start_heading_check_pending_{false};
   bool start_heading_alignment_active_{false};
   double start_heading_target_{0.0};
+
+  double kp_yaw_{1.0};
+  double rotation_yaw_tolerance_{0.05};
+  double rotation_omega_tolerance_{0.05};
+  double rotation_xy_speed_tolerance_{0.05};
+  double rotation_settle_time_{0.30};
+  std::unique_ptr<RotationCompletionTracker> rotation_completion_tracker_;
+  bool shadow_rotation_pending_{false};
+  std::size_t shadow_pending_rotation_segment_index_{0};
+  double shadow_rotation_last_sample_time_seconds_{0.0};
+  bool shadow_rotation_last_sample_time_valid_{false};
+  bool shadow_rotation_ack_candidate_{false};
 
   double e_v_{0.0};
   double e_w_{0.0};

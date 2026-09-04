@@ -48,6 +48,7 @@ add_library(${PROJECT_NAME} SHARED
   src/legacy_carrot_velocity_planner.cpp
   src/path_progress_tracker.cpp
   src/prepared_path.cpp
+  src/rotation_completion_tracker.cpp
 )
 target_include_directories(${PROJECT_NAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -173,6 +174,16 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   target_link_libraries(test_holonomic_command_limiter
+    ${PROJECT_NAME}
+  )
+
+  ament_add_gtest(test_rotation_completion_tracker
+    test/test_rotation_completion_tracker.cpp
+  )
+  target_include_directories(test_rotation_completion_tracker PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(test_rotation_completion_tracker
     ${PROJECT_NAME}
   )
 

@@ -18,6 +18,16 @@ enum class PathSegmentType
   kRotation
 };
 
+inline constexpr double kRotationBoundaryArcTolerance = 1e-10;
+
+constexpr bool translationArcHasReachedRotationBoundary(
+  double translation_arc_length,
+  double rotation_boundary_arc_length)
+{
+  return translation_arc_length >=
+         rotation_boundary_arc_length - kRotationBoundaryArcTolerance;
+}
+
 struct PreparedPathSegment
 {
   PathSegmentType type{PathSegmentType::kTranslation};

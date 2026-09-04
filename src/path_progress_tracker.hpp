@@ -16,6 +16,9 @@ struct PathProgressReference
   geometry_msgs::msg::Point carrot;
   std::string frame_id;
   PathCursor cursor;
+  // First prepared segment still eligible for projection/rotation handling.
+  // A value equal to the prepared segment count is the terminal sentinel.
+  std::size_t prepared_segment_lower_bound{0};
   std::size_t segment_index{0};
   double segment_fraction{0.0};
   double progress_arc_length{0.0};
@@ -36,10 +39,13 @@ public:
     const geometry_msgs::msg::Point & robot_position,
     double lookahead_distance);
 
+  void acknowledgeRotationComplete(std::size_t rotation_segment_index);
+
   bool hasPath() const;
 
 private:
   PreparedPathPtr path_;
+  std::size_t prepared_segment_lower_bound_{0};
   double progress_arc_length_{0.0};
   double progress_budget_{0.0};
   double maximum_progress_budget_{0.0};

@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -93,6 +94,58 @@ nav_msgs::msg::Path makeAngularLimitedLifecyclePath()
     path.poses.push_back(pose);
   }
   return path;
+}
+
+geometry_msgs::msg::PoseStamped makePose(double x, double yaw)
+{
+  geometry_msgs::msg::PoseStamped pose;
+  pose.header.frame_id = "map";
+  pose.pose.position.x = x;
+  pose.pose.orientation.z = std::sin(0.5 * yaw);
+  pose.pose.orientation.w = std::cos(0.5 * yaw);
+  return pose;
+}
+
+nav_msgs::msg::Path makeRotationPendingLifecyclePath()
+{
+  constexpr double kDegreesToRadians = M_PI / 180.0;
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  path.poses = {
+    makePose(0.0, 179.0 * kDegreesToRadians),
+    makePose(0.3, 179.0 * kDegreesToRadians),
+    makePose(0.3, -179.0 * kDegreesToRadians),
+    makePose(0.6, -179.0 * kDegreesToRadians)};
+  return path;
+}
+
+nav_msgs::msg::Path makeInitialRotationLifecyclePath()
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  path.poses = {makePose(0.0, 0.0), makePose(0.0, 0.2)};
+  return path;
+}
+
+nav_msgs::msg::Path makeLegacyBaselineLifecyclePath()
+{
+  constexpr double kDegreesToRadians = M_PI / 180.0;
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  path.poses = {
+    makePose(0.0, 179.0 * kDegreesToRadians),
+    makePose(0.3, 179.0 * kDegreesToRadians),
+    makePose(0.6, -179.0 * kDegreesToRadians)};
+  return path;
+}
+
+double loggedDouble(const std::string & text, const std::string & field)
+{
+  const std::size_t position = text.find(field);
+  if (position == std::string::npos) {
+    throw std::runtime_error("required numeric log field is absent: " + field);
+  }
+  return std::stod(text.substr(position + field.size()));
 }
 
 TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticTopic)
@@ -189,6 +242,19 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     EXPECT_NE(log_capture.output().find("max_v=0.800000"), std::string::npos);
     EXPECT_NE(log_capture.output().find("max_w=0.800000"), std::string::npos);
     EXPECT_NE(log_capture.output().find("cruise_speed=0.800000"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("kp_yaw=1.000000"), std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("rotation_yaw_tolerance=0.050000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("rotation_omega_tolerance=0.050000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("rotation_xy_speed_tolerance=0.050000"),
+      std::string::npos);
+    EXPECT_NE(
+      log_capture.output().find("rotation_settle_time=0.300000"),
+      std::string::npos);
     EXPECT_NE(log_capture.output().find("PID_LOG plan_revision=1"), std::string::npos);
     EXPECT_NE(log_capture.output().find("angular_saturation_ratio="), std::string::npos);
     EXPECT_NE(log_capture.output().find("phase=TRACKING"), std::string::npos);
@@ -275,6 +341,240 @@ TEST(LifecycleSmoke, publishesCarrotAndLogsTrackingDiagnosticsWithoutDiagnosticT
     }
     executor.remove_node(observer);
     executor.remove_node(parent->get_node_base_interface());
+  }
+
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, rotationPendingShadowUsesMeasuredSettleWithoutChangingLegacyCommand)
+{
+  rclcpp::init(0, nullptr);
+  ScopedLogCapture log_capture;
+
+  {
+    rclcpp::NodeOptions parent_options;
+    parent_options.append_parameter_override(
+      "PidTrackingController.enable_start_heading_alignment", false);
+    parent_options.append_parameter_override("PidTrackingController.kp_yaw", 2.0);
+    parent_options.append_parameter_override(
+      "PidTrackingController.rotation_settle_time", 0.12);
+    parent_options.append_parameter_override(
+      "LegacyBaseline.enable_start_heading_alignment", false);
+    auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
+      "pid_tracking_controller_shadow_test_node", parent_options);
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+      "pid_tracking_controller_shadow_test_costmap");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->configure();
+    ASSERT_EQ(costmap->get_current_state().label(), "inactive");
+
+    auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+    PidTrackingController legacy_baseline;
+    legacy_baseline.configure(parent, "LegacyBaseline", tf, costmap);
+    legacy_baseline.activate();
+    legacy_baseline.setPlan(makeLegacyBaselineLifecyclePath());
+
+    constexpr double kRobotYaw = 179.0 * M_PI / 180.0;
+    geometry_msgs::msg::PoseStamped pose = makePose(0.3, kRobotYaw);
+    geometry_msgs::msg::Twist stopped_velocity;
+    const auto baseline_command = legacy_baseline.computeVelocityCommands(
+      pose, stopped_velocity, nullptr);
+
+    const std::size_t first_observation_begin = log_capture.output().size();
+    PidTrackingController controller;
+    controller.configure(parent, "PidTrackingController", tf, costmap);
+    controller.activate();
+    controller.setPlan(makeRotationPendingLifecyclePath());
+    const auto first_command = controller.computeVelocityCommands(
+      pose, stopped_velocity, nullptr);
+    const std::string first_observation =
+      log_capture.output().substr(first_observation_begin);
+
+    EXPECT_DOUBLE_EQ(first_command.twist.linear.x, baseline_command.twist.linear.x);
+    EXPECT_DOUBLE_EQ(first_command.twist.linear.y, baseline_command.twist.linear.y);
+    EXPECT_DOUBLE_EQ(first_command.twist.angular.z, baseline_command.twist.angular.z);
+    EXPECT_DOUBLE_EQ(first_command.twist.linear.y, 0.0);
+    EXPECT_NE(
+      first_observation.find("rotation_settle_time=0.120000"),
+      std::string::npos);
+    EXPECT_NE(
+      first_observation.find("pending_rotation_segment_index=1"),
+      std::string::npos);
+    EXPECT_DOUBLE_EQ(
+      loggedDouble(first_observation, "shadow_settled_duration="), 0.0);
+    EXPECT_NE(
+      first_observation.find("rotation_ack_candidate=false"),
+      std::string::npos);
+    EXPECT_NE(
+      first_observation.find("shadow_raw_vx=0.000000"), std::string::npos);
+    EXPECT_DOUBLE_EQ(loggedDouble(first_observation, "shadow_raw_vy="), 0.0);
+    EXPECT_NE(
+      first_observation.find("shadow_yaw_error=0.034907"), std::string::npos);
+    EXPECT_NE(
+      first_observation.find("shadow_raw_omega=0.069813"), std::string::npos);
+
+    const std::size_t settled_log_begin = log_capture.output().size();
+    std::this_thread::sleep_for(140ms);
+    const auto settled_command = controller.computeVelocityCommands(
+      pose, stopped_velocity, nullptr);
+    const std::string settled_log = log_capture.output().substr(settled_log_begin);
+
+    EXPECT_DOUBLE_EQ(settled_command.twist.linear.x, baseline_command.twist.linear.x);
+    EXPECT_DOUBLE_EQ(settled_command.twist.linear.y, baseline_command.twist.linear.y);
+    EXPECT_DOUBLE_EQ(settled_command.twist.angular.z, baseline_command.twist.angular.z);
+    EXPECT_DOUBLE_EQ(settled_command.twist.linear.y, 0.0);
+    EXPECT_GE(loggedDouble(settled_log, "shadow_settled_duration="), 0.12);
+    EXPECT_NE(
+      settled_log.find("rotation_ack_candidate=true"), std::string::npos);
+    EXPECT_NE(
+      settled_log.find("pending_rotation_segment_index=1"), std::string::npos);
+
+    geometry_msgs::msg::Twist moving_velocity;
+    moving_velocity.linear.x = 0.06;
+    moving_velocity.angular.z = 0.10;
+    const std::size_t violation_log_begin = log_capture.output().size();
+    controller.computeVelocityCommands(pose, moving_velocity, nullptr);
+    const std::string violation_log =
+      log_capture.output().substr(violation_log_begin);
+
+    EXPECT_NE(
+      violation_log.find("pending_rotation_segment_index=1"), std::string::npos);
+    EXPECT_DOUBLE_EQ(
+      loggedDouble(violation_log, "shadow_settled_duration="), 0.0);
+    EXPECT_NE(
+      violation_log.find("shadow_measured_vx=0.060000"), std::string::npos);
+    EXPECT_NE(
+      violation_log.find("shadow_measured_vy=0.000000"), std::string::npos);
+    EXPECT_NE(
+      violation_log.find("shadow_measured_omega=0.100000"), std::string::npos);
+    EXPECT_NE(
+      violation_log.find("rotation_ack_candidate=false"), std::string::npos);
+
+    const std::size_t restored_log_begin = log_capture.output().size();
+    std::this_thread::sleep_for(140ms);
+    controller.computeVelocityCommands(pose, stopped_velocity, nullptr);
+    const std::string restored_log = log_capture.output().substr(restored_log_begin);
+    EXPECT_GE(loggedDouble(restored_log, "shadow_settled_duration="), 0.12);
+    EXPECT_NE(
+      restored_log.find("rotation_ack_candidate=true"), std::string::npos);
+
+    const std::size_t equivalent_plan_log_begin = log_capture.output().size();
+    controller.setPlan(makeRotationPendingLifecyclePath());
+    controller.computeVelocityCommands(pose, stopped_velocity, nullptr);
+    const std::string equivalent_plan_log =
+      log_capture.output().substr(equivalent_plan_log_begin);
+
+    EXPECT_NE(
+      equivalent_plan_log.find("reference_mode=rotation_pending"),
+      std::string::npos);
+    EXPECT_NE(
+      equivalent_plan_log.find("pending_rotation_segment_index=1"),
+      std::string::npos);
+    EXPECT_DOUBLE_EQ(
+      loggedDouble(equivalent_plan_log, "shadow_settled_duration="), 0.0);
+    EXPECT_NE(
+      equivalent_plan_log.find("rotation_ack_candidate=false"),
+      std::string::npos);
+
+    const std::size_t equivalent_restored_log_begin = log_capture.output().size();
+    std::this_thread::sleep_for(140ms);
+    controller.computeVelocityCommands(
+      pose, stopped_velocity, nullptr);
+    const std::string equivalent_restored_log =
+      log_capture.output().substr(equivalent_restored_log_begin);
+    EXPECT_GE(
+      loggedDouble(equivalent_restored_log, "shadow_settled_duration="), 0.12);
+    EXPECT_NE(
+      equivalent_restored_log.find("rotation_ack_candidate=true"),
+      std::string::npos);
+
+    const std::size_t index_change_log_begin = log_capture.output().size();
+    controller.setPlan(makeInitialRotationLifecyclePath());
+    controller.computeVelocityCommands(
+      makePose(0.0, 0.2), geometry_msgs::msg::Twist(), nullptr);
+    const std::string index_change_log =
+      log_capture.output().substr(index_change_log_begin);
+
+    EXPECT_NE(
+      index_change_log.find("reference_mode=rotation_pending"),
+      std::string::npos);
+    EXPECT_NE(
+      index_change_log.find("pending_rotation_segment_index=0"),
+      std::string::npos);
+    EXPECT_DOUBLE_EQ(
+      loggedDouble(index_change_log, "shadow_settled_duration="), 0.0);
+    EXPECT_NE(
+      index_change_log.find("rotation_ack_candidate=false"), std::string::npos);
+
+    const std::size_t index_restored_log_begin = log_capture.output().size();
+    std::this_thread::sleep_for(140ms);
+    controller.computeVelocityCommands(
+      makePose(0.0, 0.2), geometry_msgs::msg::Twist(), nullptr);
+    const std::string index_restored_log =
+      log_capture.output().substr(index_restored_log_begin);
+    EXPECT_GE(
+      loggedDouble(index_restored_log, "shadow_settled_duration="), 0.12);
+    EXPECT_NE(
+      index_restored_log.find("rotation_ack_candidate=true"),
+      std::string::npos);
+
+    const std::size_t mode_change_log_begin = log_capture.output().size();
+    controller.setPlan(makeLifecyclePath());
+    controller.computeVelocityCommands(
+      makePose(0.0, 0.0), geometry_msgs::msg::Twist(), nullptr);
+    const std::string mode_change_log =
+      log_capture.output().substr(mode_change_log_begin);
+
+    EXPECT_NE(
+      mode_change_log.find("reference_mode=translation"), std::string::npos);
+    EXPECT_NE(
+      mode_change_log.find("shadow_rotation_available=false"),
+      std::string::npos);
+    EXPECT_NE(
+      mode_change_log.find("rotation_ack_candidate=false"),
+      std::string::npos);
+
+    controller.deactivate();
+    controller.cleanup();
+    legacy_baseline.deactivate();
+    legacy_baseline.cleanup();
+    costmap->cleanup();
+  }
+
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, invalidShadowParameterFailsBeforeRuntimeCanBeUsed)
+{
+  rclcpp::init(0, nullptr);
+
+  {
+    rclcpp::NodeOptions parent_options;
+    parent_options.append_parameter_override("PidTrackingController.kp_yaw", -0.01);
+    auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
+      "pid_tracking_controller_invalid_shadow_test_node", parent_options);
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+      "pid_tracking_controller_invalid_shadow_test_costmap");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->configure();
+    ASSERT_EQ(costmap->get_current_state().label(), "inactive");
+
+    auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+    PidTrackingController controller;
+    EXPECT_THROW(
+      controller.configure(parent, "PidTrackingController", tf, costmap),
+      std::invalid_argument);
+    EXPECT_EQ(parent->count_publishers("/pid_tracking_controller/carrot"), 0u);
+
+    ASSERT_TRUE(
+      parent->set_parameter(rclcpp::Parameter("PidTrackingController.kp_yaw", 1.0)).
+      successful);
+    EXPECT_NO_THROW(
+      controller.configure(parent, "PidTrackingController", tf, costmap));
+    EXPECT_EQ(parent->count_publishers("/pid_tracking_controller/carrot"), 1u);
+
+    controller.cleanup();
+    costmap->cleanup();
   }
 
   rclcpp::shutdown();

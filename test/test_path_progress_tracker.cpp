@@ -22,6 +22,12 @@ geometry_msgs::msg::Point makePoint(double x, double y)
   return point;
 }
 
+void setYaw(geometry_msgs::msg::PoseStamped & pose, double yaw)
+{
+  pose.pose.orientation.z = std::sin(0.5 * yaw);
+  pose.pose.orientation.w = std::cos(0.5 * yaw);
+}
+
 nav_msgs::msg::Path makePath(
   std::initializer_list<std::pair<double, double>> coordinates)
 {
@@ -34,6 +40,18 @@ nav_msgs::msg::Path makePath(
     pose.pose.orientation.w = 1.0;
     path.poses.push_back(pose);
   }
+  return path;
+}
+
+nav_msgs::msg::Path makeTwoRotationPath()
+{
+  auto path = makePath(
+    {{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {2.0, 0.0},
+      {2.0, 0.0}, {3.0, 0.0}});
+  setYaw(path.poses[2], M_PI_4);
+  setYaw(path.poses[3], M_PI_4);
+  setYaw(path.poses[4], M_PI_2);
+  setYaw(path.poses[5], M_PI_2);
   return path;
 }
 
@@ -295,6 +313,82 @@ TEST(PathProgressTracker, legacyCarrotStillCrossesShadowRotationSegment)
   EXPECT_NEAR(reference.carrot.x, 1.0, 1e-12);
   EXPECT_NEAR(reference.carrot.y, 0.30, 1e-12);
   EXPECT_NEAR(reference.tangent, M_PI_2, 1e-12);
+}
+
+TEST(PathProgressTracker, acknowledgementPreservesProgressAndExcludesOlderSegments)
+{
+  auto path = makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+  setYaw(path.poses[2], M_PI_2);
+  setYaw(path.poses[3], M_PI_2);
+
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, path);
+  const auto before = tracker.update(makePoint(1.0, 0.0), 0.50);
+  ASSERT_EQ(before.cursor.segment_index, 0u);
+  ASSERT_EQ(before.prepared_segment_lower_bound, 0u);
+
+  tracker.acknowledgeRotationComplete(1u);
+  const auto after = tracker.update(makePoint(1.0, 0.0), 0.50);
+
+  EXPECT_EQ(after.prepared_segment_lower_bound, 2u);
+  EXPECT_EQ(after.cursor.segment_index, 2u);
+  EXPECT_DOUBLE_EQ(after.progress_arc_length, before.progress_arc_length);
+  EXPECT_DOUBLE_EQ(after.progress_budget, before.progress_budget);
+
+  for (int sample = 0; sample < 5; ++sample) {
+    const auto stationary = tracker.update(makePoint(1.0, 0.0), 0.50);
+    EXPECT_EQ(stationary.prepared_segment_lower_bound, 2u);
+    EXPECT_EQ(stationary.cursor.segment_index, 2u);
+  }
+}
+
+TEST(PathProgressTracker, acknowledgementRequiresReachedEarliestRotationAndIsMonotonic)
+{
+  PathProgressTracker missing_path;
+  EXPECT_THROW(missing_path.acknowledgeRotationComplete(0u), std::logic_error);
+
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, makeTwoRotationPath());
+  tracker.update(makePoint(0.0, 0.0), 0.10);
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(1u), std::logic_error);
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(0u), std::invalid_argument);
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(9u), std::out_of_range);
+
+  const auto reached = tracker.update(makePoint(2.0, 0.0), 0.10);
+  ASSERT_NEAR(reached.progress_arc_length, 2.0, 1e-12);
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(3u), std::logic_error);
+
+  tracker.acknowledgeRotationComplete(1u);
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(1u), std::logic_error);
+  tracker.acknowledgeRotationComplete(3u);
+
+  const auto acknowledged = tracker.update(makePoint(2.0, 0.0), 0.10);
+  EXPECT_EQ(acknowledged.prepared_segment_lower_bound, 4u);
+  EXPECT_EQ(acknowledged.cursor.segment_index, 4u);
+
+  setPreparedPath(tracker, makeTwoRotationPath());
+  const auto reset = tracker.update(makePoint(0.0, 0.0), 0.10);
+  EXPECT_EQ(reset.prepared_segment_lower_bound, 0u);
+}
+
+TEST(PathProgressTracker, acknowledgementPreservesPositionAndAcceptedTangentHistory)
+{
+  auto path = makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+  setYaw(path.poses[2], M_PI_2);
+  setYaw(path.poses[3], M_PI_2);
+
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, path);
+  const auto before = tracker.update(makePoint(1.0, 0.0), 0.20);
+  ASSERT_NEAR(before.progress_budget, 1.0, 1e-12);
+
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(0u), std::invalid_argument);
+  tracker.acknowledgeRotationComplete(1u);
+  const auto after = tracker.update(makePoint(1.20, 0.0), 0.20);
+
+  EXPECT_EQ(after.cursor.segment_index, 2u);
+  EXPECT_DOUBLE_EQ(after.progress_arc_length, before.progress_arc_length);
+  EXPECT_NEAR(after.progress_budget, before.progress_budget + 0.20, 1e-12);
 }
 
 }  // namespace
