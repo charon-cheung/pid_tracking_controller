@@ -41,6 +41,9 @@ set(dependencies
 
 add_library(${PROJECT_NAME} SHARED
   src/pid_tracking_controller.cpp
+  src/holonomic_command_limiter.cpp
+  src/holonomic_control_law.cpp
+  src/holonomic_speed_planner.cpp
   src/holonomic_tracking_reference.cpp
   src/legacy_carrot_velocity_planner.cpp
   src/path_progress_tracker.cpp
@@ -136,6 +139,40 @@ if(BUILD_TESTING)
     nav_msgs
   )
   target_link_libraries(test_holonomic_tracking_reference
+    ${PROJECT_NAME}
+  )
+
+  ament_add_gtest(test_holonomic_control_law
+    test/test_holonomic_control_law.cpp
+  )
+  target_include_directories(test_holonomic_control_law PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(test_holonomic_control_law
+    ${PROJECT_NAME}
+  )
+
+  ament_add_gtest(test_holonomic_speed_planner
+    test/test_holonomic_speed_planner.cpp
+  )
+  target_include_directories(test_holonomic_speed_planner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  ament_target_dependencies(test_holonomic_speed_planner
+    geometry_msgs
+    nav_msgs
+  )
+  target_link_libraries(test_holonomic_speed_planner
+    ${PROJECT_NAME}
+  )
+
+  ament_add_gtest(test_holonomic_command_limiter
+    test/test_holonomic_command_limiter.cpp
+  )
+  target_include_directories(test_holonomic_command_limiter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(test_holonomic_command_limiter
     ${PROJECT_NAME}
   )
 
