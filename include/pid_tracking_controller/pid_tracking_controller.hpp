@@ -1,6 +1,7 @@
 #ifndef PID_TRACKING_CONTROLLER__PID_TRACKING_CONTROLLER_HPP_
 #define PID_TRACKING_CONTROLLER__PID_TRACKING_CONTROLLER_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <limits>
@@ -30,6 +31,8 @@ namespace pid_tracking_controller
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
 class RotationCompletionTracker;
+class HolonomicSpeedPlanner;
+class HolonomicCommandLimiter;
 struct PreparedPath;
 struct PathProgressReference;
 struct LegacyCarrotVelocityPlan;
@@ -127,7 +130,13 @@ private:
     const HolonomicTrackingReference * holonomic_reference,
     const HolonomicRawCommand * shadow_rotation_command,
     const RotationCompletionStatus * shadow_rotation_status);
-  void resetRotationShadow();
+  void resetRotationState();
+  geometry_msgs::msg::TwistStamped computeHolonomicCommand(
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & velocity,
+    const PathProgressReference & path_reference,
+    double lookahead_distance,
+    const rclcpp::Time & now);
 
   double factor_{0.0};
 
@@ -171,16 +180,25 @@ private:
   double start_heading_target_{0.0};
 
   double kp_yaw_{1.0};
+  double kp_x_{1.0};
+  double kp_y_{1.0};
+  double max_xy_speed_{0.20};
+  double control_gap_threshold_{0.50};
+  std::atomic<double> external_speed_limit_{std::numeric_limits<double>::infinity()};
+  std::unique_ptr<HolonomicSpeedPlanner> holonomic_speed_planner_;
+  std::unique_ptr<HolonomicCommandLimiter> holonomic_command_limiter_;
+  rclcpp::Time last_control_time_{0, 0, RCL_ROS_TIME};
+  bool control_time_valid_{false};
+  bool rotation_last_all_conditions_{false};
+  int last_holonomic_mode_{-1};
   double rotation_yaw_tolerance_{0.05};
   double rotation_omega_tolerance_{0.05};
   double rotation_xy_speed_tolerance_{0.05};
   double rotation_settle_time_{0.30};
   std::unique_ptr<RotationCompletionTracker> rotation_completion_tracker_;
-  bool shadow_rotation_pending_{false};
-  std::size_t shadow_pending_rotation_segment_index_{0};
-  double shadow_rotation_last_sample_time_seconds_{0.0};
-  bool shadow_rotation_last_sample_time_valid_{false};
-  bool shadow_rotation_ack_candidate_{false};
+  bool rotation_pending_{false};
+  std::size_t pending_rotation_segment_index_{0};
+  bool rotation_ack_candidate_{false};
 
   double e_v_{0.0};
   double e_w_{0.0};

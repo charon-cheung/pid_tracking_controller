@@ -43,6 +43,7 @@ struct HolonomicSpeedPlan
   double reference_velocity{0.0};
   double axis_speed_limit{std::numeric_limits<double>::infinity()};
   double yaw_speed_limit{std::numeric_limits<double>::infinity()};
+  double yaw_ff_speed_limit{std::numeric_limits<double>::infinity()};
   double tangent_speed_limit{std::numeric_limits<double>::infinity()};
   double stopping_speed_limit{std::numeric_limits<double>::infinity()};
   double external_speed_limit{std::numeric_limits<double>::infinity()};
@@ -56,7 +57,7 @@ struct HolonomicSpeedPlan
 double convertExternalSpeedLimitToAbsolute(
   double speed_limit,
   bool percentage,
-  double nominal_tracking_speed);
+  double max_xy_speed);
 
 class HolonomicSpeedPlanner
 {

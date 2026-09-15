@@ -5,6 +5,9 @@
 
 #include "pid_tracking_controller/pid_tracking_controller.hpp"
 #include "rclcpp/clock.hpp"
+#include "holonomic_command_limiter.hpp"
+#include "holonomic_speed_planner.hpp"
+#include "rotation_completion_tracker.hpp"
 
 namespace pid_tracking_controller
 {
@@ -12,6 +15,19 @@ namespace pid_tracking_controller
 class PidTrackingControllerTestAccess
 {
 public:
+  static void initializeHolonomic(
+    PidTrackingController & controller, const HolonomicSpeedPlannerConfig & speed,
+    const HolonomicCommandLimiterConfig & limits,
+    const RotationCompletionTrackerConfig & rotation)
+  {
+    controller.holonomic_speed_planner_ = std::make_unique<HolonomicSpeedPlanner>(speed);
+    controller.holonomic_command_limiter_ = std::make_unique<HolonomicCommandLimiter>(limits);
+    controller.rotation_completion_tracker_ = std::make_unique<RotationCompletionTracker>(rotation);
+    controller.max_xy_speed_ = speed.max_xy_speed;
+    controller.control_gap_threshold_ = limits.control_gap_threshold;
+    controller.control_time_valid_ = false;
+  }
+
   static void setModelParameters(
     PidTrackingController & controller, double k_v, double k_w, double l)
   {

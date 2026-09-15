@@ -454,6 +454,47 @@ TEST(HolonomicSpeedPlanner, extremelyShortEffectiveWindowDoesNotCreateRateSpike)
   EXPECT_TRUE(std::isfinite(plan.reference_velocity_target));
 }
 
+TEST(HolonomicSpeedPlanner, currentSegmentYawFeedforwardRemainsFeasibleAfterRamping)
+{
+  for (const double final_yaw : {0.0, 0.1}) {
+    const auto path = preparePath(makePath({
+      {0.0, 0.0, 0.0}, {0.01, 0.0, 0.1}, {0.02, 0.0, final_yaw},
+      {1.02, 0.0, final_yaw}, {2.02, 0.0, final_yaw}}));
+    auto config = makeConfig();
+    config.nominal_tracking_speed = 0.2;
+    config.max_omega = 0.3;
+    config.yaw_feedback_reserve = 0.05;
+    config.max_ax = config.max_ay = 0.2;
+    config.a_ref_up = config.a_ref_down = 0.2;
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(path);
+    planner.seed(0.2);
+    const auto reference = makeReference(path, makePoint(0.0, 0.0));
+    const auto result = planner.plan(reference, 0.0, 0.1);
+    EXPECT_LE(
+      std::abs(reference.current.target_yaw_rate_per_meter * result.reference_velocity),
+      0.25 + 1e-12);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, futureShortYawSegmentBrakesBeforeItsBoundary)
+{
+  const auto path = preparePath(makePath({
+    {0.0, 0.0, 0.0}, {0.1, 0.0, 0.0}, {0.11, 0.0, 0.1},
+    {1.11, 0.0, 0.1}, {2.11, 0.0, 0.1}}));
+  auto config = makeConfig();
+  config.nominal_tracking_speed = 0.8;
+  config.max_omega = 0.3;
+  config.yaw_feedback_reserve = 0.05;
+  config.max_ax = config.max_ay = 0.2;
+  config.a_ref_up = config.a_ref_down = 0.2;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  const auto result = planAt(planner, path, makePoint(0.0, 0.0));
+  // 0.025 m/s at the boundary, 0.1 m away, with 0.2 m/s^2 deceleration.
+  EXPECT_LE(result.reference_velocity_target, std::sqrt(0.000625 + 0.04) + 1e-12);
+}
+
 TEST(HolonomicSpeedPlanner, convertsNav2AbsoluteAndPercentageSpeedLimits)
 {
   EXPECT_NEAR(convertExternalSpeedLimitToAbsolute(0.3, false, 0.8), 0.3, 1e-12);

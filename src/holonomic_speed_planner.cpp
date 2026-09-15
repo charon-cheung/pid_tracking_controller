@@ -255,10 +255,10 @@ void validateCursor(
 double convertExternalSpeedLimitToAbsolute(
   double speed_limit,
   bool percentage,
-  double nominal_tracking_speed)
+  double max_xy_speed)
 {
   if (!std::isfinite(speed_limit) || speed_limit < 0.0 ||
-    !std::isfinite(nominal_tracking_speed) || nominal_tracking_speed < 0.0)
+    !std::isfinite(max_xy_speed) || max_xy_speed <= 0.0)
   {
     throw std::invalid_argument("speed limits must be finite and nonnegative");
   }
@@ -268,7 +268,7 @@ double convertExternalSpeedLimitToAbsolute(
   if (speed_limit == 0.0) {
     return std::numeric_limits<double>::infinity();
   }
-  return percentage ? nominal_tracking_speed * speed_limit / 100.0 : speed_limit;
+  return percentage ? max_xy_speed * (speed_limit / 100.0) : speed_limit;
 }
 
 HolonomicSpeedPlanner::HolonomicSpeedPlanner(
@@ -352,6 +352,13 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
       path_->segments[rotation_index].translation_s_begin :
       path_->total_translation_length;
 
+    const double omega_available = config_.max_omega - config_.yaw_feedback_reserve;
+    const auto yawFeedforwardSpeed = [omega_available](double rate) {
+        return std::abs(rate) <= kRateEpsilon ?
+          std::numeric_limits<double>::infinity() : omega_available / std::abs(rate);
+      };
+    plan.yaw_ff_speed_limit = yawFeedforwardSpeed(current_segment.target_yaw_rate_per_meter);
+
     std::vector<SpeedCandidate> candidates;
     candidates.push_back({current_arc_length, cursor.segment_index});
     for (std::size_t index = cursor.segment_index;
@@ -361,6 +368,13 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
       if (segment.type != PathSegmentType::kTranslation) {
         break;
       }
+      // Window averages can hide short yaw changes or cancel opposing rates.
+      // Also constrain the actual segment rate used by the control-law FF.
+      plan.yaw_speed_limit = std::min(
+        plan.yaw_speed_limit,
+        propagatedSpeed(
+          yawFeedforwardSpeed(segment.target_yaw_rate_per_meter), config_.a_ref_down,
+          std::max(0.0, segment.translation_s_begin - current_arc_length)));
       addCandidate(
         candidates, *path_, cursor.segment_index, rotation_index,
         current_arc_length, horizon_arc_length, segment.translation_s_begin,
@@ -387,8 +401,6 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
             horizon_arc_length)});
     }
 
-    const double omega_available =
-      config_.max_omega - config_.yaw_feedback_reserve;
     const double normal_acceleration = std::min(config_.max_ax, config_.max_ay);
     // Between event points each spatial rate is monotone. Applying the larger
     // endpoint magnitude from the earlier distance is conservative over the
@@ -467,7 +479,8 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     plan.reference_velocity_target, lower, upper);
   plan.reference_velocity = std::min(
     plan.reference_velocity,
-    std::min({external_speed_limit, plan.axis_speed_limit, config_.max_xy_speed}));
+    std::min({external_speed_limit, plan.axis_speed_limit, config_.max_xy_speed,
+      plan.yaw_ff_speed_limit}));
   previous_reference_velocity_ = plan.reference_velocity;
   return plan;
 }

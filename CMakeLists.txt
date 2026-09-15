@@ -79,6 +79,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   find_package(rcutils REQUIRED)
+  find_package(rcl REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
@@ -191,6 +192,7 @@ if(BUILD_TESTING)
     test/test_legacy_behavior.cpp
   )
   target_include_directories(test_legacy_behavior PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
@@ -207,10 +209,12 @@ if(BUILD_TESTING)
     test/test_path_and_control.cpp
   )
   target_include_directories(test_path_and_control PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   ament_target_dependencies(test_path_and_control
+    rcl
     geometry_msgs
     nav2_core
     nav2_costmap_2d
@@ -229,9 +233,12 @@ if(BUILD_TESTING)
     ENVIRONMENT "ROS_LOG_DIR=/tmp;ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST;ROS_DOMAIN_ID=231"
   )
   target_include_directories(test_lifecycle_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   ament_target_dependencies(test_lifecycle_smoke
+    rcl
     geometry_msgs
     nav2_costmap_2d
     nav_msgs

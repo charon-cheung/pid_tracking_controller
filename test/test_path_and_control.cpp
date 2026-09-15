@@ -9,6 +9,7 @@
 #include "controller_test_access.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "rclcpp/clock.hpp"
+#include "rcl/time.h"
 
 namespace pid_tracking_controller
 {
@@ -77,13 +78,52 @@ protected:
   void SetUp() override
   {
     PidTrackingControllerTestAccess::setCostmap(controller_, &costmap_);
-    PidTrackingControllerTestAccess::setClock(
-      controller_, std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME));
-    PidTrackingControllerTestAccess::setMaximumVelocityIncrements(
-      controller_, 0.1, 0.2);
-    controller_.setPlan(makeStraightPath({0.0, 0.3, 0.6}));
+    ASSERT_EQ(rcl_enable_ros_time_override(clock_->get_clock_handle()), RCL_RET_OK);
+    PidTrackingControllerTestAccess::setClock(controller_, clock_);
+    speed_.nominal_tracking_speed = 0.2;
+    speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.2;
+    speed_.max_omega = 0.3;
+    speed_.max_ax = speed_.max_ay = speed_.a_ref_up = speed_.a_ref_down = 0.2;
+    speed_.yaw_feedback_reserve = 0.05;
+    limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.2;
+    limits_.max_omega = 0.3;
+    limits_.max_ax = limits_.max_ay = 0.2;
+    limits_.max_alpha = 0.5;
+    initialize();
+    controller_.setPlan(makeStraightPath({0.0, 1.0, 3.0}));
   }
 
+  void initialize()
+  {
+    PidTrackingControllerTestAccess::initializeHolonomic(
+      controller_, speed_, limits_, {0.01, 0.01, 0.01, 0.3});
+  }
+
+  geometry_msgs::msg::TwistStamped step(
+    const geometry_msgs::msg::PoseStamped & pose = makeRobotPose(),
+    const geometry_msgs::msg::Twist & measured = geometry_msgs::msg::Twist(), double dt = 0.1)
+  {
+    now_ns_ += static_cast<int64_t>(std::llround(dt * 1e9));
+    EXPECT_EQ(rcl_set_ros_time_override(clock_->get_clock_handle(), now_ns_), RCL_RET_OK);
+    return controller_.computeVelocityCommands(pose, measured, nullptr);
+  }
+
+  void setRotationPath(bool append_translation)
+  {
+    auto path = makeStraightPath({0.0});
+    path.poses.push_back(makeRobotPose(0.4));
+    path.poses.push_back(makeRobotPose(0.2));
+    if (append_translation) {
+      path.poses.push_back(makeRobotPoseAt(1.0, 0.0, 0.2));
+      path.poses.push_back(makeRobotPoseAt(2.0, 0.0, 0.2));
+    }
+    controller_.setPlan(path);
+  }
+
+  rclcpp::Clock::SharedPtr clock_{std::make_shared<rclcpp::Clock>(RCL_ROS_TIME)};
+  int64_t now_ns_{1000000000LL};
+  HolonomicSpeedPlannerConfig speed_;
+  HolonomicCommandLimiterConfig limits_;
   nav2_costmap_2d::Costmap2D costmap_{100, 100, 0.05, -2.5, -2.5};
   PidTrackingController controller_;
 };
@@ -126,165 +166,310 @@ TEST(PathValidation, zeroNormQuaternionClearsOldPlanAndThrowsInvalidPath)
   EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
 }
 
-TEST_F(CommandContractTest, commandUsesMeasuredVelocityAndKeepsLateralVelocityZero)
+TEST_F(CommandContractTest, lateralOffsetCommandsTranslationWithoutYawCorrection)
 {
-  geometry_msgs::msg::Twist measured;
-  measured.linear.x = 0.4;
-
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(), measured, nullptr);
-
-  EXPECT_NEAR(command.twist.linear.x, 0.5, 1e-12);
-  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+  const auto pose = makeRobotPoseAt(0.0, 0.1);
+  step(pose);
+  const auto command = step(pose);
+  EXPECT_GT(command.twist.linear.x, 0.0);
+  EXPECT_LT(command.twist.linear.y, 0.0);
   EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
   EXPECT_EQ(command.header.frame_id, "base_link");
-  EXPECT_TRUE(std::isfinite(command.twist.linear.x));
-  EXPECT_TRUE(std::isfinite(command.twist.angular.z));
 }
 
-TEST_F(CommandContractTest, largeInitialHeadingErrorRotatesBeforeTranslating)
+TEST_F(CommandContractTest, bodyDirectionIsIndependentOfTargetHeading)
 {
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
-  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
-  EXPECT_LT(command.twist.angular.z, 0.0);
+  for (const double yaw : {M_PI_2, M_PI}) {
+    auto path = makeStraightPath({0.0, 1.0, 2.0});
+    for (auto & pose : path.poses) {
+      pose.pose.orientation = makeRobotPose(yaw).pose.orientation;
+    }
+    initialize();
+    controller_.setPlan(path);
+    step(makeRobotPose(yaw));
+    const auto command = step(makeRobotPose(yaw));
+    EXPECT_NEAR(command.twist.linear.x, 0.02 * std::cos(yaw), 1e-12);
+    EXPECT_NEAR(command.twist.linear.y, -0.02 * std::sin(yaw), 1e-12);
+    EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
+  }
 }
 
-TEST_F(CommandContractTest, diagnosticsSeparateAlignmentFromTrackingSamples)
+TEST_F(CommandContractTest, realDtAndCommandHistoryDriveSlew)
 {
-  controller_.computeVelocityCommands(
-    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_EQ(PidTrackingControllerTestAccess::alignmentSampleCount(controller_), 1u);
-  EXPECT_EQ(PidTrackingControllerTestAccess::trackingSampleCount(controller_), 0u);
-
-  controller_.computeVelocityCommands(
-    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_EQ(PidTrackingControllerTestAccess::alignmentSampleCount(controller_), 1u);
-  EXPECT_EQ(PidTrackingControllerTestAccess::trackingSampleCount(controller_), 1u);
+  step();
+  const auto first = step();
+  EXPECT_NEAR(first.twist.linear.x, 0.02, 1e-12);
+  const auto second = step(makeRobotPose(), geometry_msgs::msg::Twist(), 0.2);
+  EXPECT_NEAR(second.twist.linear.x, 0.06, 1e-12);
+  // Measured velocity is still zero: a normal cycle must not reseed from it.
+  EXPECT_GT(second.twist.linear.x, first.twist.linear.x);
 }
 
-TEST_F(CommandContractTest, trackingLateralDiagnosticsExcludeAlignmentSamples)
+TEST_F(CommandContractTest, firstAndDiscontinuousCyclesProjectMeasuredVelocity)
 {
-  auto alignment_pose = makeRobotPose(M_PI_2);
-  alignment_pose.pose.position.y = 0.1;
-  controller_.computeVelocityCommands(
-    alignment_pose, geometry_msgs::msg::Twist(), nullptr);
-
-  const double alignment_target_yaw = std::atan2(-0.1, std::sqrt(0.08));
-  auto tracking_pose = makeRobotPose(alignment_target_yaw);
-  tracking_pose.pose.position.y = 0.02;
-  controller_.computeVelocityCommands(
-    tracking_pose, geometry_msgs::msg::Twist(), nullptr);
-
-  const auto & tracking_samples =
-    PidTrackingControllerTestAccess::trackingAbsoluteLateralErrorSamples(controller_);
-  ASSERT_EQ(tracking_samples.size(), 1u);
-  EXPECT_NEAR(tracking_samples.front(), 0.02, 1e-12);
-  EXPECT_NEAR(
-    PidTrackingControllerTestAccess::trackingSumSquaredLateralError(controller_),
-    0.0004, 1e-12);
-  EXPECT_NEAR(
-    PidTrackingControllerTestAccess::trackingMaximumAbsoluteLateralError(controller_),
-    0.02, 1e-12);
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.3;
+  measured.linear.y = -0.4;
+  measured.angular.z = 0.9;
+  const auto initial = step(makeRobotPose(), measured);
+  EXPECT_LE(std::hypot(initial.twist.linear.x, initial.twist.linear.y), 0.2 + 1e-12);
+  EXPECT_NEAR(initial.twist.angular.z, 0.3, 1e-12);
+  for (const double dt : {0.0, -0.1, 1.0}) {
+    measured.linear.x = 0.04;
+    measured.linear.y = 0.03;
+    measured.angular.z = 0.02;
+    const auto seed = step(makeRobotPose(), measured, dt);
+    EXPECT_EQ(seed.twist, measured);
+  }
 }
 
-TEST_F(CommandContractTest, headingAlignmentDoesNotReenterDuringSameGoal)
+TEST_F(CommandContractTest, lateralMeasuredSpeedSeedsPathReference)
 {
-  const auto aligning = controller_.computeVelocityCommands(
-    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
-  EXPECT_DOUBLE_EQ(aligning.twist.linear.x, 0.0);
-
-  const auto tracking = controller_.computeVelocityCommands(
-    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
-  EXPECT_GT(tracking.twist.linear.x, 0.0);
-
-  controller_.setPlan(makeStraightPath({0.0, 0.2, 0.6}));
-
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(1.0), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_GT(command.twist.linear.x, 0.0);
+  auto path = makeStraightPath({0.0, 1.0, 2.0});
+  for (auto & pose : path.poses) {
+    pose.pose.orientation = makeRobotPose(M_PI_2).pose.orientation;
+  }
+  controller_.setPlan(path);
+  geometry_msgs::msg::Twist measured;
+  measured.linear.y = -0.08;
+  step(makeRobotPose(M_PI_2), measured);
+  const auto command = step(makeRobotPose(M_PI_2), measured);
+  EXPECT_NEAR(command.twist.linear.y, -0.1, 1e-12);
+  EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
 }
 
-TEST_F(CommandContractTest, zeroCarrotCommandRemainsStoppedThroughRegularization)
+TEST_F(CommandContractTest, speedLimitIsImmediateAndInvalidUpdatesPreserveLastLimit)
+{
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.2;
+  step(makeRobotPose(), measured);
+  controller_.setSpeedLimit(0.03, false);
+  EXPECT_NEAR(step().twist.linear.x, 0.03, 1e-12);
+  for (const double invalid : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+    std::numeric_limits<double>::infinity()})
+  {
+    controller_.setSpeedLimit(invalid, false);
+    EXPECT_LE(step().twist.linear.x, 0.03 + 1e-12);
+  }
+  controller_.setSpeedLimit(101.0, true);
+  EXPECT_LE(step().twist.linear.x, 0.03 + 1e-12);
+  controller_.setSpeedLimit(0.0, true);  // Nav2 zero sentinel releases, it is not stop.
+  const auto released = step();
+  EXPECT_GT(released.twist.linear.x, 0.03);
+  EXPECT_LE(released.twist.linear.x, 0.05 + 1e-12);
+}
+
+TEST_F(CommandContractTest, percentageUsesMaximumXyInsteadOfNominalReference)
+{
+  speed_.nominal_tracking_speed = 0.2;
+  speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
+  limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
+  initialize();
+  controller_.setPlan(makeStraightPath({0.0, 1.0, 2.0}));
+  controller_.setSpeedLimit(25.0, true);
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.5;
+  EXPECT_NEAR(step(makeRobotPose(), measured).twist.linear.x, 0.2, 1e-12);
+  EXPECT_NEAR(step(makeRobotPose(), measured).twist.linear.x, 0.2, 1e-12);
+}
+
+TEST_F(CommandContractTest, externalCapAlsoScalesTheSameYawFeedforward)
+{
+  auto path = makeStraightPath({0.0, 1.0, 2.0});
+  path.poses[1].pose.orientation = makeRobotPose(0.5).pose.orientation;
+  path.poses[2].pose.orientation = makeRobotPose(1.0).pose.orientation;
+  controller_.setPlan(path);
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.2;
+  step(makeRobotPose(), measured);
+  controller_.setSpeedLimit(0.04, false);
+  const auto command = step();
+  EXPECT_NEAR(command.twist.linear.x, 0.04, 1e-12);
+  EXPECT_NEAR(command.twist.angular.z, 0.5 * command.twist.linear.x, 1e-12);
+}
+
+TEST_F(CommandContractTest, sameGoalReplanChangesGeometryWithoutResettingSlew)
+{
+  step();
+  step();
+  EXPECT_NEAR(step().twist.linear.x, 0.04, 1e-12);
+  auto replanned = makeStraightPath({0.0, 1.0, 3.0});
+  replanned.poses[1].pose.orientation = makeRobotPose(0.1).pose.orientation;
+  controller_.setPlan(replanned);
+  const auto command = step();
+  EXPECT_NEAR(command.twist.linear.x, 0.06, 1e-12);
+  EXPECT_NEAR(command.twist.angular.z, 0.1 * command.twist.linear.x, 1e-12);
+}
+
+TEST_F(CommandContractTest, zeroReferenceDoesNotUsePreviewAsPositionFeedback)
+{
+  speed_.nominal_tracking_speed = 0.0;
+  initialize();
+  controller_.setPlan(makeStraightPath({0.0, 1.0, 2.0}));
+  for (int index = 0; index < 10; ++index) {
+    const auto command = step();
+    EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+    EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+  }
+}
+
+TEST_F(CommandContractTest, rotationRunAcknowledgesFinalYawAndResumesTranslation)
+{
+  setRotationPath(true);
+  const auto aligned = makeRobotPose(0.2);
+  for (int index = 0; index < 4; ++index) {
+    const auto command = step(aligned);
+    EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+    EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
+  }
+  EXPECT_GT(step(aligned).twist.linear.x, 0.0);
+}
+
+TEST_F(CommandContractTest, finalRotationRunTransitionsToTerminalPositionFeedback)
+{
+  setRotationPath(false);
+  const auto aligned = makeRobotPoseAt(0.0, 0.1, 0.2);
+  for (int index = 0; index < 4; ++index) {
+    EXPECT_DOUBLE_EQ(step(aligned).twist.linear.y, 0.0);
+  }
+  const auto terminal = step(aligned);
+  EXPECT_LT(terminal.twist.linear.y, 0.0);
+  EXPECT_NEAR(terminal.twist.angular.z, 0.0, 1e-12);
+}
+
+TEST_F(CommandContractTest, rotationRequiresAllMeasuredConditionsAndContinuousSettle)
+{
+  setRotationPath(true);
+  const auto aligned = makeRobotPose(0.2);
+  step(aligned);
+  step(aligned);
+  geometry_msgs::msg::Twist drifting;
+  drifting.linear.y = 0.02;
+  step(aligned, drifting);  // Break XY condition.
+  step(aligned);
+  step(aligned);
+  drifting.linear.y = 0.0;
+  drifting.angular.z = 0.02;
+  step(aligned, drifting);  // Break omega condition.
+  step(aligned);
+  step(makeRobotPose(0.0));  // Break yaw condition.
+  for (int index = 0; index < 4; ++index) {
+    EXPECT_DOUBLE_EQ(step(aligned).twist.linear.x, 0.0);
+  }
+  EXPECT_GT(step(aligned).twist.linear.x, 0.0);
+}
+
+TEST_F(CommandContractTest, gapAndSamePlanResetRotationSettle)
+{
+  for (const bool replan : {false, true}) {
+    initialize();
+    setRotationPath(true);
+    const auto aligned = makeRobotPose(0.2);
+    step(aligned);
+    step(aligned);
+    step(aligned);
+    if (replan) {
+      setRotationPath(true);
+      step(aligned);  // The first observation in a new plan counts zero.
+    } else {
+      step(aligned, geometry_msgs::msg::Twist(), 2.0);  // Do not count a gap as settled time.
+    }
+    for (int index = 0; index < 3; ++index) {
+      EXPECT_DOUBLE_EQ(step(aligned).twist.linear.x, 0.0);
+    }
+    EXPECT_GT(step(aligned).twist.linear.x, 0.0);
+  }
+}
+
+TEST_F(CommandContractTest, singlePoseTerminalKeepsPositionAndYawFeedback)
 {
   controller_.setPlan(makeStraightPath({0.0}));
-
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
-  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
-  EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.0);
-}
-
-TEST_F(CommandContractTest, newGoalCanStartHeadingAlignmentAgain)
-{
-  controller_.computeVelocityCommands(
-    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
-  controller_.setPlan(makeStraightPath({0.0, 0.3, 0.9}));
-
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(M_PI_2), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+  const auto pose = makeRobotPoseAt(-0.1, 0.1, 0.1);
+  step(pose);
+  const auto command = step(pose);
+  EXPECT_GT(command.twist.linear.x, 0.0);
+  EXPECT_LT(command.twist.linear.y, 0.0);
   EXPECT_LT(command.twist.angular.z, 0.0);
-}
-
-TEST_F(CommandContractTest, normalTrackingNeverCommandsReverseMotion)
-{
-  controller_.computeVelocityCommands(
-    makeRobotPose(), geometry_msgs::msg::Twist(), nullptr);
-
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPose(M_PI), geometry_msgs::msg::Twist(), nullptr);
-
-  EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
 }
 
 TEST_F(CommandContractTest, nearbyFutureBranchDoesNotTakeOverTracking)
 {
   controller_.setPlan(makeDenseHairpinPath());
-  geometry_msgs::msg::Twist measured;
-  measured.linear.x = 0.30;
   for (int index = 0; index <= 8; ++index) {
-    controller_.computeVelocityCommands(
-      makeRobotPoseAt(0.05 * static_cast<double>(index), 0.0), measured, nullptr);
+    step(makeRobotPoseAt(0.05 * static_cast<double>(index), 0.0));
   }
-
-  const auto command = controller_.computeVelocityCommands(
-    makeRobotPoseAt(0.40, 0.08), measured, nullptr);
-
+  const auto command = step(makeRobotPoseAt(0.40, 0.08));
   EXPECT_GT(command.twist.linear.x, 0.0);
-  EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
-  const auto & lateral_errors =
-    PidTrackingControllerTestAccess::trackingAbsoluteLateralErrorSamples(controller_);
-  ASSERT_FALSE(lateral_errors.empty());
-  EXPECT_NEAR(lateral_errors.back(), 0.08, 1e-12);
+  EXPECT_LT(command.twist.linear.y, 0.0);  // Correct toward current y=0, not future y=0.1.
+  EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
 }
 
-TEST_F(CommandContractTest, nonFinitePoseThrowsNoValidControl)
+TEST_F(CommandContractTest, invalidInputRejectsInsteadOfFallingBackAndRecoveryReseeds)
 {
+  step();
+  step();
   auto pose = makeRobotPose();
   pose.pose.position.x = std::numeric_limits<double>::quiet_NaN();
-
-  EXPECT_THROW(
-    controller_.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr),
-    nav2_core::NoValidControl);
-}
-
-TEST_F(CommandContractTest, nonFiniteVelocityThrowsNoValidControl)
-{
+  EXPECT_THROW(step(pose), nav2_core::NoValidControl);
+  EXPECT_DOUBLE_EQ(step().twist.linear.x, 0.0);
+  pose = makeRobotPose();
+  pose.pose.orientation.w = 0.0;
+  EXPECT_THROW(step(pose), nav2_core::NoValidControl);
   geometry_msgs::msg::Twist measured;
   measured.linear.y = std::numeric_limits<double>::infinity();
+  EXPECT_THROW(step(makeRobotPose(), measured), nav2_core::NoValidControl);
+  EXPECT_THROW(controller_.setPlan(nav_msgs::msg::Path()), nav2_core::InvalidPath);
+  EXPECT_THROW(step(), nav2_core::InvalidPath);
+  controller_.setPlan(makeStraightPath({0.0, 1.0, 2.0}));
+  EXPECT_DOUBLE_EQ(step().twist.linear.x, 0.0);
+}
 
-  EXPECT_THROW(
-    controller_.computeVelocityCommands(makeRobotPose(), measured, nullptr),
-    nav2_core::NoValidControl);
+TEST_F(CommandContractTest, failedActiveCalculationCannotAcknowledgeRotation)
+{
+  setRotationPath(true);
+  const auto aligned = makeRobotPose(0.2);
+  step(aligned);
+  step(aligned);
+  step(aligned);
+  auto invalid = aligned;
+  invalid.pose.position.x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_THROW(step(invalid), nav2_core::NoValidControl);
+  for (int index = 0; index < 4; ++index) {
+    EXPECT_DOUBLE_EQ(step(aligned).twist.linear.x, 0.0);
+  }
+  EXPECT_GT(step(aligned).twist.linear.x, 0.0);
+}
+
+TEST_F(CommandContractTest, closedLoopTranslationAndFinalRotationConvergeWithinEnvelope)
+{
+  auto path = makeStraightPath({0.0, 1.0, 2.0});
+  for (auto & point : path.poses) {
+    point.pose.orientation = makeRobotPose(M_PI_2).pose.orientation;
+  }
+  path.poses.push_back(makeRobotPoseAt(2.0, 0.0, 0.0));
+  controller_.setPlan(path);
+  double x = -0.1;
+  double y = 0.2;
+  double yaw = M_PI_2;
+  geometry_msgs::msg::Twist measured;
+  // Ideal body-velocity plant: protects controller composition, not real robot dynamics.
+  for (int index = 0; index < 600; ++index) {
+    const auto command = step(makeRobotPoseAt(x, y, yaw), measured).twist;
+    EXPECT_LE(std::hypot(command.linear.x, command.linear.y), 0.2 + 1e-12);
+    EXPECT_LE(std::abs(command.angular.z), 0.3 + 1e-12);
+    EXPECT_LE(std::abs(command.linear.x - measured.linear.x), 0.02 + 1e-12);
+    EXPECT_LE(std::abs(command.linear.y - measured.linear.y), 0.02 + 1e-12);
+    EXPECT_LE(std::abs(command.angular.z - measured.angular.z), 0.05 + 1e-12);
+    x += 0.1 * (std::cos(yaw) * command.linear.x - std::sin(yaw) * command.linear.y);
+    y += 0.1 * (std::sin(yaw) * command.linear.x + std::cos(yaw) * command.linear.y);
+    yaw += 0.1 * command.angular.z;
+    measured = command;
+  }
+  EXPECT_NEAR(x, 2.0, 0.01);
+  EXPECT_NEAR(y, 0.0, 0.01);
+  EXPECT_NEAR(yaw, 0.0, 0.01);
+  EXPECT_LT(std::hypot(measured.linear.x, measured.linear.y), 0.01);
+  EXPECT_LT(std::abs(measured.angular.z), 0.01);
 }
 
 }  // namespace

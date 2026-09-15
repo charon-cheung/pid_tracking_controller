@@ -36,6 +36,21 @@ controller_server:
       start_heading_exit_tolerance: 0.15
       start_heading_kp: 1.0
       kp_yaw: 1.0
+      kp_x: 1.0
+      kp_y: 1.0
+      nominal_tracking_speed: 0.80
+      max_vx: 0.80
+      max_vy: 0.40
+      max_xy_speed: 0.80
+      max_omega: 0.60
+      max_ax: 0.20
+      max_ay: 0.20
+      max_alpha: 0.50
+      a_ref_up: 0.20
+      a_ref_down: 0.20
+      yaw_feedback_reserve: 0.05
+      configured_min_rate_window: 0.30
+      control_gap_threshold: 0.50
       rotation_yaw_tolerance: 0.05
       rotation_omega_tolerance: 0.05
       rotation_xy_speed_tolerance: 0.05
