@@ -8,6 +8,7 @@
 #include "holonomic_command_limiter.hpp"
 #include "holonomic_speed_planner.hpp"
 #include "rotation_completion_tracker.hpp"
+#include "rotation_entry_gate.hpp"
 
 namespace pid_tracking_controller
 {
@@ -23,6 +24,8 @@ public:
     controller.holonomic_speed_planner_ = std::make_unique<HolonomicSpeedPlanner>(speed);
     controller.holonomic_command_limiter_ = std::make_unique<HolonomicCommandLimiter>(limits);
     controller.rotation_completion_tracker_ = std::make_unique<RotationCompletionTracker>(rotation);
+    controller.rotation_entry_gate_ = std::make_unique<RotationEntryGate>(RotationEntryGateConfig{
+      rotation.rotation_xy_speed_tolerance, rotation.rotation_omega_tolerance, 0.2, 8.0});
     controller.max_xy_speed_ = speed.max_xy_speed;
     controller.control_gap_threshold_ = limits.control_gap_threshold;
     controller.control_time_valid_ = false;

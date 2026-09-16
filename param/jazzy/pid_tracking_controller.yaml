@@ -55,5 +55,7 @@ controller_server:
       rotation_omega_tolerance: 0.05
       rotation_xy_speed_tolerance: 0.05
       rotation_settle_time: 0.30
+      rotation_stop_confirm_time: 0.20  # Measured and commanded speed must stay near zero.
+      rotation_braking_timeout: 8.0   # Failure to stop raises NoValidControl, never forces a turn.
       pid_frequency: 15.0
       use_model: true

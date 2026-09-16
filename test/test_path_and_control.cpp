@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <initializer_list>
 #include <limits>
@@ -313,11 +314,83 @@ TEST_F(CommandContractTest, zeroReferenceDoesNotUsePreviewAsPositionFeedback)
   }
 }
 
+TEST_F(CommandContractTest, rotationBrakesBeforeTurningAndWaitsForMeasuredStop)
+{
+  geometry_msgs::msg::Twist moving;
+  moving.linear.x = 0.2;
+  step(makeRobotPose(), moving);
+  setRotationPath(true);
+  // Even after the command reaches zero, moving odometry must prevent rotation.
+  for (int index = 0; index < 15; ++index) {
+    const auto command = step(makeRobotPose(), moving);
+    EXPECT_NEAR(command.twist.linear.x, std::max(0.0, 0.18 - 0.02 * index), 1e-12);
+    EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.0);
+  }
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  for (int index = 0; index < 4; ++index) {
+    step();
+  }
+  EXPECT_GT(step().twist.angular.z, 0.0);
+}
+
+TEST_F(CommandContractTest, entryBrakesExistingAngularMotionWithoutHardStopping)
+{
+  geometry_msgs::msg::Twist moving;
+  moving.angular.z = 0.3;
+  step(makeRobotPose(), moving);
+  setRotationPath(true);
+  for (int index = 0; index < 8; ++index) {
+    const auto command = step(makeRobotPose(), moving);
+    EXPECT_NEAR(command.twist.angular.z, std::max(0.0, 0.25 - 0.05 * index), 1e-12);
+  }
+}
+
+TEST_F(CommandContractTest, brakingConfirmationSurvivesReplansButNotControlGaps)
+{
+  setRotationPath(true);
+  step();
+  step();
+  setRotationPath(true);
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  EXPECT_GT(step().twist.angular.z, 0.0);
+  // Stationary samples after gaps or nonpositive dt cannot reuse the old admission.
+  for (const double dt : {2.0, 0.0, -0.1}) {
+    EXPECT_DOUBLE_EQ(
+      step(makeRobotPose(), geometry_msgs::msg::Twist(), dt).twist.angular.z, 0.0);
+    EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+    EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+    EXPECT_GT(step().twist.angular.z, 0.0);
+  }
+}
+
+TEST_F(CommandContractTest, continuousReplansCannotHideBrakingTimeout)
+{
+  geometry_msgs::msg::Twist moving;
+  moving.linear.y = 0.1;
+  setRotationPath(true);
+  step(makeRobotPose(), moving);
+  bool timed_out = false;
+  for (int index = 0; index < 85 && !timed_out; ++index) {
+    setRotationPath(true);
+    try {
+      EXPECT_DOUBLE_EQ(step(makeRobotPose(), moving).twist.angular.z, 0.0);
+    } catch (const nav2_core::NoValidControl &) {
+      timed_out = true;
+    }
+  }
+  EXPECT_TRUE(timed_out);
+  // Error recovery seeds from measured velocity and cannot reuse stop evidence.
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+}
+
 TEST_F(CommandContractTest, rotationRunAcknowledgesFinalYawAndResumesTranslation)
 {
   setRotationPath(true);
   const auto aligned = makeRobotPose(0.2);
-  for (int index = 0; index < 4; ++index) {
+  // 0.2 s stop admission, then independent 0.3 s rotation completion.
+  for (int index = 0; index < 7; ++index) {
     const auto command = step(aligned);
     EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
     EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
@@ -329,7 +402,7 @@ TEST_F(CommandContractTest, finalRotationRunTransitionsToTerminalPositionFeedbac
 {
   setRotationPath(false);
   const auto aligned = makeRobotPoseAt(0.0, 0.1, 0.2);
-  for (int index = 0; index < 4; ++index) {
+  for (int index = 0; index < 7; ++index) {
     EXPECT_DOUBLE_EQ(step(aligned).twist.linear.y, 0.0);
   }
   const auto terminal = step(aligned);
@@ -341,6 +414,9 @@ TEST_F(CommandContractTest, rotationRequiresAllMeasuredConditionsAndContinuousSe
 {
   setRotationPath(true);
   const auto aligned = makeRobotPose(0.2);
+  for (int index = 0; index < 3; ++index) {
+    step(aligned);  // Complete stop admission before exercising yaw completion.
+  }
   step(aligned);
   step(aligned);
   geometry_msgs::msg::Twist drifting;
@@ -365,6 +441,9 @@ TEST_F(CommandContractTest, gapAndSamePlanResetRotationSettle)
     initialize();
     setRotationPath(true);
     const auto aligned = makeRobotPose(0.2);
+    for (int index = 0; index < 3; ++index) {
+      step(aligned);
+    }
     step(aligned);
     step(aligned);
     step(aligned);
@@ -374,7 +453,7 @@ TEST_F(CommandContractTest, gapAndSamePlanResetRotationSettle)
     } else {
       step(aligned, geometry_msgs::msg::Twist(), 2.0);  // Do not count a gap as settled time.
     }
-    for (int index = 0; index < 3; ++index) {
+    for (int index = 0; index < 6; ++index) {
       EXPECT_DOUBLE_EQ(step(aligned).twist.linear.x, 0.0);
     }
     EXPECT_GT(step(aligned).twist.linear.x, 0.0);
@@ -428,13 +507,16 @@ TEST_F(CommandContractTest, failedActiveCalculationCannotAcknowledgeRotation)
 {
   setRotationPath(true);
   const auto aligned = makeRobotPose(0.2);
+  for (int index = 0; index < 3; ++index) {
+    step(aligned);
+  }
   step(aligned);
   step(aligned);
   step(aligned);
   auto invalid = aligned;
   invalid.pose.position.x = std::numeric_limits<double>::quiet_NaN();
   EXPECT_THROW(step(invalid), nav2_core::NoValidControl);
-  for (int index = 0; index < 4; ++index) {
+  for (int index = 0; index < 7; ++index) {
     EXPECT_DOUBLE_EQ(step(aligned).twist.linear.x, 0.0);
   }
   EXPECT_GT(step(aligned).twist.linear.x, 0.0);

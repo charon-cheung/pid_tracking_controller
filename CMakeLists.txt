@@ -49,6 +49,7 @@ add_library(${PROJECT_NAME} SHARED
   src/path_progress_tracker.cpp
   src/prepared_path.cpp
   src/rotation_completion_tracker.cpp
+  src/rotation_entry_gate.cpp
 )
 target_include_directories(${PROJECT_NAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -187,6 +188,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_rotation_completion_tracker
     ${PROJECT_NAME}
   )
+
+  ament_add_gtest(test_rotation_entry_gate test/test_rotation_entry_gate.cpp)
+  target_include_directories(test_rotation_entry_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_rotation_entry_gate ${PROJECT_NAME})
 
   ament_add_gtest(test_legacy_behavior
     test/test_legacy_behavior.cpp

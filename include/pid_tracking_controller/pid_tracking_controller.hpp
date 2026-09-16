@@ -31,6 +31,7 @@ namespace pid_tracking_controller
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
 class RotationCompletionTracker;
+class RotationEntryGate;
 class HolonomicSpeedPlanner;
 class HolonomicCommandLimiter;
 struct PreparedPath;
@@ -130,7 +131,7 @@ private:
     const HolonomicTrackingReference * holonomic_reference,
     const HolonomicRawCommand * shadow_rotation_command,
     const RotationCompletionStatus * shadow_rotation_status);
-  void resetRotationState();
+  void resetRotationState(bool preserve_braking = false);
   geometry_msgs::msg::TwistStamped computeHolonomicCommand(
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity,
@@ -196,7 +197,9 @@ private:
   double rotation_xy_speed_tolerance_{0.05};
   double rotation_settle_time_{0.30};
   std::unique_ptr<RotationCompletionTracker> rotation_completion_tracker_;
+  std::unique_ptr<RotationEntryGate> rotation_entry_gate_;
   bool rotation_pending_{false};
+  bool last_rotation_braking_{false};
   std::size_t pending_rotation_segment_index_{0};
   bool rotation_ack_candidate_{false};
 

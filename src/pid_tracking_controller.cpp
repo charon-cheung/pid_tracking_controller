@@ -27,6 +27,7 @@
 #include "path_progress_tracker.hpp"
 #include "prepared_path.hpp"
 #include "rotation_completion_tracker.hpp"
+#include "rotation_entry_gate.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/utils.h"
@@ -159,8 +160,11 @@ PidTrackingController::PidTrackingController()
 
 PidTrackingController::~PidTrackingController() = default;
 
-void PidTrackingController::resetRotationState()
+void PidTrackingController::resetRotationState(bool preserve_braking)
 {
+    if (rotation_entry_gate_) {
+        rotation_entry_gate_->reset(preserve_braking);
+    }
     if (rotation_completion_tracker_) {
         rotation_completion_tracker_->reset();
     }
@@ -342,6 +346,12 @@ void PidTrackingController::configure(
         declare_parameter_if_not_declared(node, key, rclcpp::ParameterValue(initial));
         return node->get_parameter(key).as_double();
     };
+    RotationEntryGateConfig entry_config;
+    entry_config.xy_speed_tolerance = rotation_xy_speed_tolerance_;
+    entry_config.omega_tolerance = rotation_omega_tolerance_;
+    entry_config.stop_confirm_time = parameter("rotation_stop_confirm_time", 0.20);
+    entry_config.braking_timeout = parameter("rotation_braking_timeout", 8.0);
+    rotation_entry_gate_ = std::make_unique<RotationEntryGate>(entry_config);
     HolonomicSpeedPlannerConfig speed_config;
     speed_config.nominal_tracking_speed = parameter("nominal_tracking_speed", 0.20);
     speed_config.max_vx = parameter("max_vx", 0.20);
@@ -381,11 +391,12 @@ void PidTrackingController::configure(
     last_holonomic_mode_ = -1;
     RCLCPP_INFO(logger_, "PID_LOG holonomic_parameters nominal=%.3f max_xy_speed=%.3f "
             "max_vx=%.3f max_vy=%.3f max_omega=%.3f max_ax=%.3f max_ay=%.3f "
-            "max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f",
+            "max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f "
+            "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
             speed_config.max_vy, speed_config.max_omega, speed_config.max_ax,
             speed_config.max_ay, limiter_config.max_alpha, kp_x_, kp_y_, kp_yaw_,
-            control_gap_threshold_);
+            control_gap_threshold_, entry_config.stop_confirm_time, entry_config.braking_timeout);
     
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
@@ -472,7 +483,7 @@ void PidTrackingController::cleanup()
 void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
     RCLCPP_INFO(logger_, "PidTrackingController received a path");
-    resetRotationState();
+    resetRotationState(true);
     force_diagnostics_log_ = true;
     global_plan_.clear();
     prepared_path_.reset();
@@ -908,7 +919,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
   const rclcpp::Time & now)
 {
     if (!prepared_path_ || !holonomic_speed_planner_ ||
-        !holonomic_command_limiter_ || !rotation_completion_tracker_) {
+        !holonomic_command_limiter_ || !rotation_completion_tracker_ || !rotation_entry_gate_) {
         throw std::logic_error("holonomic components are unavailable");
     }
     const auto reference = buildHolonomicTrackingReference(
@@ -923,7 +934,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     const bool rotating = reference.mode == HolonomicReferenceMode::kRotationPending;
     if (reseed || !rotating || !rotation_pending_ ||
         reference.pending_rotation_segment_index != pending_rotation_segment_index_) {
-        resetRotationState();
+        resetRotationState(!reseed && rotating);
     }
     if (rotating) {
         if (!reference.pending_rotation_segment_index) {
@@ -932,6 +943,12 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         rotation_pending_ = true;
         pending_rotation_segment_index_ = *reference.pending_rotation_segment_index;
     }
+    const HolonomicBodyCommand measured{velocity.linear.x, velocity.linear.y, velocity.angular.z};
+    const bool braking = rotating && !rotation_entry_gate_->beginCycle(measured);
+    if (braking != last_rotation_braking_) {
+        force_diagnostics_log_ = true;
+    }
+    last_rotation_braking_ = braking;
 
     HolonomicSpeedPlan speed_plan;
     if (reseed) {
@@ -955,10 +972,13 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     input.target_yaw_rate_per_meter =
             reference.mode == HolonomicReferenceMode::kTranslation ?
             reference.current.target_yaw_rate_per_meter : 0.0;
-    const auto raw = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
+    auto raw = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
+    if (braking) {
+        raw.vx = raw.vy = raw.omega = 0.0;
+    }
     const auto limited = holonomic_command_limiter_->limit(
             {raw.vx, raw.vy, raw.omega},
-            {velocity.linear.x, velocity.linear.y, velocity.angular.z},
+            measured,
             reseed ? 0.0 : dt, cap);
     geometry_msgs::msg::TwistStamped command;
     command.header.frame_id = base_frame_;
@@ -972,7 +992,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
 
     RotationCompletionStatus completion;
     const bool previous_candidate = rotation_ack_candidate_;
-    if (rotating) {
+    if (braking) {
+        rotation_entry_gate_->observeBraking(measured, limited.command, reseed ? 0.0 : dt);
+    } else if (rotating) {
         // Only intervals bounded by two qualifying measurements count as settled.
         completion = rotation_completion_tracker_->update(
                 raw.yaw_error, velocity.linear.x, velocity.linear.y, velocity.angular.z,
@@ -992,7 +1014,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "reference_target=%.6f reference_effective=%.6f limit_reason=%s external_limit=%.6f "
                 "raw_vx=%.6f raw_vy=%.6f raw_omega=%.6f limited_vx=%.6f limited_vy=%.6f "
                 "limited_omega=%.6f translation_lambda=%.6f reseed=%s control_gap=%s "
-                "rotation_index=%s rotation_settled=%.6f ack_candidate=%s",
+                "rotation_index=%s rotation_phase=%s stop_confirmed=%.6f "
+                "rotation_settled=%.6f ack_candidate=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), reseed ? "false" : "true",
                 reseed ? std::numeric_limits<double>::quiet_NaN() : speed_plan.reference_velocity_target,
                 speed_plan.reference_velocity,
@@ -1000,6 +1023,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 raw.vx, raw.vy, raw.omega, limited.command.vx, limited.command.vy, limited.command.omega,
                 limited.translation_lambda, reseed_reason, gap ? "true" : "false",
                 rotating ? std::to_string(pending_rotation_segment_index_).c_str() : "none",
+                rotating ? (braking ? "braking" : "rotating") : "none",
+                rotation_entry_gate_->stoppedDuration(),
                 completion.settled_duration, rotation_ack_candidate_ ? "true" : "false");
         last_diagnostics_log_time_seconds_ = now_seconds;
         force_diagnostics_log_ = false;
