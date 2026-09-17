@@ -1052,6 +1052,15 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             throw std::logic_error("controller is not configured for control");
         }
         const auto now = clock_->now();
+        // Temporary TRA-3 observation probe: remove after validating live pose stamps.
+        RCLCPP_INFO(logger_,
+                "PID_LOG pose_observation plan_revision=%zu control_now=%.9f "
+                "pose_stamp_sec=%d pose_stamp_nanosec=%u frame=%s "
+                "x=%.9f y=%.9f yaw=%.9f vx=%.6f vy=%.6f omega=%.6f",
+                plan_revision_, now.seconds(), pose.header.stamp.sec,
+                pose.header.stamp.nanosec, pose.header.frame_id.c_str(),
+                pose.pose.position.x, pose.pose.position.y, tf2::getYaw(pose.pose.orientation),
+                velocity.linear.x, velocity.linear.y, velocity.angular.z);
         const double lookahead = getLookAheadDistance(
                 std::hypot(velocity.linear.x, velocity.linear.y));
         const auto progress = path_progress_tracker_->update(pose.pose.position, lookahead);

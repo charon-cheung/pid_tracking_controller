@@ -106,6 +106,51 @@ void expectFinite(const PathProgressReference & reference)
   EXPECT_TRUE(std::isfinite(reference.signed_lateral_error));
 }
 
+TEST(PathProgressTracker, denseSamplingDoesNotCapObservedForwardMotion)
+{
+  for (const double spacing : {0.01, 0.02, 0.05}) {
+    SCOPED_TRACE(spacing);
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "map";
+    const int count = static_cast<int>(std::lround(4.0 / spacing));
+    for (int i = 0; i <= count; ++i) {
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header = path.header;
+      pose.pose.position = makePoint(i * spacing, 0.0);
+      pose.pose.orientation.w = 1.0;
+      path.poses.push_back(pose);
+    }
+    PathProgressTracker tracker;
+    setPreparedPath(tracker, path);
+    tracker.update(makePoint(0.0, 0.0), 0.3);
+    const double step = 0.8 / 15.0;
+    double maximum_progress_error = 0.0;
+    for (int i = 1; i <= 45; ++i) {
+      const double x = i * step;
+      const auto reference = tracker.update(makePoint(x, 0.0), 0.3);
+      maximum_progress_error = std::fmax(
+        maximum_progress_error, std::abs(reference.progress_arc_length - x));
+    }
+    EXPECT_NEAR(maximum_progress_error, 0.0, 1e-8);
+  }
+}
+
+TEST(PathProgressTracker, sharedTranslationEndpointUsesOutgoingCursor)
+{
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}}));
+  tracker.update(makePoint(0.0, 0.0), 0.3);
+  for (int i = 1; i < 10; ++i) {
+    tracker.update(makePoint(0.1 * i, 0.0), 0.3);
+  }
+  const auto reference = tracker.update(makePoint(1.0, 0.0), 0.3);
+  EXPECT_NEAR(reference.progress_arc_length, 1.0, 1e-10);
+  EXPECT_EQ(reference.cursor.segment_index, 1u);
+  EXPECT_NEAR(reference.cursor.segment_fraction, 0.0, 1e-10);
+  EXPECT_NEAR(reference.projection.x, 1.0, 1e-10);
+  EXPECT_NEAR(reference.projection.y, 0.0, 1e-10);
+}
+
 TEST(PathProgressTracker, futureNearbyBranchCannotReplaceCurrentOrderedBranch)
 {
   PathProgressTracker tracker;
