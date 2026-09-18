@@ -82,6 +82,26 @@ TEST(HolonomicTrackingReference, separatesAcceptedCurrentFromPreviewGeometry)
   EXPECT_NEAR(progress.progress_arc_length, 0.25, 1e-12);
 }
 
+TEST(HolonomicTrackingReference, sharedEndpointUsesOutgoingTangentAndYawRate)
+{
+  const auto path = preparePath(
+    makePath({{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {1.0, 1.0, 0.4}}));
+  PathProgressTracker tracker;
+  tracker.setPath(path);
+  const auto progress = tracker.update(makePoint(1.0, 0.0), 0.0);
+  const auto reference = buildHolonomicTrackingReference(*path, progress, 0.0);
+
+  EXPECT_EQ(reference.mode, HolonomicReferenceMode::kTranslation);
+  EXPECT_EQ(reference.current.cursor.segment_index, 1u);
+  EXPECT_NEAR(reference.current.cursor.segment_fraction, 0.0, 1e-12);
+  EXPECT_NEAR(reference.current.position.x, 1.0, 1e-12);
+  EXPECT_NEAR(reference.current.position.y, 0.0, 1e-12);
+  EXPECT_NEAR(reference.current.path_tangent, 0.5 * kPi, 1e-12);
+  EXPECT_NEAR(reference.current.target_yaw, 0.0, 1e-12);
+  EXPECT_NEAR(reference.current.target_yaw_rate_per_meter, 0.4, 1e-12);
+  EXPECT_NEAR(progress.tangent, 0.0, 1e-12);  // Legacy carrot keeps its boundary convention.
+}
+
 TEST(HolonomicTrackingReference, keepsPathTangentIndependentFromTargetYaw)
 {
   const auto path = preparePath(
@@ -179,7 +199,9 @@ TEST(HolonomicTrackingReference, internalRotationRunUsesFinalYawAndSingleAcknowl
   tracker.setPath(path);
 
   const auto crossed_progress = tracker.update(makePoint(1.0, 0.20), 0.20);
-  ASSERT_EQ(crossed_progress.cursor.segment_index, 3u);
+  ASSERT_EQ(crossed_progress.cursor.segment_index, 0u);
+  EXPECT_NEAR(crossed_progress.cursor.segment_fraction, 1.0, 1e-12);
+  EXPECT_NEAR(crossed_progress.progress_arc_length, 1.0, 1e-12);
   const auto pending = buildHolonomicTrackingReference(
     *path, crossed_progress, 0.20);
   ASSERT_EQ(pending.mode, HolonomicReferenceMode::kRotationPending);
@@ -305,6 +327,7 @@ TEST(HolonomicTrackingReference, initialRotationBoundaryUsesRotationBeginYaw)
   const auto reference = buildHolonomicTrackingReference(*path, progress, 0.20);
 
   ASSERT_EQ(reference.pending_rotation_segment_index, std::optional<std::size_t>(0u));
+  EXPECT_EQ(progress.cursor.segment_index, 0u);
   EXPECT_EQ(reference.preview.cursor.segment_index, 0u);
   EXPECT_NEAR(reference.preview.target_yaw, 0.0, 1e-12);
   EXPECT_NEAR(reference.rotation_target_yaw, 0.25 * kPi, 1e-12);

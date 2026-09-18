@@ -228,6 +228,7 @@ PathProgressReference PathProgressTracker::update(
     throw std::domain_error("robot position and lookahead distance must be finite");
   }
 
+  double available_budget = progress_budget_;
   if (previous_robot_position_valid_ && previous_accepted_tangent_valid_) {
     const double displacement_x = robot_position.x - previous_robot_position_.x;
     const double displacement_y = robot_position.y - previous_robot_position_.y;
@@ -235,9 +236,8 @@ PathProgressReference PathProgressTracker::update(
       0.0,
       displacement_x * previous_accepted_tangent_x_ +
       displacement_y * previous_accepted_tangent_y_);
-    progress_budget_ = std::min(
-      maximum_progress_budget_,
-      progress_budget_ + forward_displacement);
+    // Current observed motion is spendable before capping the retained reserve.
+    available_budget += forward_displacement;
   }
 
   PathProgressReference reference;
@@ -250,16 +250,25 @@ PathProgressReference PathProgressTracker::update(
     reference.remaining_path_length = 0.0;
     reference.progress_budget = progress_budget_;
     reference.signed_lateral_error = planarDistance(robot_position, reference.projection);
-    previous_robot_position_ = robot_position;
-    previous_robot_position_valid_ = true;
     if (!referenceIsFinite(reference)) {
       throw std::domain_error("path progress tracker produced a non-finite reference");
     }
+    previous_robot_position_ = robot_position;
+    previous_robot_position_valid_ = true;
     return reference;
   }
 
-  const double admissible_end = std::min(
-    path_->total_translation_length, progress_arc_length_ + progress_budget_);
+  std::size_t projection_segment_end = path_->segments.size();
+  double progress_limit = path_->total_translation_length;
+  for (std::size_t index = prepared_segment_lower_bound_; index < path_->segments.size(); ++index) {
+    if (path_->segments[index].type == PathSegmentType::kRotation) {
+      projection_segment_end = index;
+      progress_limit = std::min(progress_limit, path_->segments[index].translation_s_begin);
+      break;
+    }
+  }
+  // Arc alone cannot exclude the translation sharing a pending rotation's boundary.
+  const double admissible_end = std::min(progress_limit, progress_arc_length_ + available_budget);
   bool projection_found = false;
   double best_distance_squared = std::numeric_limits<double>::infinity();
   double best_arc_length = progress_arc_length_;
@@ -267,10 +276,9 @@ PathProgressReference PathProgressTracker::update(
   double best_segment_fraction = 0.0;
   geometry_msgs::msg::Point best_projection;
 
-  for (std::size_t index = 0; index < path_->segments.size(); ++index) {
+  for (std::size_t index = prepared_segment_lower_bound_; index < projection_segment_end; ++index) {
     const auto & segment = path_->segments[index];
-    if (index < prepared_segment_lower_bound_ ||
-      segment.type != PathSegmentType::kTranslation ||
+    if (segment.type != PathSegmentType::kTranslation ||
       segment.translation_s_end + kGeometryEpsilon <
       progress_arc_length_ ||
       segment.translation_s_begin > admissible_end + kGeometryEpsilon)
@@ -344,46 +352,72 @@ PathProgressReference PathProgressTracker::update(
     reference.carrot_arc_length = progress_arc_length_;
     reference.remaining_path_length = std::max(
       0.0, path_->total_translation_length - progress_arc_length_);
-    reference.progress_budget = progress_budget_;
+    reference.progress_budget = std::clamp(available_budget, 0.0, maximum_progress_budget_);
     reference.tangent = previous_accepted_tangent_valid_ ?
       std::atan2(previous_accepted_tangent_y_, previous_accepted_tangent_x_) : 0.0;
+    if (prepared_segment_lower_bound_ < path_->segments.size()) {
+      // An initial rotation blocks accepted progress, not the legacy carrot preview.
+      reference.carrot_arc_length = std::min(
+        progress_arc_length_ + lookahead_distance, path_->total_translation_length);
+      const auto carrot = interpolateAtArcLength(*path_, reference.carrot_arc_length);
+      reference.carrot = carrot.point;
+      reference.tangent = path_->segments[carrot.prepared_segment_index].path_tangent;
+      reference.curvature = curvatureAtSegment(path_->poses, carrot.source_segment_index);
+    }
     reference.signed_lateral_error = planarDistance(
       robot_position, reference.projection);
-    previous_robot_position_ = robot_position;
-    previous_robot_position_valid_ = true;
     if (!referenceIsFinite(reference)) {
       throw std::domain_error("path progress tracker produced a non-finite reference");
     }
+    progress_budget_ = reference.progress_budget;
+    previous_robot_position_ = robot_position;
+    previous_robot_position_valid_ = true;
     return reference;
   }
 
+  // Give a shared translation endpoint to the immediately outgoing segment.
+  // This changes ownership/tangent only: neither projection nor arc advances.
+  const auto & incoming_segment = path_->segments[best_prepared_segment_index];
+  const std::size_t next_index = best_prepared_segment_index + 1u;
+  if (best_segment_fraction >= 1.0 - kGeometryEpsilon &&
+    std::abs(best_arc_length - incoming_segment.translation_s_end) <= kGeometryEpsilon &&
+    incoming_segment.translation_s_end <= admissible_end &&
+    next_index < projection_segment_end)
+  {
+    const auto & next_segment = path_->segments[next_index];
+    const auto & end = path_->poses[incoming_segment.end_pose_index].pose.position;
+    const auto & next_start = path_->poses[next_segment.start_pose_index].pose.position;
+    if (next_segment.type == PathSegmentType::kTranslation &&
+      std::abs(next_segment.translation_s_begin - incoming_segment.translation_s_end) <=
+      kGeometryEpsilon && planarDistance(end, next_start) <= kGeometryEpsilon &&
+      std::abs(end.z - next_start.z) <= kGeometryEpsilon)
+    {
+      best_prepared_segment_index = next_index;
+      best_segment_fraction = 0.0;
+    }
+  }
+
   const double advance = std::max(0.0, best_arc_length - progress_arc_length_);
-  progress_arc_length_ = std::max(progress_arc_length_, best_arc_length);
-  progress_budget_ = std::max(0.0, progress_budget_ - advance);
+  const double next_progress = std::max(progress_arc_length_, best_arc_length);
+  const double next_budget = std::clamp(available_budget - advance, 0.0, maximum_progress_budget_);
 
   const auto & accepted_segment = path_->segments[best_prepared_segment_index];
   const auto & accepted_start =
     path_->poses[accepted_segment.start_pose_index].pose.position;
   const auto & accepted_end =
     path_->poses[accepted_segment.end_pose_index].pose.position;
-  previous_accepted_tangent_x_ = std::cos(accepted_segment.path_tangent);
-  previous_accepted_tangent_y_ = std::sin(accepted_segment.path_tangent);
-  previous_accepted_tangent_valid_ = true;
-  previous_robot_position_ = robot_position;
-  previous_robot_position_valid_ = true;
-
   reference.projection = best_projection;
   reference.cursor.segment_index = best_prepared_segment_index;
   reference.cursor.segment_fraction = best_segment_fraction;
-  reference.cursor.translation_arc_length = progress_arc_length_;
+  reference.cursor.translation_arc_length = next_progress;
   reference.segment_index = accepted_segment.start_pose_index;
   reference.segment_fraction = best_segment_fraction;
-  reference.progress_arc_length = progress_arc_length_;
+  reference.progress_arc_length = next_progress;
   reference.carrot_arc_length = std::min(
-    progress_arc_length_ + lookahead_distance, path_->total_translation_length);
+    next_progress + lookahead_distance, path_->total_translation_length);
   reference.remaining_path_length = std::max(
     0.0, path_->total_translation_length - reference.progress_arc_length);
-  reference.progress_budget = progress_budget_;
+  reference.progress_budget = next_budget;
   const auto carrot = interpolateAtArcLength(
     *path_, reference.carrot_arc_length);
   reference.carrot = carrot.point;
@@ -406,6 +440,13 @@ PathProgressReference PathProgressTracker::update(
   if (!referenceIsFinite(reference)) {
     throw std::domain_error("path progress tracker produced a non-finite reference");
   }
+  progress_arc_length_ = next_progress;
+  progress_budget_ = next_budget;
+  previous_accepted_tangent_x_ = std::cos(accepted_segment.path_tangent);
+  previous_accepted_tangent_y_ = std::sin(accepted_segment.path_tangent);
+  previous_accepted_tangent_valid_ = true;
+  previous_robot_position_ = robot_position;
+  previous_robot_position_valid_ = true;
   return reference;
 }
 

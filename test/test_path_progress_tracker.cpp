@@ -125,13 +125,17 @@ TEST(PathProgressTracker, denseSamplingDoesNotCapObservedForwardMotion)
     tracker.update(makePoint(0.0, 0.0), 0.3);
     const double step = 0.8 / 15.0;
     double maximum_progress_error = 0.0;
+    double maximum_reserve_error = 0.0;
     for (int i = 1; i <= 45; ++i) {
       const double x = i * step;
       const auto reference = tracker.update(makePoint(x, 0.0), 0.3);
       maximum_progress_error = std::fmax(
         maximum_progress_error, std::abs(reference.progress_arc_length - x));
+      maximum_reserve_error = std::fmax(
+        maximum_reserve_error, std::abs(reference.progress_budget - 2.0 * spacing));
     }
     EXPECT_NEAR(maximum_progress_error, 0.0, 1e-8);
+    EXPECT_NEAR(maximum_reserve_error, 0.0, 1e-8);
   }
 }
 
@@ -149,6 +153,37 @@ TEST(PathProgressTracker, sharedTranslationEndpointUsesOutgoingCursor)
   EXPECT_NEAR(reference.cursor.segment_fraction, 0.0, 1e-10);
   EXPECT_NEAR(reference.projection.x, 1.0, 1e-10);
   EXPECT_NEAR(reference.projection.y, 0.0, 1e-10);
+}
+
+TEST(PathProgressTracker, sharedEndpointPreservesReserveAndUsesOutgoingMotion)
+{
+  for (const double direction : {-1.0, 0.0, 1.0}) {
+    SCOPED_TRACE(direction);
+    const bool straight = direction == 0.0;
+    PathProgressTracker tracker;
+    setPreparedPath(
+      tracker, makePath(
+        {{0.0, 0.0}, {0.1, 0.0}, {0.2, 0.0}, {0.2, 0.0},
+          {straight ? 0.3 : 0.2, direction * 0.1},
+          {straight ? 0.7 : 0.2, direction * 0.5}}));
+
+    // Initial anchoring consumes the reserve; further progress needs the outgoing tangent.
+    const auto boundary = tracker.update(makePoint(0.2, 0.0), 0.05);
+    ASSERT_NEAR(boundary.progress_budget, 0.0, 1e-12);
+    for (int sample = 0; sample < 3; ++sample) {
+      const auto stationary = tracker.update(makePoint(0.2, 0.0), 0.05);
+      EXPECT_EQ(stationary.cursor.segment_index, 2u);
+      EXPECT_EQ(stationary.segment_index, 3u);  // The duplicate source pose was skipped.
+      EXPECT_NEAR(stationary.cursor.segment_fraction, 0.0, 1e-12);
+      EXPECT_NEAR(stationary.progress_arc_length, 0.2, 1e-12);
+      EXPECT_NEAR(stationary.progress_budget, 0.0, 1e-12);
+    }
+    const auto outgoing = tracker.update(
+      makePoint(straight ? 0.25 : 0.2, direction * 0.05), 0.05);
+    EXPECT_NEAR(outgoing.progress_arc_length, 0.25, 1e-12);
+    EXPECT_NEAR(outgoing.cursor.segment_fraction, 0.5, 1e-12);
+    EXPECT_NEAR(outgoing.progress_budget, 0.0, 1e-12);
+  }
 }
 
 TEST(PathProgressTracker, futureNearbyBranchCannotReplaceCurrentOrderedBranch)
@@ -226,14 +261,14 @@ TEST(PathProgressTracker, nonuniformSamplingPreservesArcLengthProgressAndProvena
   EXPECT_EQ(second.segment_index, 2u);
   EXPECT_NEAR(second.segment_fraction, 2.0 / 75.0, 1e-12);
   EXPECT_NEAR(second.remaining_path_length, 0.83, 1e-12);
-  EXPECT_NEAR(second.progress_budget, 0.10, 1e-12);
+  EXPECT_NEAR(second.progress_budget, 0.13, 1e-12);
   EXPECT_GT(second.progress_arc_length, first.progress_arc_length);
 
   EXPECT_NEAR(third.progress_arc_length, 0.27, 1e-12);
   EXPECT_EQ(third.segment_index, 2u);
   EXPECT_NEAR(third.segment_fraction, 12.0 / 75.0, 1e-12);
   EXPECT_NEAR(third.remaining_path_length, 0.73, 1e-12);
-  EXPECT_NEAR(third.progress_budget, 0.10, 1e-12);
+  EXPECT_NEAR(third.progress_budget, 0.13, 1e-12);
   EXPECT_GT(third.progress_arc_length, second.progress_arc_length);
 }
 
@@ -402,11 +437,18 @@ TEST(PathProgressTracker, acknowledgementRequiresReachedEarliestRotationAndIsMon
   EXPECT_THROW(tracker.acknowledgeRotationComplete(9u), std::out_of_range);
 
   const auto reached = tracker.update(makePoint(2.0, 0.0), 0.10);
-  ASSERT_NEAR(reached.progress_arc_length, 2.0, 1e-12);
+  ASSERT_NEAR(reached.progress_arc_length, 1.0, 1e-12);
+  EXPECT_EQ(reached.cursor.segment_index, 0u);
+  EXPECT_NEAR(reached.cursor.segment_fraction, 1.0, 1e-12);
+  EXPECT_NEAR(reached.progress_budget, 2.0, 1e-12);
   EXPECT_THROW(tracker.acknowledgeRotationComplete(3u), std::logic_error);
 
   tracker.acknowledgeRotationComplete(1u);
   EXPECT_THROW(tracker.acknowledgeRotationComplete(1u), std::logic_error);
+  EXPECT_THROW(tracker.acknowledgeRotationComplete(3u), std::logic_error);
+  const auto second_boundary = tracker.update(makePoint(2.0, 0.0), 0.10);
+  EXPECT_NEAR(second_boundary.progress_arc_length, 2.0, 1e-12);
+  EXPECT_EQ(second_boundary.cursor.segment_index, 2u);
   tracker.acknowledgeRotationComplete(3u);
 
   const auto acknowledged = tracker.update(makePoint(2.0, 0.0), 0.10);
@@ -416,6 +458,30 @@ TEST(PathProgressTracker, acknowledgementRequiresReachedEarliestRotationAndIsMon
   setPreparedPath(tracker, makeTwoRotationPath());
   const auto reset = tracker.update(makePoint(0.0, 0.0), 0.10);
   EXPECT_EQ(reset.prepared_segment_lower_bound, 0u);
+}
+
+TEST(PathProgressTracker, initialRotationBlocksTranslationUntilAcknowledged)
+{
+  auto path = makePath({{0.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}});
+  setYaw(path.poses[1], M_PI_2);
+  setYaw(path.poses[2], M_PI_2);
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, path);
+
+  for (const double x : {0.0, 0.2}) {
+    const auto pending = tracker.update(makePoint(x, 0.0), 0.1);
+    EXPECT_EQ(pending.cursor.segment_index, 0u);
+    EXPECT_DOUBLE_EQ(pending.progress_arc_length, 0.0);
+    EXPECT_DOUBLE_EQ(pending.projection.x, 0.0);
+    EXPECT_DOUBLE_EQ(pending.progress_budget, 2.0);
+    EXPECT_NEAR(pending.carrot_arc_length, 0.1, 1e-12);
+    EXPECT_NEAR(pending.carrot.x, 0.1, 1e-12);
+    EXPECT_NEAR(pending.carrot.y, 0.0, 1e-12);
+  }
+  tracker.acknowledgeRotationComplete(0u);
+  const auto after = tracker.update(makePoint(0.2, 0.0), 0.1);
+  EXPECT_EQ(after.cursor.segment_index, 1u);
+  EXPECT_NEAR(after.progress_arc_length, 0.2, 1e-12);
 }
 
 TEST(PathProgressTracker, acknowledgementPreservesPositionAndAcceptedTangentHistory)

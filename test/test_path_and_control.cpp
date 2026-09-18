@@ -603,6 +603,35 @@ TEST_F(CommandContractTest, closedLoopTranslationAndFinalRotationConvergeWithinE
   EXPECT_LT(std::abs(measured.angular.z), 0.01);
 }
 
+TEST_F(CommandContractTest, closedLoopTranslationCornerReachesOutgoingEndpoint)
+{
+  auto path = makeStraightPath({0.0, 1.0});
+  path.poses.push_back(makeRobotPoseAt(1.0, 1.0));
+  controller_.setPlan(path);
+  double x = 0.0;
+  double y = 0.0;
+  double yaw = 0.0;
+  geometry_msgs::msg::Twist measured;
+  bool reached_outgoing_segment = false;
+  // Pose advances only from the real controller output through an ideal velocity plant.
+  for (int cycle = 0; cycle < 450; ++cycle) {
+    const auto command = step(makeRobotPoseAt(x, y, yaw), measured).twist;
+    ASSERT_LE(std::hypot(command.linear.x, command.linear.y), 0.2 + 1e-12);
+    ASSERT_LE(std::abs(command.linear.x - measured.linear.x), 0.02 + 1e-12);
+    ASSERT_LE(std::abs(command.linear.y - measured.linear.y), 0.02 + 1e-12);
+    x += 0.1 * (std::cos(yaw) * command.linear.x - std::sin(yaw) * command.linear.y);
+    y += 0.1 * (std::sin(yaw) * command.linear.x + std::cos(yaw) * command.linear.y);
+    yaw += 0.1 * command.angular.z;
+    measured = command;
+    reached_outgoing_segment = reached_outgoing_segment || (y > 0.5 && std::abs(x - 1.0) < 0.1);
+  }
+  EXPECT_TRUE(reached_outgoing_segment);
+  EXPECT_NEAR(x, 1.0, 0.01);
+  EXPECT_NEAR(y, 1.0, 0.01);
+  EXPECT_NEAR(yaw, 0.0, 0.01);
+  EXPECT_LT(std::hypot(measured.linear.x, measured.linear.y), 0.01);
+}
+
 TEST_F(CommandContractTest, stopsNearEndpointWithPoseAndDriveDelay)
 {
   // The plant has actuator lag and the controller observes poses two cycles old.
