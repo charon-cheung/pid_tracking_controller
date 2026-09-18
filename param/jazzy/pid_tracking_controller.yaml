@@ -29,8 +29,8 @@ controller_server:
       stopping_delay: 0.50
       # Reach the exact segment boundary at low speed instead of stalling before rotation.
       stopping_min_speed: 0.02
-      max_decel_x: 0.20
-      max_decel_y: 0.20
+      max_decel_x: 0.60
+      max_decel_y: 0.60
       yaw_feedback_reserve: 0.05
       configured_min_rate_window: 0.30
       control_gap_threshold: 0.50

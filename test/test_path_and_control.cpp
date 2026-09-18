@@ -89,6 +89,7 @@ protected:
     limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.2;
     limits_.max_omega = 0.3;
     limits_.max_ax = limits_.max_ay = 0.2;
+    limits_.max_decel_x = limits_.max_decel_y = 0.2;
     limits_.max_alpha = 0.5;
     initialize();
     controller_.setPlan(makeStraightPath({0.0, 1.0, 3.0}));
@@ -323,6 +324,43 @@ TEST_F(CommandContractTest, zeroReferenceDoesNotUsePreviewAsPositionFeedback)
     EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
     EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
   }
+}
+
+TEST_F(CommandContractTest, rotationUsesIndependentDeceleration)
+{
+  speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
+  limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
+  limits_.max_decel_x = limits_.max_decel_y = 0.6;
+  for (const auto & moving : std::vector<geometry_msgs::msg::Twist>{
+      [] {geometry_msgs::msg::Twist t; t.linear.x = 0.44; return t;}(),
+      [] {geometry_msgs::msg::Twist t; t.linear.x = -0.44; return t;}(),
+      [] {geometry_msgs::msg::Twist t; t.linear.y = 0.44; return t;}()})
+  {
+    initialize();
+    controller_.setPlan(makeStraightPath({0.0, 1.0}));
+    step(makeRobotPose(), moving);
+    setRotationPath(true);
+    const auto command = step(makeRobotPose(), moving, 1.0 / 15.0);
+    EXPECT_NEAR(std::hypot(command.twist.linear.x, command.twist.linear.y), 0.40, 1e-9);
+    EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.0);
+  }
+}
+
+TEST_F(CommandContractTest, rotationBrakesDiagonalWithoutChangingDirection)
+{
+  speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
+  limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
+  limits_.max_decel_x = limits_.max_decel_y = 0.6;
+  initialize();
+  controller_.setPlan(makeStraightPath({0.0, 1.0}));
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.44;
+  measured.linear.y = -0.33;
+  step(makeRobotPose(), measured);
+  setRotationPath(true);
+  const auto command = step(makeRobotPose(), measured, 1.0 / 15.0);
+  EXPECT_NEAR(command.twist.linear.x, 0.40, 1e-9);
+  EXPECT_NEAR(command.twist.linear.y, -0.30, 1e-9);
 }
 
 TEST_F(CommandContractTest, rotationBrakesBeforeTurningAndWaitsForMeasuredStop)
@@ -569,6 +607,7 @@ TEST_F(CommandContractTest, stopsNearEndpointWithPoseAndDriveDelay)
 {
   // The plant has actuator lag and the controller observes poses two cycles old.
   // Exercise the actual tracker, planner, feedback law and command limiter together.
+  for (const double deceleration : {0.2, 0.6}) {
   for (const double direction : {1.0, -1.0}) {
     for (const bool lateral : {false, true}) {
       SCOPED_TRACE(direction);
@@ -576,7 +615,7 @@ TEST_F(CommandContractTest, stopsNearEndpointWithPoseAndDriveDelay)
       speed_.nominal_tracking_speed = 0.8;
       speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
       limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
-      limits_.max_decel_x = limits_.max_decel_y = 0.2;
+      limits_.max_decel_x = limits_.max_decel_y = deceleration;
       initialize();
       auto path = makeStraightPath({0.0, direction * 1.5});
       if (lateral) {
@@ -612,6 +651,7 @@ TEST_F(CommandContractTest, stopsNearEndpointWithPoseAndDriveDelay)
       EXPECT_NEAR(positions.back(), direction * 1.5, 0.05);
       EXPECT_LT(std::abs(velocity), 0.05);
     }
+  }
   }
 }
 

@@ -332,6 +332,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     plan.speed_limit_reason =
       reference.mode == HolonomicReferenceMode::kRotationPending ?
       HolonomicSpeedLimitReason::kRotation : HolonomicSpeedLimitReason::kTerminal;
+    if (reference.mode == HolonomicReferenceMode::kRotationPending) {
+      plan.stopping_speed_limit = 0.0;
+    }
     previous_reference_velocity_ = 0.0;
     return plan;
   } else {
