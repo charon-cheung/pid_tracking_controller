@@ -65,9 +65,10 @@ HolonomicSpeedPlannerConfig makeConfig()
   config.max_ax = 4.0;
   config.max_ay = 4.0;
   config.a_ref_up = 4.0;
-  config.a_ref_down = 4.0;
+  config.stopping_deceleration = config.a_ref_down = 4.0;
   config.yaw_feedback_reserve = 0.0;
   config.configured_min_rate_window = 0.0;
+  config.stopping_delay = 0.0;
   return config;
 }
 
@@ -172,7 +173,7 @@ TEST(HolonomicSpeedPlanner, pathTangentSpatialRateUsesNormalAcceleration)
   config.max_ax = 0.25;
   config.max_ay = 1.0;
   config.a_ref_up = 0.25;
-  config.a_ref_down = 0.25;
+  config.stopping_deceleration = config.a_ref_down = 0.25;
   HolonomicSpeedPlanner planner(config);
   planner.setPath(path);
   planner.seed(2.0);
@@ -197,7 +198,7 @@ TEST(HolonomicSpeedPlanner, propagatesFutureYawConstraintBackByDistance)
   config.max_ax = 1.0;
   config.max_ay = 1.0;
   config.a_ref_up = 0.5;
-  config.a_ref_down = 0.5;
+  config.stopping_deceleration = config.a_ref_down = 0.5;
   HolonomicSpeedPlanner planner(config);
   planner.setPath(path);
   planner.seed(2.0);
@@ -225,7 +226,7 @@ TEST(HolonomicSpeedPlanner, earlierRotationStopOverridesTerminalStop)
   config.max_ax = 1.0;
   config.max_ay = 1.0;
   config.a_ref_up = 1.0;
-  config.a_ref_down = 1.0;
+  config.stopping_deceleration = config.a_ref_down = 1.0;
   HolonomicSpeedPlanner planner(config);
   planner.setPath(path);
   planner.seed(5.0);
@@ -248,7 +249,7 @@ TEST(HolonomicSpeedPlanner, terminalStopPropagatesToCurrentPosition)
   config.max_ax = 0.5;
   config.max_ay = 0.5;
   config.a_ref_up = 0.5;
-  config.a_ref_down = 0.5;
+  config.stopping_deceleration = config.a_ref_down = 0.5;
   HolonomicSpeedPlanner planner(config);
   planner.setPath(path);
   planner.seed(5.0);
@@ -319,7 +320,7 @@ TEST(HolonomicSpeedPlanner, instantaneousHardLimitsOverrideTemporalRamp)
     config.max_vx = test_case.max_vx;
     config.max_xy_speed = test_case.max_xy_speed;
     config.a_ref_up = 0.1;
-    config.a_ref_down = 0.1;
+    config.stopping_deceleration = config.a_ref_down = 0.1;
     HolonomicSpeedPlanner planner(config);
     planner.setPath(path);
     planner.seed(0.6);
@@ -394,7 +395,7 @@ TEST(HolonomicSpeedPlanner, referenceVelocityHonorsSeparateRiseAndFallRates)
   auto config = makeConfig();
   config.nominal_tracking_speed = 1.0;
   config.a_ref_up = 0.2;
-  config.a_ref_down = 0.4;
+  config.stopping_deceleration = config.a_ref_down = 0.4;
   HolonomicSpeedPlanner planner(config);
   planner.setPath(path);
   planner.seed(0.0);
@@ -465,7 +466,7 @@ TEST(HolonomicSpeedPlanner, currentSegmentYawFeedforwardRemainsFeasibleAfterRamp
     config.max_omega = 0.3;
     config.yaw_feedback_reserve = 0.05;
     config.max_ax = config.max_ay = 0.2;
-    config.a_ref_up = config.a_ref_down = 0.2;
+    config.stopping_deceleration = config.a_ref_up = config.a_ref_down = 0.2;
     HolonomicSpeedPlanner planner(config);
     planner.setPath(path);
     planner.seed(0.2);
@@ -487,7 +488,7 @@ TEST(HolonomicSpeedPlanner, futureShortYawSegmentBrakesBeforeItsBoundary)
   config.max_omega = 0.3;
   config.yaw_feedback_reserve = 0.05;
   config.max_ax = config.max_ay = 0.2;
-  config.a_ref_up = config.a_ref_down = 0.2;
+  config.stopping_deceleration = config.a_ref_up = config.a_ref_down = 0.2;
   HolonomicSpeedPlanner planner(config);
   planner.setPath(path);
   const auto result = planAt(planner, path, makePoint(0.0, 0.0));
@@ -523,6 +524,51 @@ TEST(HolonomicSpeedPlanner, rejectsInvalidConfigurationStateAndInputs)
   EXPECT_THROW(
     planner.plan(makeReference(path, makePoint(0.0, 0.0)), 0.0, 0.0),
     std::domain_error);
+}
+
+TEST(HolonomicSpeedPlanner, stoppingEnvelopeIsNotRaisedByReferenceSlew)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {1.5, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.stopping_deceleration = config.max_ax = config.max_ay = config.a_ref_down = 0.2;
+  config.a_ref_up = 0.2;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  planner.seed(0.4);
+
+  const auto plan = planAt(planner, path, makePoint(1.45, 0.0), 0.0, 1.0 / 15.0);
+
+  // A fast incoming reference must not override the distance-based stop target.
+  EXPECT_LE(plan.reference_velocity, plan.stopping_speed_limit + 1e-12);
+  EXPECT_LT(plan.reference_velocity, 0.15);
+}
+
+TEST(HolonomicSpeedPlanner, observedSpeedReservesDistanceForDelayedBraking)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {1.5, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.stopping_deceleration = 0.12;
+  config.stopping_delay = 0.5;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  const auto reference = makeReference(path, makePoint(1.0, 0.0));
+  planner.seed(0.0);
+  const auto stationary = planner.plan(reference, 0.0, 0.1);
+  planner.seed(0.0);
+  const auto moving = planner.plan(
+    reference, 0.0, 0.1, std::numeric_limits<double>::infinity(), 0.6);
+  // 0.5 m remaining, reserving 0.3 m of travel during the delay.
+  EXPECT_NEAR(moving.stopping_speed_limit, std::sqrt(0.048), 1e-12);
+  EXPECT_LT(moving.reference_velocity, stationary.reference_velocity);
+  EXPECT_THROW(planner.plan(reference, 0.0, 0.1, 1.0, -0.1), std::domain_error);
+  EXPECT_THROW(planner.plan(reference, 0.0, 0.1, 1.0,
+    std::numeric_limits<double>::quiet_NaN()), std::domain_error);
+
+  config.stopping_delay = -0.1;
+  EXPECT_THROW(HolonomicSpeedPlanner{config}, std::invalid_argument);
+  config.stopping_delay = 0.5;
+  config.stopping_deceleration = 0.0;
+  EXPECT_THROW(HolonomicSpeedPlanner{config}, std::invalid_argument);
 }
 
 }  // namespace

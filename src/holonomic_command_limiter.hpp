@@ -21,6 +21,9 @@ struct HolonomicCommandLimiterConfig
   double max_omega{0.8};
   double max_ax{0.5};
   double max_ay{0.5};
+  // Used when the distance-based stopping cap requires translation braking.
+  double max_decel_x{0.5};
+  double max_decel_y{0.5};
   double max_alpha{1.0};
   double control_gap_threshold{0.5};
 };
@@ -45,6 +48,8 @@ struct HolonomicCommandLimitResult
   // True when the per-call external cap changed this call's final translation.
   bool external_limit_applied{false};
   bool reseeded{false};
+  // The cap was not reachable this cycle without exceeding command rate limits.
+  bool stopping_limit_unreachable{false};
 };
 
 class HolonomicCommandLimiter
@@ -60,7 +65,8 @@ public:
     const HolonomicBodyCommand & raw,
     const HolonomicBodyCommand & measured,
     double dt,
-    double external_speed_limit = std::numeric_limits<double>::infinity());
+    double external_speed_limit = std::numeric_limits<double>::infinity(),
+    double stopping_speed_limit = std::numeric_limits<double>::infinity());
 
 private:
   HolonomicCommandLimiterConfig config_;

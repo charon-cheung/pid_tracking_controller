@@ -47,6 +47,10 @@ bool configIsValid(const HolonomicSpeedPlannerConfig & config)
          config.a_ref_up <= normal_acceleration &&
          std::isfinite(config.a_ref_down) && config.a_ref_down > 0.0 &&
          config.a_ref_down <= normal_acceleration &&
+         std::isfinite(config.stopping_deceleration) && config.stopping_deceleration > 0.0 &&
+         config.stopping_deceleration <= normal_acceleration &&
+         std::isfinite(config.stopping_delay) && config.stopping_delay >= 0.0 &&
+         std::isfinite(config.stopping_min_speed) && config.stopping_min_speed >= 0.0 &&
          std::isfinite(config.yaw_feedback_reserve) &&
          config.yaw_feedback_reserve >= 0.0 &&
          config.yaw_feedback_reserve < config.max_omega &&
@@ -304,13 +308,15 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   const HolonomicTrackingReference & reference,
   double robot_yaw,
   double dt,
-  double external_speed_limit)
+  double external_speed_limit,
+  double observed_speed)
 {
   if (!path_) {
     throw std::logic_error("speed planner has no path");
   }
   if (!std::isfinite(robot_yaw) || !std::isfinite(dt) || dt <= 0.0 ||
-    std::isnan(external_speed_limit) || external_speed_limit < 0.0)
+    std::isnan(external_speed_limit) || external_speed_limit < 0.0 ||
+    !std::isfinite(observed_speed) || observed_speed < 0.0)
   {
     throw std::domain_error("speed planner inputs are invalid");
   }
@@ -444,10 +450,21 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
         propagatedSpeed(tangent_local_limit, config_.a_ref_down, distance));
     }
 
-    const double stopping_distance = std::max(
+    plan.stopping_distance = std::max(
       0.0, horizon_arc_length - current_arc_length);
+    // Reserve distance consumed before a reduced command can affect the robot.
+    // No fixed spatial offset: as speed falls the full remaining distance becomes
+    // available again, so this cannot strand the tracker before a rotation boundary.
+    plan.stopping_delay_distance =
+      std::max(observed_speed, previous_reference_velocity_) * config_.stopping_delay;
+    const double stopping_distance = std::max(
+      0.0, plan.stopping_distance - plan.stopping_delay_distance);
     plan.stopping_speed_limit = std::sqrt(
-      2.0 * config_.a_ref_down * stopping_distance);
+      2.0 * config_.stopping_deceleration * stopping_distance);
+    if (plan.stopping_distance > 0.0) {
+      plan.stopping_speed_limit = std::max(
+        plan.stopping_speed_limit, config_.stopping_min_speed);
+    }
 
     plan.reference_velocity_target = config_.nominal_tracking_speed;
     plan.speed_limit_reason = HolonomicSpeedLimitReason::kNominal;
@@ -480,7 +497,7 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   plan.reference_velocity = std::min(
     plan.reference_velocity,
     std::min({external_speed_limit, plan.axis_speed_limit, config_.max_xy_speed,
-      plan.yaw_ff_speed_limit}));
+      plan.yaw_ff_speed_limit, plan.stopping_speed_limit}));
   previous_reference_velocity_ = plan.reference_velocity;
   return plan;
 }

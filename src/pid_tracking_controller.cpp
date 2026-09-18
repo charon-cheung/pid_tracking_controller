@@ -362,6 +362,9 @@ void PidTrackingController::configure(
     speed_config.max_ay = parameter("max_ay", 0.20);
     speed_config.a_ref_up = parameter("a_ref_up", 0.20);
     speed_config.a_ref_down = parameter("a_ref_down", 0.20);
+    speed_config.stopping_deceleration = parameter("stopping_deceleration", 0.12);
+    speed_config.stopping_delay = parameter("stopping_delay", 0.50);
+    speed_config.stopping_min_speed = parameter("stopping_min_speed", 0.02);
     speed_config.yaw_feedback_reserve = parameter("yaw_feedback_reserve", 0.05);
     speed_config.configured_min_rate_window = parameter("configured_min_rate_window", 0.30);
     HolonomicCommandLimiterConfig limiter_config;
@@ -371,6 +374,12 @@ void PidTrackingController::configure(
     limiter_config.max_omega = speed_config.max_omega;
     limiter_config.max_ax = speed_config.max_ax;
     limiter_config.max_ay = speed_config.max_ay;
+    limiter_config.max_decel_x = parameter("max_decel_x", speed_config.max_ax);
+    limiter_config.max_decel_y = parameter("max_decel_y", speed_config.max_ay);
+    if (speed_config.stopping_deceleration >
+            std::min(limiter_config.max_decel_x, limiter_config.max_decel_y)) {
+        throw std::invalid_argument("stopping_deceleration exceeds command braking limits");
+    }
     limiter_config.max_alpha = parameter("max_alpha", 0.50);
     limiter_config.control_gap_threshold = parameter("control_gap_threshold", 0.50);
     const double kp_x = parameter("kp_x", 1.0);
@@ -392,11 +401,16 @@ void PidTrackingController::configure(
     RCLCPP_INFO(logger_, "PID_LOG holonomic_parameters nominal=%.3f max_xy_speed=%.3f "
             "max_vx=%.3f max_vy=%.3f max_omega=%.3f max_ax=%.3f max_ay=%.3f "
             "max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f "
-            "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f",
+            "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f "
+            "stopping_deceleration=%.3f stopping_delay=%.3f stopping_min_speed=%.3f "
+            "max_decel_x=%.3f max_decel_y=%.3f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
             speed_config.max_vy, speed_config.max_omega, speed_config.max_ax,
             speed_config.max_ay, limiter_config.max_alpha, kp_x_, kp_y_, kp_yaw_,
-            control_gap_threshold_, entry_config.stop_confirm_time, entry_config.braking_timeout);
+            control_gap_threshold_, entry_config.stop_confirm_time, entry_config.braking_timeout,
+            speed_config.stopping_deceleration, speed_config.stopping_delay,
+            speed_config.stopping_min_speed,
+            limiter_config.max_decel_x, limiter_config.max_decel_y);
     
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
@@ -958,7 +972,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         holonomic_speed_planner_->seed(reference.mode == HolonomicReferenceMode::kTranslation ?
                 std::max(0.0, measured_progress_speed) : 0.0);
     } else {
-        speed_plan = holonomic_speed_planner_->plan(reference, yaw, dt, cap);
+        speed_plan = holonomic_speed_planner_->plan(reference, yaw, dt, cap,
+                std::max(std::hypot(measured.vx, measured.vy), last_commanded_planar_speed_));
     }
     HolonomicControlInput input;
     input.robot_x = pose.pose.position.x;
@@ -979,7 +994,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     const auto limited = holonomic_command_limiter_->limit(
             {raw.vx, raw.vy, raw.omega},
             measured,
-            reseed ? 0.0 : dt, cap);
+            reseed ? 0.0 : dt, cap, speed_plan.stopping_speed_limit);
+    last_commanded_planar_speed_ = std::hypot(limited.command.vx, limited.command.vy);
     geometry_msgs::msg::TwistStamped command;
     command.header.frame_id = base_frame_;
     command.header.stamp = now;
@@ -1015,7 +1031,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "raw_vx=%.6f raw_vy=%.6f raw_omega=%.6f limited_vx=%.6f limited_vy=%.6f "
                 "limited_omega=%.6f translation_lambda=%.6f reseed=%s control_gap=%s "
                 "rotation_index=%s rotation_phase=%s stop_confirmed=%.6f "
-                "rotation_settled=%.6f ack_candidate=%s",
+                "rotation_settled=%.6f ack_candidate=%s "
+                "stop_distance=%.6f stop_delay_distance=%.6f stop_speed_limit=%.6f "
+                "stop_limit_unreachable=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), reseed ? "false" : "true",
                 reseed ? std::numeric_limits<double>::quiet_NaN() : speed_plan.reference_velocity_target,
                 speed_plan.reference_velocity,
@@ -1025,7 +1043,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 rotating ? std::to_string(pending_rotation_segment_index_).c_str() : "none",
                 rotating ? (braking ? "braking" : "rotating") : "none",
                 rotation_entry_gate_->stoppedDuration(),
-                completion.settled_duration, rotation_ack_candidate_ ? "true" : "false");
+                completion.settled_duration, rotation_ack_candidate_ ? "true" : "false",
+                speed_plan.stopping_distance, speed_plan.stopping_delay_distance,
+                speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false");
         last_diagnostics_log_time_seconds_ = now_seconds;
         force_diagnostics_log_ = false;
     }

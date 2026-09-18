@@ -185,6 +185,7 @@ private:
   double kp_y_{1.0};
   double max_xy_speed_{0.20};
   double control_gap_threshold_{0.50};
+  double last_commanded_planar_speed_{0.0};
   std::atomic<double> external_speed_limit_{std::numeric_limits<double>::infinity()};
   std::unique_ptr<HolonomicSpeedPlanner> holonomic_speed_planner_;
   std::unique_ptr<HolonomicCommandLimiter> holonomic_command_limiter_;

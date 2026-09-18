@@ -26,6 +26,8 @@ bool configIsValid(const HolonomicCommandLimiterConfig & config)
          std::isfinite(config.max_omega) && config.max_omega > 0.0 &&
          std::isfinite(config.max_ax) && config.max_ax > 0.0 &&
          std::isfinite(config.max_ay) && config.max_ay > 0.0 &&
+         std::isfinite(config.max_decel_x) && config.max_decel_x > 0.0 &&
+         std::isfinite(config.max_decel_y) && config.max_decel_y > 0.0 &&
          std::isfinite(config.max_alpha) && config.max_alpha > 0.0 &&
          std::isfinite(config.control_gap_threshold) &&
          config.control_gap_threshold > 0.0;
@@ -142,6 +144,23 @@ void validateExternalSpeedLimit(double external_speed_limit)
   }
 }
 
+long double stoppingAxisDelta(
+  double previous, double target, double acceleration, double deceleration, double dt)
+{
+  if (previous == 0.0 ||
+    (previous * target >= 0.0 && std::abs(target) >= std::abs(previous)))
+  {
+    return static_cast<long double>(acceleration) * dt;
+  }
+  const long double stop_time = std::abs(static_cast<long double>(previous)) / deceleration;
+  if (stop_time >= dt) {
+    return static_cast<long double>(deceleration) * dt;
+  }
+  // A reversal may brake to zero faster, but acceleration in the new direction
+  // still uses the normal acceleration allowance for the remaining cycle time.
+  return std::abs(static_cast<long double>(previous)) + acceleration * (dt - stop_time);
+}
+
 }  // namespace
 
 HolonomicCommandLimiter::HolonomicCommandLimiter(
@@ -168,13 +187,17 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
   const HolonomicBodyCommand & raw,
   const HolonomicBodyCommand & measured,
   double dt,
-  double external_speed_limit)
+  double external_speed_limit,
+  double stopping_speed_limit)
 {
   validateCommand(raw);
   validateCommand(measured);
   validateExternalSpeedLimit(external_speed_limit);
+  validateExternalSpeedLimit(stopping_speed_limit);
 
-  const auto target = projectBaseLimits(raw, config_);
+  auto target = projectBaseLimits(raw, config_);
+  const bool stopping_limited =
+    projectTranslationToSpeed(target.command, stopping_speed_limit);
   HolonomicCommandLimitResult result;
   result.projected_target = target.command;
   result.vx_saturated = target.vx_saturated;
@@ -190,6 +213,7 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
       applyExternalSpeedLimit(result.command, external_speed_limit);
     result.translation_lambda = 0.0;
     result.reseeded = true;
+    result.stopping_limit_unreachable = translationSpeed(result.command) > stopping_speed_limit;
     previous_command_ = result.command;
     seeded_ = true;
     return result;
@@ -199,9 +223,15 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     static_cast<long double>(target.command.vx) - previous_command_.vx;
   const long double delta_vy =
     static_cast<long double>(target.command.vy) - previous_command_.vy;
-  const long double max_delta_vx =
+  const bool stopping_brake = stopping_limited ||
+    translationSpeed(previous_command_) > stopping_speed_limit;
+  const long double max_delta_vx = stopping_brake ?
+    stoppingAxisDelta(previous_command_.vx, target.command.vx,
+      config_.max_ax, config_.max_decel_x, dt) :
     static_cast<long double>(config_.max_ax) * dt;
-  const long double max_delta_vy =
+  const long double max_delta_vy = stopping_brake ?
+    stoppingAxisDelta(previous_command_.vy, target.command.vy,
+      config_.max_ay, config_.max_decel_y, dt) :
     static_cast<long double>(config_.max_ay) * dt;
   const long double lambda_x = delta_vx == 0.0L ?
     1.0L : max_delta_vx / std::abs(delta_vx);
@@ -252,6 +282,7 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
 
   result.external_limit_applied =
     applyExternalSpeedLimit(result.command, external_speed_limit);
+  result.stopping_limit_unreachable = translationSpeed(result.command) > stopping_speed_limit;
   previous_command_ = result.command;
   return result;
 }

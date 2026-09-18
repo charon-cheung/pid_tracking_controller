@@ -554,5 +554,105 @@ TEST_F(CommandContractTest, closedLoopTranslationAndFinalRotationConvergeWithinE
   EXPECT_LT(std::abs(measured.angular.z), 0.01);
 }
 
+TEST_F(CommandContractTest, stopsNearEndpointWithPoseAndDriveDelay)
+{
+  // The plant has actuator lag and the controller observes poses two cycles old.
+  // Exercise the actual tracker, planner, feedback law and command limiter together.
+  for (const double direction : {1.0, -1.0}) {
+    for (const bool lateral : {false, true}) {
+      SCOPED_TRACE(direction);
+      SCOPED_TRACE(lateral);
+      speed_.nominal_tracking_speed = 0.8;
+      speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
+      limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
+      limits_.max_decel_x = limits_.max_decel_y = 0.2;
+      initialize();
+      auto path = makeStraightPath({0.0, direction * 1.5});
+      if (lateral) {
+        for (auto & pose : path.poses) {
+          std::swap(pose.pose.position.x, pose.pose.position.y);
+        }
+      }
+      controller_.setPlan(path);
+      constexpr double dt = 1.0 / 15.0;
+      constexpr double drive_time_constant = 0.25;
+      std::vector<double> positions(3, 0.0);
+      double velocity = 0.0;
+      double max_overshoot = 0.0;
+      for (int cycle = 0; cycle < 450; ++cycle) {
+        const double observed_position = positions[positions.size() - 3];
+        auto pose = makeRobotPoseAt(
+          lateral ? 0.0 : observed_position, lateral ? observed_position : 0.0);
+        geometry_msgs::msg::Twist measured;
+        if (lateral) {
+          measured.linear.y = velocity;
+        } else {
+          measured.linear.x = velocity;
+        }
+        const auto output = step(pose, measured, dt);
+        const double next_velocity = velocity +
+          ((lateral ? output.twist.linear.y : output.twist.linear.x) - velocity) *
+          (1.0 - std::exp(-dt / drive_time_constant));
+        positions.push_back(positions.back() + 0.5 * (velocity + next_velocity) * dt);
+        velocity = next_velocity;
+        max_overshoot = std::max(max_overshoot, direction * positions.back() - 1.5);
+      }
+      EXPECT_LE(max_overshoot, 0.05);
+      EXPECT_NEAR(positions.back(), direction * 1.5, 0.05);
+      EXPECT_LT(std::abs(velocity), 0.05);
+    }
+  }
+}
+
+TEST_F(CommandContractTest, delayedDriveWithDeadbandReachesTerminalRotation)
+{
+  speed_.nominal_tracking_speed = 0.8;
+  speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
+  limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
+  limits_.max_decel_x = limits_.max_decel_y = 0.2;
+  initialize();
+  auto path = makeStraightPath({0.0, 1.5});
+  path.poses.push_back(makeRobotPoseAt(1.5, 0.0, 0.4));
+  controller_.setPlan(path);
+  constexpr double dt = 1.0 / 15.0;
+  std::vector<geometry_msgs::msg::PoseStamped> history(3, makeRobotPose());
+  double x = 0.0;
+  double y = 0.0;
+  double yaw = 0.0;
+  double world_vx = 0.0;
+  double world_vy = 0.0;
+  double omega = 0.0;
+  double max_overshoot = 0.0;
+  const auto deadband = [](double value) {return std::abs(value) < 0.01 ? 0.0 : value;};
+  for (int cycle = 0; cycle < 450; ++cycle) {
+    geometry_msgs::msg::Twist measured;
+    measured.linear.x = std::cos(yaw) * world_vx + std::sin(yaw) * world_vy;
+    measured.linear.y = -std::sin(yaw) * world_vx + std::cos(yaw) * world_vy;
+    measured.angular.z = omega;
+    const auto output = step(history[history.size() - 3], measured, dt).twist;
+    const double body_vx = deadband(output.linear.x);
+    const double body_vy = deadband(output.linear.y);
+    const double target_vx = std::cos(yaw) * body_vx - std::sin(yaw) * body_vy;
+    const double target_vy = std::sin(yaw) * body_vx + std::cos(yaw) * body_vy;
+    const double alpha = 1.0 - std::exp(-dt / 0.25);
+    const double next_vx = world_vx + alpha * (target_vx - world_vx);
+    const double next_vy = world_vy + alpha * (target_vy - world_vy);
+    x += 0.5 * (world_vx + next_vx) * dt;
+    y += 0.5 * (world_vy + next_vy) * dt;
+    world_vx = next_vx;
+    world_vy = next_vy;
+    omega = output.angular.z;
+    yaw += omega * dt;
+    history.push_back(makeRobotPoseAt(x, y, yaw));
+    max_overshoot = std::max(max_overshoot, x - 1.5);
+  }
+  EXPECT_LE(max_overshoot, 0.05);
+  EXPECT_NEAR(x, 1.5, 0.05);
+  EXPECT_NEAR(y, 0.0, 0.05);
+  EXPECT_NEAR(yaw, 0.4, 0.02);
+  EXPECT_LT(std::hypot(world_vx, world_vy), 0.01);
+  EXPECT_LT(std::abs(omega), 0.01);
+}
+
 }  // namespace
 }  // namespace pid_tracking_controller

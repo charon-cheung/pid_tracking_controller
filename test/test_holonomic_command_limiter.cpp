@@ -532,5 +532,52 @@ TEST(HolonomicCommandLimiter, rejectsNonfiniteCommandsAndInvalidExternalCaps)
       finite, finite, 0.1, std::numeric_limits<double>::infinity()));
 }
 
+TEST(HolonomicCommandLimiter, stoppingLimitCapsFeedbackBeforeSlew)
+{
+  auto config = makeConfig();
+  config.max_ax = config.max_ay = 0.2;
+  config.max_decel_x = config.max_decel_y = 0.4;
+  HolonomicCommandLimiter limiter(config);
+  limiter.seed(command(0.06, 0.08, 0.0));
+
+  const auto result = limiter.limit(
+    command(0.6, 0.8, 0.0), command(0.06, 0.08, 0.0), 0.1,
+    std::numeric_limits<double>::infinity(), 0.1);
+
+  EXPECT_LE(xySpeed(result.command), 0.1L + 1e-12L);
+  EXPECT_NEAR(result.command.vx, 0.06, 1e-12);
+  EXPECT_NEAR(result.command.vy, 0.08, 1e-12);
+}
+
+TEST(HolonomicCommandLimiter, infeasibleStopUsesBoundedBrakingInsteadOfInstantClipping)
+{
+  auto config = makeConfig();
+  config.max_ax = config.max_ay = 0.2;
+  config.max_decel_x = config.max_decel_y = 0.4;
+  for (const double sign : {1.0, -1.0}) {
+    HolonomicCommandLimiter limiter(config);
+    limiter.seed(command(sign * 0.4, 0.0, 0.0));
+    const auto result = limiter.limit(
+      command(sign * 0.5, 0.0, 0.0), command(sign * 0.4, 0.0, 0.0), 0.1,
+      std::numeric_limits<double>::infinity(), 0.1);
+    EXPECT_NEAR(result.command.vx, sign * 0.36, 1e-12);
+    EXPECT_TRUE(result.stopping_limit_unreachable);
+  }
+}
+
+TEST(HolonomicCommandLimiter, stoppingBrakeDoesNotIncreaseReverseAcceleration)
+{
+  auto config = makeConfig();
+  config.max_ax = config.max_ay = 0.2;
+  config.max_decel_x = config.max_decel_y = 0.4;
+  HolonomicCommandLimiter limiter(config);
+  limiter.seed(command(0.04, 0.0, 0.0));
+  const auto result = limiter.limit(
+    command(-0.5, 0.0, 0.0), command(0.04, 0.0, 0.0), 0.2,
+    std::numeric_limits<double>::infinity(), 0.3);
+  // 0.1 s to brake from +0.04 to zero, then 0.1 s accelerating at 0.2.
+  EXPECT_NEAR(result.command.vx, -0.02, 1e-12);
+}
+
 }  // namespace
 }  // namespace pid_tracking_controller

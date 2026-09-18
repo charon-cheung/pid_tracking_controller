@@ -33,6 +33,11 @@ struct HolonomicSpeedPlannerConfig
   double max_ay{0.5};
   double a_ref_up{0.5};
   double a_ref_down{0.5};
+  double stopping_deceleration{0.12};
+  // Total observation, control-cycle and drive response allowance, in seconds.
+  double stopping_delay{0.5};
+  // Small approach speed to cross the exact path boundary despite drive deadband.
+  double stopping_min_speed{0.02};
   double yaw_feedback_reserve{0.1};
   double configured_min_rate_window{0.3};
 };
@@ -46,6 +51,8 @@ struct HolonomicSpeedPlan
   double yaw_ff_speed_limit{std::numeric_limits<double>::infinity()};
   double tangent_speed_limit{std::numeric_limits<double>::infinity()};
   double stopping_speed_limit{std::numeric_limits<double>::infinity()};
+  double stopping_distance{0.0};
+  double stopping_delay_distance{0.0};
   double external_speed_limit{std::numeric_limits<double>::infinity()};
   double max_abs_target_yaw_rate_per_meter{0.0};
   double max_abs_path_tangent_rate_per_meter{0.0};
@@ -67,11 +74,14 @@ public:
   void setPath(PreparedPathPtr path);
   void seed(double reference_velocity);
 
+  // observed_speed is a nonnegative planar speed, conservatively including both
+  // measured motion and the last output; stopping_delay already includes pose age.
   HolonomicSpeedPlan plan(
     const HolonomicTrackingReference & reference,
     double robot_yaw,
     double dt,
-    double external_speed_limit = std::numeric_limits<double>::infinity());
+    double external_speed_limit = std::numeric_limits<double>::infinity(),
+    double observed_speed = 0.0);
 
 private:
   HolonomicSpeedPlannerConfig config_;
