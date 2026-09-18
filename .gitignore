@@ -1,0 +1,58 @@
+# ROS 2 / colcon generated directories
+/build/
+/install/
+/log/
+/build_*/
+/install_*/
+/.colcon/
+/.ros/
+
+# CMake / C++ build artifacts (including in-source builds)
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.pdb
+
+# Test and coverage output
+/Testing/
+/test_results/
+*.gcda
+*.gcno
+*.gcov
+.coverage
+.coverage.*
+/htmlcov/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.bak

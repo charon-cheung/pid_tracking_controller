@@ -10,8 +10,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 find_package(angles REQUIRED)
-find_package(eigen3_cmake_module REQUIRED)
-find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav2_core REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
@@ -45,7 +43,6 @@ add_library(${PROJECT_NAME} SHARED
   src/holonomic_control_law.cpp
   src/holonomic_speed_planner.cpp
   src/holonomic_tracking_reference.cpp
-  src/legacy_carrot_velocity_planner.cpp
   src/path_progress_tracker.cpp
   src/prepared_path.cpp
   src/rotation_completion_tracker.cpp
@@ -55,7 +52,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 ament_target_dependencies(${PROJECT_NAME} ${dependencies})
-target_link_libraries(${PROJECT_NAME} Eigen3::Eigen)
 
 pluginlib_export_plugin_description_file(
   nav2_core
@@ -91,16 +87,6 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_plugin_loading
     nav2_core
     pluginlib
-  )
-
-  ament_add_gtest(test_legacy_carrot_velocity_planner
-    test/test_legacy_carrot_velocity_planner.cpp
-  )
-  target_include_directories(test_legacy_carrot_velocity_planner PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-  )
-  target_link_libraries(test_legacy_carrot_velocity_planner
-    ${PROJECT_NAME}
   )
 
   ament_add_gtest(test_path_progress_tracker
@@ -193,23 +179,6 @@ if(BUILD_TESTING)
   target_include_directories(test_rotation_entry_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_rotation_entry_gate ${PROJECT_NAME})
 
-  ament_add_gtest(test_legacy_behavior
-    test/test_legacy_behavior.cpp
-  )
-  target_include_directories(test_legacy_behavior PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/test
-  )
-  ament_target_dependencies(test_legacy_behavior
-    geometry_msgs
-    nav2_costmap_2d
-  )
-  target_link_libraries(test_legacy_behavior
-    ${PROJECT_NAME}
-    Eigen3::Eigen
-  )
-
   ament_add_gtest(test_path_and_control
     test/test_path_and_control.cpp
   )
@@ -228,7 +197,6 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_path_and_control
     ${PROJECT_NAME}
-    Eigen3::Eigen
   )
 
   ament_add_gtest(test_lifecycle_smoke
@@ -254,7 +222,6 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_lifecycle_smoke
     ${PROJECT_NAME}
-    Eigen3::Eigen
   )
 endif()
 

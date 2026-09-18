@@ -6,35 +6,10 @@ controller_server:
 
     PidTrackingController:
       plugin: "pid_tracking_controller::PidTrackingController"
-      goal_dist_tolerance: 0.05
-      rotate_tolerance: 0.5
       base_frame: "base_link"
-      map_frame: "map"
       lookahead_time: 1.0
       min_lookahead_dist: 0.5
       max_lookahead_dist: 0.9
-      max_v: 0.6
-      min_v: 0.05
-      max_v_inc: 0.5
-      max_w: 0.8
-      min_w: 0.0
-      max_w_inc: 0.2
-      k_v_p: 2.0
-      k_v_i: 0.01
-      k_v_d: 0.10
-      k_w_p: 1.0
-      k_w_i: 0.01
-      k_w_d: 0.10
-      k_theta: 0.5
-      model_k_v: 1.7
-      model_k_w: 1.9
-      l: 0.2
-      cruise_speed: 0.6
-      angular_speed_reserve: 0.10
-      enable_start_heading_alignment: true
-      start_heading_enter_tolerance: 0.3
-      start_heading_exit_tolerance: 0.15
-      start_heading_kp: 1.0
       kp_yaw: 1.0
       kp_x: 1.0
       kp_y: 1.0
@@ -65,5 +40,3 @@ controller_server:
       rotation_settle_time: 0.30
       rotation_stop_confirm_time: 0.20  # Measured and commanded speed must stay near zero.
       rotation_braking_timeout: 8.0   # Failure to stop raises NoValidControl, never forces a turn.
-      pid_frequency: 15.0
-      use_model: true

@@ -134,13 +134,6 @@ TEST(LifecycleSmoke, publishesCarrotAndCompactActiveDiagnosticsWithoutDiagnostic
 
   {
     rclcpp::NodeOptions parent_options;
-    parent_options.append_parameter_override("PidTrackingController.max_v", 0.8);
-    parent_options.append_parameter_override("PidTrackingController.max_w", 0.8);
-    parent_options.append_parameter_override("PidTrackingController.model_k_v", 1.9);
-    parent_options.append_parameter_override("PidTrackingController.model_k_w", 2.1);
-    parent_options.append_parameter_override("PidTrackingController.cruise_speed", 0.8);
-    parent_options.append_parameter_override(
-      "PidTrackingController.enable_start_heading_alignment", false);
     auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
       "pid_tracking_controller_test_node", parent_options);
     auto observer = std::make_shared<rclcpp::Node>(
@@ -225,7 +218,6 @@ TEST(LifecycleSmoke, publishesCarrotAndCompactActiveDiagnosticsWithoutDiagnostic
     EXPECT_NE(log_capture.output().find("planner_step=true"), std::string::npos);
     EXPECT_NE(log_capture.output().find("limited_vy="), std::string::npos);
     EXPECT_EQ(log_capture.output().find("phase=TRACKING"), std::string::npos);
-    EXPECT_EQ(log_capture.output().find("start_heading_alignment=entered"), std::string::npos);
 
     if (costmap_configured) {
       controller.deactivate();

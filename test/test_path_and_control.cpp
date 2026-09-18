@@ -129,6 +129,17 @@ protected:
   PidTrackingController controller_;
 };
 
+TEST(Lookahead, lookaheadKeepsSpeedTimeClamp)
+{
+  PidTrackingController controller;
+  PidTrackingControllerTestAccess::setLookaheadParameters(
+    controller, 0.5, 0.3, 0.9);
+
+  EXPECT_DOUBLE_EQ(controller.getLookAheadDistance(0.0), 0.3);
+  EXPECT_DOUBLE_EQ(controller.getLookAheadDistance(0.8), 0.4);
+  EXPECT_DOUBLE_EQ(controller.getLookAheadDistance(3.0), 0.9);
+}
+
 TEST(PathValidation, nonFinitePathClearsOldPlanAndThrowsInvalidPath)
 {
   PidTrackingController controller;
@@ -139,7 +150,7 @@ TEST(PathValidation, nonFinitePathClearsOldPlanAndThrowsInvalidPath)
     std::numeric_limits<double>::quiet_NaN();
 
   EXPECT_THROW(controller.setPlan(invalid), nav2_core::InvalidPath);
-  EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
+  EXPECT_FALSE(PidTrackingControllerTestAccess::hasPreparedPath(controller));
 }
 
 TEST(PathValidation, emptyPathClearsOldPlanAndThrowsInvalidPath)
@@ -148,7 +159,7 @@ TEST(PathValidation, emptyPathClearsOldPlanAndThrowsInvalidPath)
   controller.setPlan(makeStraightPath({0.0, 0.3}));
 
   EXPECT_THROW(controller.setPlan(nav_msgs::msg::Path()), nav2_core::InvalidPath);
-  EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
+  EXPECT_FALSE(PidTrackingControllerTestAccess::hasPreparedPath(controller));
 }
 
 TEST(PathValidation, zeroNormQuaternionClearsOldPlanAndThrowsInvalidPath)
@@ -164,7 +175,7 @@ TEST(PathValidation, zeroNormQuaternionClearsOldPlanAndThrowsInvalidPath)
   quaternion.w = 0.0;
 
   EXPECT_THROW(controller.setPlan(invalid), nav2_core::InvalidPath);
-  EXPECT_TRUE(PidTrackingControllerTestAccess::plan(controller).empty());
+  EXPECT_FALSE(PidTrackingControllerTestAccess::hasPreparedPath(controller));
 }
 
 TEST_F(CommandContractTest, lateralOffsetCommandsTranslationWithoutYawCorrection)
