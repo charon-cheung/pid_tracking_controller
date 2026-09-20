@@ -301,6 +301,80 @@ TEST_F(CommandContractTest, externalCapAlsoScalesTheSameYawFeedforward)
   EXPECT_NEAR(command.twist.angular.z, 0.5 * command.twist.linear.x, 1e-12);
 }
 
+TEST_F(CommandContractTest, conflictingPathFramesRejectAndInvalidateOldPlan)
+{
+  auto path = makeStraightPath({0.0, 1.0});
+  path.poses.back().header.frame_id = "odom";
+  EXPECT_THROW(controller_.setPlan(path), nav2_core::InvalidPath);
+  EXPECT_THROW(step(), nav2_core::InvalidPath);
+  path.header.frame_id.clear();
+  EXPECT_THROW(controller_.setPlan(path), nav2_core::InvalidPath);
+}
+
+TEST_F(CommandContractTest, transformsPositionAndYawIntoPathFrame)
+{
+  auto tf = std::make_shared<tf2_ros::Buffer>(clock_);
+  geometry_msgs::msg::TransformStamped transform;
+  transform.header.frame_id = "map";
+  transform.child_frame_id = "odom";
+  transform.transform.translation.x = 1.0;
+  transform.transform.translation.y = 2.0;
+  transform.transform.rotation = makeRobotPose(0.5 * std::acos(-1.0)).pose.orientation;
+  ASSERT_TRUE(tf->setTransform(transform, "test", true));
+  PidTrackingControllerTestAccess::setTf(controller_, tf);
+  // R(+90 deg) * (-2, 1) + (1, 2) = (0, 0), with map yaw zero.
+  auto pose = makeRobotPoseAt(-2.0, 1.0, -0.5 * std::acos(-1.0));
+  pose.header.frame_id = "odom";
+  pose.header.stamp.sec = 1;
+  step(pose);
+  const auto command = step(pose);
+  EXPECT_EQ(command.header.frame_id, "base_link");
+  EXPECT_NEAR(command.twist.linear.x, 0.02, 1e-12);
+  EXPECT_NEAR(command.twist.linear.y, 0.0, 1e-12);
+  EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
+}
+
+TEST_F(CommandContractTest, missingPoseFrameOrTransformThrowsControllerTfError)
+{
+  auto pose = makeRobotPose();
+  pose.header.frame_id.clear();
+  EXPECT_THROW(step(pose), nav2_core::ControllerTFError);
+  pose.header.frame_id = "odom";
+  EXPECT_THROW(step(pose), nav2_core::ControllerTFError);
+  PidTrackingControllerTestAccess::setTf(
+    controller_, std::make_shared<tf2_ros::Buffer>(clock_));
+  EXPECT_THROW(step(pose), nav2_core::ControllerTFError);
+}
+
+TEST_F(CommandContractTest, taskResetReseedsFromMeasuredVelocityAndPreservesSpeedLimit)
+{
+  step();
+  step();
+  ASSERT_NEAR(step().twist.linear.x, 0.04, 1e-12);
+  controller_.setSpeedLimit(0.03, false);
+  controller_.reset();
+  controller_.setPlan(makeStraightPath({0.0, 1.0, 3.0}));
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.01;
+  measured.linear.y = -0.01;
+  measured.angular.z = 0.04;
+  const auto command = step(makeRobotPose(), measured);
+  EXPECT_NEAR(command.twist.linear.x, 0.01, 1e-12);
+  EXPECT_NEAR(command.twist.linear.y, -0.01, 1e-12);
+  EXPECT_NEAR(command.twist.angular.z, 0.04, 1e-12);
+  for (int index = 0; index < 5; ++index) {
+    const auto next = step();
+    EXPECT_LE(std::hypot(next.twist.linear.x, next.twist.linear.y), 0.03 + 1e-12);
+  }
+}
+
+TEST_F(CommandContractTest, taskResetRequiresANewPlan)
+{
+  step();
+  controller_.reset();
+  EXPECT_THROW(step(), nav2_core::InvalidPath);
+}
+
 TEST_F(CommandContractTest, sameGoalReplanChangesGeometryWithoutResettingSlew)
 {
   step();

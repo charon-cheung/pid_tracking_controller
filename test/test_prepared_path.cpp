@@ -90,6 +90,20 @@ TEST(PreparedPath, preparesTranslationGeometryAndCumulativeArcLength)
   EXPECT_NEAR(second.target_yaw_rate_per_meter, 0.25 * kPi, 1e-12);
 }
 
+TEST(PreparedPath, emptyPoseFramesInheritResolvedPathFrame)
+{
+  auto path = makePath();
+  appendPose(path, 0.0, 0.0, 0.0);
+  appendPose(path, 1.0, 0.0, 0.0);
+  path.poses.front().header.frame_id.clear();
+  path.poses.back().header.frame_id.clear();
+  EXPECT_EQ(preparePath(path)->frame_id, "map");
+  path.header.frame_id.clear();
+  EXPECT_THROW(preparePath(path), std::invalid_argument);
+  path.poses.back().header.frame_id = "odom";
+  EXPECT_EQ(preparePath(path)->frame_id, "odom");
+}
+
 TEST(PreparedPath, usesShortestYawDeltaAcrossPi)
 {
   auto path = makePath();

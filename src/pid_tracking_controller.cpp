@@ -326,6 +326,18 @@ void PidTrackingController::cleanup()
     clock_.reset();
 }
 
+void PidTrackingController::reset()
+{
+    // The next task seeds the planner and limiter from measured velocity.
+    control_time_valid_ = false;
+    last_commanded_planar_speed_ = 0.0;
+    resetRotationState();
+    last_rotation_braking_ = false;
+    last_holonomic_mode_ = -1;
+    prepared_path_.reset();
+    force_diagnostics_log_ = true;
+}
+
 // Every accepted path replaces tracker/planner geometry while retaining command continuity.
 void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
@@ -525,6 +537,24 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         if (!clock_ || !costmap_) {
             throw std::logic_error("controller is not configured for control");
         }
+        if (pose.header.frame_id.empty()) {
+            throw nav2_core::ControllerTFError("received pose with empty frame_id");
+        }
+        auto tracking_pose = pose;
+        if (pose.header.frame_id != prepared_path_->frame_id) {
+            if (!tf_) {
+                throw nav2_core::ControllerTFError("controller has no TF buffer");
+            }
+            try {
+                // Use the pose timestamp without waiting inside the control loop.
+                tf_->transform(pose, tracking_pose, prepared_path_->frame_id,
+                        tf2::durationFromSec(0.0));
+            } catch (const tf2::TransformException & exception) {
+                throw nav2_core::ControllerTFError(
+                        "failed to transform robot pose from " + pose.header.frame_id +
+                        " to " + prepared_path_->frame_id + ": " + exception.what());
+            }
+        }
         const auto now = clock_->now();
         // Temporary TRA-3 observation probe: remove after validating live pose stamps.
         RCLCPP_INFO(logger_,
@@ -537,8 +567,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 velocity.linear.x, velocity.linear.y, velocity.angular.z);
         const double lookahead = getLookAheadDistance(
                 std::hypot(velocity.linear.x, velocity.linear.y));
-        const auto progress = path_progress_tracker_->update(pose.pose.position, lookahead);
-        auto command = computeHolonomicCommand(pose, velocity, progress, lookahead, now);
+        const auto progress = path_progress_tracker_->update(tracking_pose.pose.position, lookahead);
+        auto command = computeHolonomicCommand(tracking_pose, velocity, progress, lookahead, now);
         geometry_msgs::msg::PointStamped carrot;
         carrot.header.frame_id = progress.frame_id;
         carrot.header.stamp = now;
@@ -556,6 +586,10 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         }
         return command;
     } catch (const nav2_core::InvalidPath &) {
+        control_time_valid_ = false;
+        resetRotationState();
+        throw;
+    } catch (const nav2_core::ControllerTFError &) {
         control_time_valid_ = false;
         resetRotationState();
         throw;

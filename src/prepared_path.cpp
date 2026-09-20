@@ -16,6 +16,25 @@ constexpr double kSamePositionTolerance = 1e-4;
 constexpr double kSameYawTolerance = 1e-6;
 constexpr double kQuaternionNormEpsilon = 1e-12;
 
+std::string resolvePathFrame(const nav_msgs::msg::Path & path)
+{
+  std::string frame = path.header.frame_id;
+  for (const auto & pose : path.poses) {
+    if (pose.header.frame_id.empty()) {
+      continue;
+    }
+    if (frame.empty()) {
+      frame = pose.header.frame_id;
+    } else if (pose.header.frame_id != frame) {
+      throw std::invalid_argument("path poses must use a consistent frame");
+    }
+  }
+  if (frame.empty()) {
+    throw std::invalid_argument("path frame_id must not be empty");
+  }
+  return frame;
+}
+
 bool positionIsFinite(const geometry_msgs::msg::Point & position)
 {
   return std::isfinite(position.x) && std::isfinite(position.y) &&
@@ -64,7 +83,7 @@ PreparedPathPtr preparePath(const nav_msgs::msg::Path & path)
   }
 
   auto prepared = std::make_shared<PreparedPath>();
-  prepared->frame_id = path.header.frame_id;
+  prepared->frame_id = resolvePathFrame(path);
   prepared->poses = path.poses;
 
   std::vector<double> target_yaws;
@@ -74,9 +93,6 @@ PreparedPathPtr preparePath(const nav_msgs::msg::Path & path)
       throw std::invalid_argument("path positions must be finite");
     }
     target_yaws.push_back(normalizeQuaternion(pose.pose.orientation));
-    if (prepared->frame_id.empty() && !pose.header.frame_id.empty()) {
-      prepared->frame_id = pose.header.frame_id;
-    }
   }
 
   prepared->segments.reserve(prepared->poses.size() - 1u);

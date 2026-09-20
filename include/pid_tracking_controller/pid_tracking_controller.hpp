@@ -48,6 +48,7 @@ public:
   void activate() override;
   void deactivate() override;
   void cleanup() override;
+  void reset() override;
 
   void setPlan(const nav_msgs::msg::Path & path) override;
 

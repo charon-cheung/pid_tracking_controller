@@ -49,6 +49,12 @@ public:
     controller.clock_ = clock;
   }
 
+  static void setTf(
+    PidTrackingController & controller, const std::shared_ptr<tf2_ros::Buffer> & tf)
+  {
+    controller.tf_ = tf;
+  }
+
   static bool hasPreparedPath(const PidTrackingController & controller)
   {
     return static_cast<bool>(controller.prepared_path_);
