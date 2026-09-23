@@ -7,6 +7,7 @@
 #include "gtest/gtest.h"
 
 #include "path_progress_tracker.hpp"
+#include "holonomic_tracking_reference.hpp"
 #include "prepared_path.hpp"
 
 namespace pid_tracking_controller
@@ -502,6 +503,234 @@ TEST(PathProgressTracker, acknowledgementPreservesPositionAndAcceptedTangentHist
   EXPECT_EQ(after.cursor.segment_index, 2u);
   EXPECT_DOUBLE_EQ(after.progress_arc_length, before.progress_arc_length);
   EXPECT_NEAR(after.progress_budget, before.progress_budget + 0.20, 1e-12);
+}
+
+TEST(PathProgressTracker, handoffAnchorsDelayedDensePlanWithoutSpendingMotionBudget)
+{
+  for (const double spacing : {0.01, 0.05, 0.20}) {
+    SCOPED_TRACE(spacing);
+    auto path = makePath({{3.5, 0.0}, {3.5, 0.0}});
+    setYaw(path.poses.front(), 0.2);
+    for (int i = 1; i <= static_cast<int>(std::lround(3.0 / spacing)); ++i) {
+      auto pose = path.poses.back();
+      pose.pose.position.x = 3.5 - i * spacing;
+      path.poses.push_back(pose);
+    }
+    const auto prepared = preparePath(path);
+    PathProgressTracker tracker;
+    tracker.setPath(prepared);
+    const auto handoff = tracker.initializePathHandoff(makePoint(1.925, -0.02), 0.3);
+    EXPECT_NEAR(handoff.progress_arc_length, 1.575, 1e-10);
+    EXPECT_NEAR(handoff.projection.x, 1.925, 1e-10);
+    EXPECT_NEAR(handoff.projection.y, 0.0, 1e-10);
+    EXPECT_NEAR(handoff.progress_budget, 2.0 * spacing, 1e-10);
+    EXPECT_EQ(buildHolonomicTrackingReference(*prepared, handoff, 0.3).mode,
+      HolonomicReferenceMode::kTranslation);
+    EXPECT_THROW(tracker.acknowledgeRotationComplete(0u), std::logic_error);
+
+    const auto forward = tracker.update(makePoint(1.855, -0.02), 0.3);
+    EXPECT_NEAR(forward.progress_arc_length, 1.645, 1e-10);
+    EXPECT_NEAR(forward.progress_budget, 2.0 * spacing, 1e-10);
+    for (int i = 0; i < 8; ++i) {
+      const auto lateral = tracker.update(makePoint(1.855, i % 2 ? 0.01 : -0.03), 0.3);
+      EXPECT_NEAR(lateral.progress_arc_length, 1.645, 1e-10);
+    }
+    EXPECT_NEAR(tracker.update(makePoint(1.90, 0.0), 0.3).progress_arc_length, 1.645, 1e-10);
+  }
+}
+
+TEST(PathProgressTracker, handoffUsesOnlyTheNewRevisionsArcAndMotionHistory)
+{
+  PathProgressTracker tracker;
+  for (const double start : {4.0, 2.0, 3.0, 1.0}) {
+    auto path = makePath({{start, 0.0}, {0.0, 0.0}});
+    setPreparedPath(tracker, path);
+    const auto handoff = tracker.initializePathHandoff(makePoint(0.5, 0.0), 0.1);
+    EXPECT_NEAR(handoff.progress_arc_length, start - 0.5, 1e-12);
+    EXPECT_NEAR(handoff.projection.x, 0.5, 1e-12);
+    EXPECT_NEAR(tracker.update(makePoint(0.4, 0.0), 0.1).progress_arc_length,
+      start - 0.4, 1e-12);
+  }
+}
+
+TEST(PathProgressTracker, handoffSkipsOnlyRotationsStrictlyBeforeItsBoundary)
+{
+  auto path = makePath({{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}, {1.0, 0.0},
+      {1.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {2.0, 0.0}});
+  const double yaws[] = {0.0, 0.3, 0.6, 0.6, 1.0, 1.3, 1.3, 0.0};
+  for (std::size_t i = 0; i < path.poses.size(); ++i) {
+    setYaw(path.poses[i], yaws[i]);
+  }
+  const auto prepared = preparePath(path);
+  struct Case {double x; int pending_rotation;};
+  for (const auto & test : {Case{0.0, 0}, Case{0.5, -1}, Case{1.0 - 1e-8, -1},
+      Case{1.0, 3}, Case{1.0 + 5e-11, 3}, Case{1.0 + 1e-8, -1}, Case{1.5, -1},
+      Case{2.0, 6}})
+  {
+    SCOPED_TRACE(test.x);
+    PathProgressTracker tracker;
+    tracker.setPath(prepared);
+    const auto handoff = tracker.initializePathHandoff(makePoint(test.x, 0.0), 0.3);
+    const auto reference = buildHolonomicTrackingReference(*prepared, handoff, 0.3);
+    EXPECT_NEAR(handoff.progress_arc_length, test.x, 1e-10);
+    if (test.pending_rotation >= 0) {
+      EXPECT_EQ(reference.mode, HolonomicReferenceMode::kRotationPending);
+      ASSERT_TRUE(reference.pending_rotation_segment_index);
+      EXPECT_EQ(*reference.pending_rotation_segment_index,
+        static_cast<std::size_t>(test.pending_rotation));
+      tracker.acknowledgeRotationComplete(*reference.pending_rotation_segment_index);
+      const auto after = tracker.update(makePoint(test.x, 0.0), 0.3);
+      EXPECT_NE(buildHolonomicTrackingReference(*prepared, after, 0.3).mode,
+        HolonomicReferenceMode::kRotationPending);
+    } else {
+      EXPECT_EQ(reference.mode, HolonomicReferenceMode::kTranslation);
+    }
+  }
+}
+
+TEST(PathProgressTracker, handoffSelectsClearlyNearestBranchDespiteRemoteAlternatives)
+{
+  for (const bool reverse_order : {false, true}) {
+    const auto path = reverse_order ?
+      makePath({{0.0, 0.47}, {2.0, 0.47}, {2.0, 0.0}, {0.0, 0.0}}) :
+      makePath({{0.0, 0.0}, {2.0, 0.0}, {2.0, 0.47}, {0.0, 0.47}});
+    PathProgressTracker tracker;
+    setPreparedPath(tracker, path);
+    // Distances are 0.02 m and 0.45 m: a second branch is not itself ambiguity.
+    const auto handoff = tracker.initializePathHandoff(makePoint(0.4, 0.02), 0.1);
+    EXPECT_NEAR(handoff.projection.x, 0.4, 1e-12);
+    EXPECT_NEAR(handoff.projection.y, 0.0, 1e-12);
+    EXPECT_NEAR(handoff.progress_arc_length, reverse_order ? 4.07 : 0.4, 1e-12);
+  }
+
+  // Dense sampling and a nearby return leg must not reject a clear nearest leg.
+  for (const double y : {0.02, 0.08}) {
+    PathProgressTracker tracker;
+    setPreparedPath(tracker, makeDenseHairpinPath());
+    const auto handoff = tracker.initializePathHandoff(makePoint(0.4, y), 0.1);
+    EXPECT_NEAR(handoff.progress_arc_length, y < 0.05 ? 0.4 : 1.7, 1e-12);
+  }
+}
+
+TEST(PathProgressTracker, handoffRejectsCrossingsReversalsAndNearlyEquidistantBranches)
+{
+  const auto crossing = makePath({{-1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}, {1.0, -1.0}});
+  const auto reversal = makePath({{0.0, 0.0}, {2.0, 0.0}, {0.0, 0.0}});
+  const auto parallel = makePath({{0.0, 0.0}, {2.0, 0.0}, {2.0, 1.0},
+      {-1.0, 1.0}, {-1.0, 0.1}, {2.0, 0.1}});
+  for (const auto & path : {crossing, reversal, makeDenseHairpinPath(), parallel}) {
+    PathProgressTracker tracker;
+    setPreparedPath(tracker, path);
+    const auto point = path.poses.front().pose.position.x < 0.0 ?
+      makePoint(0.0, 0.0) : makePoint(0.4, 0.049);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      EXPECT_THROW(tracker.initializePathHandoff(point, 0.1), std::domain_error);
+    }
+  }
+
+  // A numerical nearest point is insufficient when distinct branches differ by 3 mm.
+  PathProgressTracker tracker;
+  setPreparedPath(tracker,
+    makePath({{0.0, 0.0}, {2.0, 0.0}, {2.0, 0.045}, {0.0, 0.045}}));
+  EXPECT_THROW(tracker.initializePathHandoff(makePoint(0.4, 0.021), 0.1), std::domain_error);
+  // An exact match must not mask a different, almost overlapping return leg.
+  setPreparedPath(tracker,
+    makePath({{0.0, 0.0}, {2.0, 0.0}, {2.0, 0.005}, {0.0, 0.005}}));
+  EXPECT_THROW(tracker.initializePathHandoff(makePoint(0.4, 0.0), 0.1), std::domain_error);
+}
+
+TEST(PathProgressTracker, nearestHandoffKeepsRotationBoundaryAndSkipsOnlyPassedPrefix)
+{
+  auto path = makePath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 0.0},
+      {2.0, 0.0}, {2.0, 0.47}, {0.0, 0.47}});
+  for (std::size_t i = 2; i < path.poses.size(); ++i) {
+    setYaw(path.poses[i], 0.5);
+  }
+  const auto prepared = preparePath(path);
+  for (const double x : {1.0, 1.1}) {
+    PathProgressTracker tracker;
+    tracker.setPath(prepared);
+    const auto handoff = tracker.initializePathHandoff(makePoint(x, 0.02), 0.1);
+    EXPECT_NEAR(handoff.progress_arc_length, x, 1e-12);
+    EXPECT_NEAR(handoff.projection.y, 0.0, 1e-12);
+    const auto reference = buildHolonomicTrackingReference(*prepared, handoff, 0.1);
+    if (x == 1.0) {
+      EXPECT_EQ(reference.mode, HolonomicReferenceMode::kRotationPending);
+      ASSERT_TRUE(reference.pending_rotation_segment_index);
+      EXPECT_EQ(*reference.pending_rotation_segment_index, 1u);
+    } else {
+      EXPECT_EQ(reference.mode, HolonomicReferenceMode::kTranslation);
+      EXPECT_THROW(tracker.acknowledgeRotationComplete(1u), std::logic_error);
+    }
+  }
+}
+
+TEST(PathProgressTracker, handoffFailureDoesNotCommitAndAcceptedBranchKeepsNormalProtection)
+{
+  PathProgressTracker tracker;
+  setPreparedPath(tracker, makeDenseHairpinPath());
+  EXPECT_THROW(tracker.initializePathHandoff(makePoint(0.4, 0.049), 0.1), std::domain_error);
+  EXPECT_THROW(tracker.initializePathHandoff(makePoint(0.4, 0.0), -0.1), std::domain_error);
+  auto invalid = makePoint(0.4, 0.0);
+  invalid.x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_THROW(tracker.initializePathHandoff(invalid, 0.1), std::domain_error);
+  const auto handoff = tracker.initializePathHandoff(makePoint(0.4, 0.0), 0.1);
+  EXPECT_NEAR(handoff.progress_arc_length, 0.4, 1e-12);
+  for (int i = 0; i < 10; ++i) {
+    const auto nearby = tracker.update(makePoint(0.4, 0.08), 0.1);
+    EXPECT_NEAR(nearby.projection.y, 0.0, 1e-12);
+    EXPECT_NEAR(nearby.progress_arc_length, 0.4, 1e-12);
+  }
+  EXPECT_THROW(tracker.initializePathHandoff(makePoint(0.4, 0.1), 0.1), std::logic_error);
+}
+
+TEST(PathProgressTracker, handoffTreatsOneBendAsOneBranchAndOwnsSharedTranslationEndpoint)
+{
+  for (const double spacing : {0.05, 1.0}) {
+    auto path = makePath({{0.0, 0.0}});
+    for (int i = 1; i <= static_cast<int>(std::lround(1.0 / spacing)); ++i) {
+      auto pose = path.poses.back();
+      pose.pose.position.x = i * spacing;
+      path.poses.push_back(pose);
+    }
+    for (int i = 1; i <= static_cast<int>(std::lround(1.0 / spacing)); ++i) {
+      auto pose = path.poses.back();
+      pose.pose.position.y = i * spacing;
+      path.poses.push_back(pose);
+    }
+    PathProgressTracker tracker;
+    setPreparedPath(tracker, path);
+    const auto incoming = tracker.initializePathHandoff(makePoint(0.8, 0.1), 0.1);
+    EXPECT_NEAR(incoming.progress_arc_length, 0.8, 1e-10);
+    EXPECT_NEAR(incoming.projection.y, 0.0, 1e-10);
+    setPreparedPath(tracker, path);
+    const auto outgoing = tracker.initializePathHandoff(makePoint(0.9, 0.2), 0.1);
+    EXPECT_NEAR(outgoing.progress_arc_length, 1.2, 1e-10);
+    EXPECT_NEAR(outgoing.projection.x, 1.0, 1e-10);
+    setPreparedPath(tracker, path);
+    const auto boundary = tracker.initializePathHandoff(makePoint(1.0, 0.0), 0.1);
+    EXPECT_NEAR(boundary.cursor.segment_fraction, 0.0, 1e-10);
+    EXPECT_NEAR(tracker.update(makePoint(1.0, 0.05), 0.1).progress_arc_length, 1.05, 1e-10);
+  }
+}
+
+TEST(PathProgressTracker, handoffPreservesSinglePoseAndRotationOnlyPaths)
+{
+  for (const bool rotation : {false, true}) {
+    auto path = makePath({{1.0, 2.0}});
+    if (rotation) {
+      path.poses.push_back(path.poses.back());
+      setYaw(path.poses.back(), 0.5);
+    }
+    const auto prepared = preparePath(path);
+    PathProgressTracker tracker;
+    tracker.setPath(prepared);
+    const auto handoff = tracker.initializePathHandoff(makePoint(1.01, 1.98), 0.1);
+    EXPECT_EQ(buildHolonomicTrackingReference(*prepared, handoff, 0.1).mode,
+      rotation ? HolonomicReferenceMode::kRotationPending : HolonomicReferenceMode::kTerminal);
+    EXPECT_NEAR(handoff.projection.x, 1.0, 1e-12);
+    EXPECT_NEAR(handoff.projection.y, 2.0, 1e-12);
+  }
 }
 
 }  // namespace

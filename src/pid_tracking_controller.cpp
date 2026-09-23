@@ -139,6 +139,7 @@ void PidTrackingController::configure(
     controller_plugin_name = std::move(name);
     control_time_valid_ = false;
     prepared_path_.reset();
+    progress_handoff_pending_ = false;
     holonomic_speed_planner_.reset();
     holonomic_command_limiter_.reset();
     resetRotationState();
@@ -320,6 +321,7 @@ void PidTrackingController::cleanup()
     resetRotationState();
     carrot_pub_.reset();
     prepared_path_.reset();
+    progress_handoff_pending_ = false;
     costmap_ = nullptr;
     costmap_ros_.reset();
     tf_.reset();
@@ -335,6 +337,7 @@ void PidTrackingController::reset()
     last_rotation_braking_ = false;
     last_holonomic_mode_ = -1;
     prepared_path_.reset();
+    progress_handoff_pending_ = false;
     force_diagnostics_log_ = true;
 }
 
@@ -345,6 +348,8 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
     resetRotationState(true);
     force_diagnostics_log_ = true;
     prepared_path_.reset();
+    progress_handoff_pending_ = false;
+    progress_handoff_failure_logged_ = false;
     if (orig_global_plan.poses.empty() || !pathIsFinite(orig_global_plan))
     {
         control_time_valid_ = false;
@@ -367,6 +372,7 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
                 controller_plugin_name + " received an invalid path: " + exception.what());
     }
     ++plan_revision_;
+    progress_handoff_pending_ = true;
 }
 
 /**
@@ -567,6 +573,39 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 velocity.linear.x, velocity.linear.y, velocity.angular.z);
         const double lookahead = getLookAheadDistance(
                 std::hypot(velocity.linear.x, velocity.linear.y));
+        if (progress_handoff_pending_) {
+            PathProgressReference handoff;
+            try {
+                handoff = path_progress_tracker_->initializePathHandoff(
+                        tracking_pose.pose.position, lookahead);
+            } catch (const std::exception & exception) {
+                if (!progress_handoff_failure_logged_) {
+                    RCLCPP_WARN(logger_,
+                            "PID_LOG path_handoff_rejected plan_revision=%zu frame=%s "
+                            "robot_x=%.6f robot_y=%.6f reason=%s",
+                            plan_revision_, prepared_path_->frame_id.c_str(),
+                            tracking_pose.pose.position.x, tracking_pose.pose.position.y,
+                            exception.what());
+                    progress_handoff_failure_logged_ = true;
+                }
+                throw;
+            }
+            progress_handoff_pending_ = false;
+            const auto skipped_rotations = std::count_if(prepared_path_->segments.begin(),
+                    prepared_path_->segments.begin() + handoff.prepared_segment_lower_bound,
+                    [](const auto & segment) { return segment.type == PathSegmentType::kRotation; });
+            RCLCPP_INFO(logger_,
+                    "PID_LOG path_handoff plan_revision=%zu frame=%s robot_x=%.6f robot_y=%.6f "
+                    "segment=%zu source_index=%zu fraction=%.6f projection_x=%.6f projection_y=%.6f "
+                    "accepted_s=%.6f projection_distance=%.6f lower_bound=%zu skipped_rotations=%zu",
+                    plan_revision_, handoff.frame_id.c_str(), tracking_pose.pose.position.x,
+                    tracking_pose.pose.position.y, handoff.cursor.segment_index, handoff.segment_index,
+                    handoff.cursor.segment_fraction, handoff.projection.x, handoff.projection.y,
+                    handoff.progress_arc_length,
+                    std::hypot(tracking_pose.pose.position.x - handoff.projection.x,
+                    tracking_pose.pose.position.y - handoff.projection.y),
+                    handoff.prepared_segment_lower_bound, static_cast<std::size_t>(skipped_rotations));
+        }
         const auto progress = path_progress_tracker_->update(tracking_pose.pose.position, lookahead);
         auto command = computeHolonomicCommand(tracking_pose, velocity, progress, lookahead, now);
         geometry_msgs::msg::PointStamped carrot;

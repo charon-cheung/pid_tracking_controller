@@ -388,6 +388,65 @@ TEST_F(CommandContractTest, sameGoalReplanChangesGeometryWithoutResettingSlew)
   EXPECT_NEAR(command.twist.angular.z, 0.1 * command.twist.linear.x, 1e-12);
 }
 
+TEST_F(CommandContractTest, staleReplanPrefixNeverPullsRobotBack)
+{
+  for (const bool initial_rotation : {false, true}) {
+    SCOPED_TRACE(initial_rotation);
+    controller_.reset();
+    controller_.setPlan(makeStraightPath({4.0, 2.0, 0.5}));
+    geometry_msgs::msg::Twist measured;
+    measured.linear.x = -0.15;
+    step(makeRobotPoseAt(3.5, 0.0), measured);
+    step(makeRobotPoseAt(2.05, 0.0), measured);
+
+    auto path = makeStraightPath({3.5});
+    if (initial_rotation) {
+      path.poses.front().pose.orientation = makeRobotPose(0.2).pose.orientation;
+      path.poses.push_back(makeRobotPoseAt(3.5, 0.0));
+    }
+    for (int i = 1; i <= 60; ++i) {
+      path.poses.push_back(makeRobotPoseAt(3.5 - 0.05 * i, 0.0));
+    }
+    auto tf = std::make_shared<tf2_ros::Buffer>(clock_);
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = "map";
+    transform.child_frame_id = "odom";
+    transform.transform.translation.x = 1.0;
+    transform.transform.rotation.w = 1.0;
+    ASSERT_TRUE(tf->setTransform(transform, "test", true));
+    PidTrackingControllerTestAccess::setTf(controller_, tf);
+    controller_.setPlan(path);
+    // The first control pose is newer than both the planning and last control poses.
+    for (int i = 0; i < 30; ++i) {
+      if (i > 0 && i % 5 == 0) {
+        controller_.setPlan(path);
+      }
+      auto pose = makeRobotPoseAt(0.925 - 0.01 * i, 0.0);
+      pose.header.frame_id = "odom";
+      const auto command = step(pose, measured);
+      EXPECT_LT(command.twist.linear.x, 0.0);
+      EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
+      measured = command.twist;
+    }
+  }
+}
+
+TEST_F(CommandContractTest, ambiguousHandoffNeverFallsBackToTrackingAndCanRetry)
+{
+  step();
+  controller_.setPlan(makeDenseHairpinPath());
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_THROW(step(makeRobotPoseAt(0.4, 0.049)), nav2_core::NoValidControl);
+  }
+  // A valid observation retries the same revision, rather than tracking from s=0.
+  EXPECT_NO_THROW(step(makeRobotPoseAt(0.4, 0.02)));
+  EXPECT_GT(step(makeRobotPoseAt(0.4, 0.02)).twist.linear.x, 0.0);
+  // Once initialized, normal budget protection owns later observations.
+  const auto nearby = step(makeRobotPoseAt(0.4, 0.08));
+  EXPECT_GT(nearby.twist.linear.x, 0.0);
+  EXPECT_LT(nearby.twist.linear.y, 0.0);
+}
+
 TEST_F(CommandContractTest, zeroReferenceDoesNotUsePreviewAsPositionFeedback)
 {
   speed_.nominal_tracking_speed = 0.0;

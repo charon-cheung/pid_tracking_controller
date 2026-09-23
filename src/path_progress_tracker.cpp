@@ -215,6 +215,143 @@ void PathProgressTracker::setPath(PreparedPathPtr path)
   previous_accepted_tangent_valid_ = false;
 }
 
+PathProgressReference PathProgressTracker::initializePathHandoff(
+  const geometry_msgs::msg::Point & robot_position,
+  double lookahead_distance)
+{
+  if (!hasPath() || previous_robot_position_valid_) {
+    throw std::logic_error("path handoff requires a new, unobserved path");
+  }
+  if (!pointIsFinite(robot_position) || !std::isfinite(lookahead_distance) ||
+    lookahead_distance < 0.0)
+  {
+    throw std::domain_error("path handoff inputs must be finite");
+  }
+
+  struct Candidate
+  {
+    std::size_t index;
+    double fraction;
+    double arc;
+    double distance;
+    double accumulated_turn;
+    std::size_t preceding_rotations;
+  };
+  std::vector<Candidate> projections;
+  projections.reserve(path_->segments.size());
+  double accumulated_turn = 0.0;
+  double previous_tangent = 0.0;
+  std::size_t preceding_rotations = 0u;
+  for (std::size_t index = 0; index < path_->segments.size(); ++index) {
+    const auto & segment = path_->segments[index];
+    if (segment.type != PathSegmentType::kTranslation) {
+      ++preceding_rotations;
+      continue;
+    }
+    if (!projections.empty()) {
+      const double turn = segment.path_tangent - previous_tangent;
+      accumulated_turn += std::abs(std::atan2(std::sin(turn), std::cos(turn)));
+    }
+    previous_tangent = segment.path_tangent;
+    const auto & start = path_->poses[segment.start_pose_index].pose.position;
+    const auto & end = path_->poses[segment.end_pose_index].pose.position;
+    const double dx = end.x - start.x;
+    const double dy = end.y - start.y;
+    const double along = (robot_position.x - start.x) * (dx / segment.translation_length) +
+      (robot_position.y - start.y) * (dy / segment.translation_length);
+    if (!std::isfinite(along)) {
+      throw std::domain_error("non-finite path handoff projection");
+    }
+    const double fraction = std::clamp(along / segment.translation_length, 0.0, 1.0);
+    const double distance = std::hypot(
+      robot_position.x - (start.x + fraction * dx),
+      robot_position.y - (start.y + fraction * dy));
+    if (!std::isfinite(distance)) {
+      throw std::domain_error("non-finite path handoff distance");
+    }
+    projections.push_back({
+      index, fraction, segment.translation_s_begin + fraction * segment.translation_length,
+      distance, accumulated_turn, preceding_rotations});
+  }
+
+  // A clamped endpoint is a local minimum only if neither adjacent translation
+  // offers a descent away from it. Dense samples of one branch are not alternatives.
+  std::vector<Candidate> candidates;
+  double last_minimum_arc = -1.0;
+  double bend_begin_turn = 0.0;
+  std::size_t bend_preceding_rotations = 0u;
+  constexpr double kRightAngle = 1.5707963267948966;
+  for (std::size_t i = 0; i < projections.size(); ++i) {
+    const auto & candidate = projections[i];
+    if ((candidate.fraction <= kGeometryEpsilon && i > 0u &&
+      projections[i - 1u].fraction < 1.0 - kGeometryEpsilon) ||
+      (candidate.fraction >= 1.0 - kGeometryEpsilon && i + 1u < projections.size() &&
+      projections[i + 1u].fraction > kGeometryEpsilon))
+    {
+      continue;
+    }
+    // Incoming/outgoing sides of a shared vertex (including a rotation run)
+    // represent one handoff boundary. Keep its incoming ownership.
+    if (std::abs(last_minimum_arc - candidate.arc) <= kRotationBoundaryArcTolerance)
+    {
+      continue;
+    }
+    last_minimum_arc = candidate.arc;
+    // Minima on the two arms of one simple bend are one branch. A cumulative
+    // turn <= 90 degrees confines all tangents to a forward directional cone;
+    // it cannot fold back. Anchor at the FIRST minimum, not the selected nearest
+    // one, so successive small turns cannot merge a hairpin or a loop.
+    if (candidates.empty() || candidate.preceding_rotations != bend_preceding_rotations ||
+      candidate.accumulated_turn - bend_begin_turn > kRightAngle + kGeometryEpsilon)
+    {
+      candidates.push_back(candidate);
+      bend_begin_turn = candidate.accumulated_turn;
+      bend_preceding_rotations = candidate.preceding_rotations;
+    } else if (candidate.distance < candidates.back().distance) {
+      candidates.back() = candidate;
+    }
+  }
+
+  const auto selected = std::min_element(candidates.begin(), candidates.end(),
+    [](const Candidate & first, const Candidate & second) {
+      return first.distance < second.distance;
+    });
+  // Only near-equal distances on distinct branches are ambiguous. This 1 cm
+  // distance difference is not a capture radius or a path-prefix skip distance.
+  // Even an exact on-path match must not hide a nearly overlapping return leg.
+  constexpr double kHandoffDistanceTieTolerance = 0.01;
+  for (auto candidate = candidates.begin(); candidate != candidates.end(); ++candidate) {
+    if (candidate != selected &&
+      candidate->distance <= selected->distance + kHandoffDistanceTieTolerance)
+    {
+      throw std::domain_error("ambiguous path handoff: nearly equidistant path branches");
+    }
+  }
+
+  // Validate the complete reference on a copy before committing any initialization.
+  // Initial anchoring does not spend the new revision's normal motion reserve.
+  auto initialized = *this;
+  if (selected != candidates.end()) {
+    initialized.progress_arc_length_ = selected->arc;
+    initialized.prepared_segment_lower_bound_ = selected->index;
+    for (std::size_t index = 0; index < selected->index; ++index) {
+      const auto & segment = path_->segments[index];
+      if (segment.type == PathSegmentType::kRotation &&
+        selected->arc <= segment.translation_s_begin + kRotationBoundaryArcTolerance)
+      {
+        // A zero-length rotation run at this boundary is still pending, even
+        // when projection selected the outgoing translation's start.
+        initialized.prepared_segment_lower_bound_ = index;
+        initialized.progress_arc_length_ = segment.translation_s_begin;
+        break;
+      }
+    }
+  }
+  auto reference = initialized.update(robot_position, lookahead_distance);
+  *this = std::move(initialized);
+  return reference;
+}
+
 PathProgressReference PathProgressTracker::update(
   const geometry_msgs::msg::Point & robot_position,
   double lookahead_distance)

@@ -103,6 +103,8 @@ private:
 
   std::shared_ptr<const PreparedPath> prepared_path_;
   std::unique_ptr<PathProgressTracker> path_progress_tracker_;
+  bool progress_handoff_pending_{false};
+  bool progress_handoff_failure_logged_{false};
   std::string controller_plugin_name;
 
   std::size_t plan_revision_{0};

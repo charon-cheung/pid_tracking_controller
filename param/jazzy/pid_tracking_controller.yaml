@@ -18,13 +18,13 @@ controller_server:
       max_vy: 0.40
       max_xy_speed: 0.80
       max_omega: 0.60
-      max_ax: 0.20
-      max_ay: 0.20
+      max_ax: 0.80
+      max_ay: 0.80
       max_alpha: 0.50
-      a_ref_up: 0.20
-      a_ref_down: 0.20
+      a_ref_up: 0.80
+      a_ref_down: 0.40
       # Plan conservatively; keep normal acceleration and command braking separate.
-      stopping_deceleration: 0.12
+      stopping_deceleration: 0.40
       # Total pose/odometry age, control-cycle and drive-response budget (seconds).
       stopping_delay: 0.50
       # Reach the exact segment boundary at low speed instead of stalling before rotation.

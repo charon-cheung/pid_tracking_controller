@@ -35,6 +35,13 @@ class PathProgressTracker
 public:
   void setPath(PreparedPathPtr path);
 
+  // Call once after setPath, using a current position in the new path's frame.
+  // Selects the nearest branch; near-equal alternatives on distinct branches
+  // are rejected. Failure leaves all tracker state unchanged.
+  PathProgressReference initializePathHandoff(
+    const geometry_msgs::msg::Point & robot_position,
+    double lookahead_distance);
+
   PathProgressReference update(
     const geometry_msgs::msg::Point & robot_position,
     double lookahead_distance);
