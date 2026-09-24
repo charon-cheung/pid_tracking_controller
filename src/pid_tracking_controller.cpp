@@ -499,70 +499,74 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         previous_candidate != rotation_ack_candidate_ ||
         now_seconds - last_diagnostics_log_time_seconds_ >= 1.0) {
         RCLCPP_INFO(logger_,
-                "PID_LOG holonomic plan_revision=%zu mode=%s planner_step=%s "
-                "reference_target=%.6f reference_effective=%.6f limit_reason=%s external_limit=%.6f "
-                "raw_vx=%.6f raw_vy=%.6f raw_omega=%.6f limited_vx=%.6f limited_vy=%.6f "
-                "limited_omega=%.6f translation_lambda=%.6f reseed=%s control_gap=%s "
-                "rotation_index=%s rotation_phase=%s stop_confirmed=%.6f "
-                "rotation_settled=%.6f ack_candidate=%s "
-                "stop_distance=%.6f stop_delay_distance=%.6f stop_speed_limit=%.6f "
-                "stop_limit_unreachable=%s",
-                plan_revision_, holonomicReferenceModeName(reference.mode), reseed ? "false" : "true",
-                reseed ? std::numeric_limits<double>::quiet_NaN() : speed_plan.reference_velocity_target,
-                speed_plan.reference_velocity,
-                reseed ? "not_planned" : holonomicLimitReasonName(speed_plan.speed_limit_reason), cap,
-                raw.vx, raw.vy, raw.omega, limited.command.vx, limited.command.vy, limited.command.omega,
-                limited.translation_lambda, reseed_reason, gap ? "true" : "false",
-                rotating ? std::to_string(pending_rotation_segment_index_).c_str() : "none",
-                rotating ? (braking ? "braking" : "rotating") : "none",
-                rotation_entry_gate_->stoppedDuration(),
-                completion.settled_duration, rotation_ack_candidate_ ? "true" : "false",
-                speed_plan.stopping_distance, speed_plan.stopping_delay_distance,
-                speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false");
-        // Keep progress and control-law evidence in the same diagnostic cycle.
-        const auto & goal = prepared_path_->poses.back().pose;
-        const auto segment_index = progress.cursor.segment_index;
-        const auto * segment = segment_index < prepared_path_->segments.size() ?
-                &prepared_path_->segments[segment_index] : nullptr;
-        const double absent = std::numeric_limits<double>::quiet_NaN();
-        std::size_t next_rotation = progress.prepared_segment_lower_bound;
-        while (next_rotation < prepared_path_->segments.size() &&
-                prepared_path_->segments[next_rotation].type != PathSegmentType::kRotation) {
-            ++next_rotation;
-        }
-        const bool has_rotation = next_rotation < prepared_path_->segments.size();
-        RCLCPP_INFO(logger_,
-                "PID_LOG tracking_state plan_revision=%zu mode=%s control_now=%.9f "
-                "robot_x=%.9f robot_y=%.9f robot_yaw=%.9f "
-                "goal_x=%.9f goal_y=%.9f goal_distance=%.6f goal_yaw_error=%.6f "
-                "segment=%zu source_index=%zu fraction=%.9f lower_bound=%zu segment_count=%zu "
-                "segment_type=%s segment_s_begin=%.9f segment_s_end=%.9f "
-                "progress_s=%.9f total_s=%.9f remaining_s=%.9f budget_remaining=%.9f "
-                "next_rotation_index=%s next_rotation_s=%.9f "
-                "projection_x=%.9f projection_y=%.9f reference_x=%.9f reference_y=%.9f "
-                "carrot_x=%.9f carrot_y=%.9f carrot_s=%.9f "
-                "path_tangent=%.9f target_yaw=%.9f ex_body=%.9f ey_body=%.9f "
-                "vx_ff=%.9f vy_ff=%.9f vx_fb=%.9f vy_fb=%.9f "
-                "measured_vx=%.6f measured_vy=%.6f measured_omega=%.6f",
+                "PID_LOG holonomic plan_revision=%zu mode=%s control_now=%.9f planner_step=%s "
+                "reference_effective=%.6f limit_reason=%s "
+                "raw_vx=%.6f raw_vy=%.6f limited_vx=%.6f limited_vy=%.6f "
+                "translation_lambda=%.6f reseed=%s control_gap=%s "
+                "stop_speed_limit=%.6f stop_limit_unreachable=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
-                input.robot_x, input.robot_y, yaw, goal.position.x, goal.position.y,
-                std::hypot(goal.position.x - input.robot_x, goal.position.y - input.robot_y),
-                angles::normalize_angle(tf2::getYaw(goal.orientation) - yaw),
-                segment_index, progress.segment_index, progress.cursor.segment_fraction,
-                progress.prepared_segment_lower_bound, prepared_path_->segments.size(),
-                segment ? (segment->type == PathSegmentType::kRotation ? "rotation" : "translation") :
-                "terminal",
-                segment ? segment->translation_s_begin : absent,
-                segment ? segment->translation_s_end : absent,
-                progress.progress_arc_length, prepared_path_->total_translation_length,
-                progress.remaining_path_length, progress.progress_budget,
-                has_rotation ? std::to_string(next_rotation).c_str() : "none",
-                has_rotation ? prepared_path_->segments[next_rotation].translation_s_begin : absent,
-                progress.projection.x, progress.projection.y, input.reference_x, input.reference_y,
-                progress.carrot.x, progress.carrot.y, progress.carrot_arc_length,
-                input.path_tangent, input.target_yaw, raw.ex_body, raw.ey_body,
-                raw.vx_ff, raw.vy_ff, raw.vx_fb, raw.vy_fb,
-                measured.vx, measured.vy, measured.omega);
+                reseed ? "false" : "true",
+                speed_plan.reference_velocity,
+                reseed ? "not_planned" : holonomicLimitReasonName(speed_plan.speed_limit_reason),
+                raw.vx, raw.vy, limited.command.vx, limited.command.vy,
+                limited.translation_lambda, reseed_reason, gap ? "true" : "false",
+                speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false");
+        if (rotating) {
+            RCLCPP_INFO(logger_,
+                    "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.9f "
+                    "rotation_index=%zu rotation_phase=%s raw_omega=%.6f limited_omega=%.6f "
+                    "stop_confirmed=%.6f rotation_settled=%.6f ack_candidate=%s",
+                    plan_revision_, now_seconds, pending_rotation_segment_index_,
+                    braking ? "braking" : "rotating", raw.omega, limited.command.omega,
+                    rotation_entry_gate_->stoppedDuration(), completion.settled_duration,
+                    rotation_ack_candidate_ ? "true" : "false");
+        }
+        if (logger_.get_effective_level() <= rclcpp::Logger::Level::Debug) {
+            // Keep progress and control-law evidence in the same diagnostic cycle.
+            const auto & goal = prepared_path_->poses.back().pose;
+            const auto segment_index = progress.cursor.segment_index;
+            const auto * segment = segment_index < prepared_path_->segments.size() ?
+                    &prepared_path_->segments[segment_index] : nullptr;
+            const double absent = std::numeric_limits<double>::quiet_NaN();
+            std::size_t next_rotation = progress.prepared_segment_lower_bound;
+            while (next_rotation < prepared_path_->segments.size() &&
+                    prepared_path_->segments[next_rotation].type != PathSegmentType::kRotation) {
+                ++next_rotation;
+            }
+            const bool has_rotation = next_rotation < prepared_path_->segments.size();
+            RCLCPP_DEBUG(logger_,
+                    "PID_LOG tracking_state plan_revision=%zu mode=%s control_now=%.9f "
+                    "robot_x=%.9f robot_y=%.9f robot_yaw=%.9f "
+                    "goal_x=%.9f goal_y=%.9f goal_distance=%.6f goal_yaw_error=%.6f "
+                    "segment=%zu source_index=%zu fraction=%.9f lower_bound=%zu segment_count=%zu "
+                    "segment_type=%s segment_s_begin=%.9f segment_s_end=%.9f "
+                    "progress_s=%.9f total_s=%.9f remaining_s=%.9f budget_remaining=%.9f "
+                    "next_rotation_index=%s next_rotation_s=%.9f "
+                    "projection_x=%.9f projection_y=%.9f reference_x=%.9f reference_y=%.9f "
+                    "carrot_x=%.9f carrot_y=%.9f carrot_s=%.9f "
+                    "path_tangent=%.9f target_yaw=%.9f ex_body=%.9f ey_body=%.9f "
+                    "vx_ff=%.9f vy_ff=%.9f vx_fb=%.9f vy_fb=%.9f "
+                    "measured_vx=%.6f measured_vy=%.6f measured_omega=%.6f",
+                    plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
+                    input.robot_x, input.robot_y, yaw, goal.position.x, goal.position.y,
+                    std::hypot(goal.position.x - input.robot_x, goal.position.y - input.robot_y),
+                    angles::normalize_angle(tf2::getYaw(goal.orientation) - yaw),
+                    segment_index, progress.segment_index, progress.cursor.segment_fraction,
+                    progress.prepared_segment_lower_bound, prepared_path_->segments.size(),
+                    segment ? (segment->type == PathSegmentType::kRotation ? "rotation" : "translation") :
+                    "terminal",
+                    segment ? segment->translation_s_begin : absent,
+                    segment ? segment->translation_s_end : absent,
+                    progress.progress_arc_length, prepared_path_->total_translation_length,
+                    progress.remaining_path_length, progress.progress_budget,
+                    has_rotation ? std::to_string(next_rotation).c_str() : "none",
+                    has_rotation ? prepared_path_->segments[next_rotation].translation_s_begin : absent,
+                    progress.projection.x, progress.projection.y, input.reference_x, input.reference_y,
+                    progress.carrot.x, progress.carrot.y, progress.carrot_arc_length,
+                    input.path_tangent, input.target_yaw, raw.ex_body, raw.ey_body,
+                    raw.vx_ff, raw.vy_ff, raw.vx_fb, raw.vy_fb,
+                    measured.vx, measured.vy, measured.omega);
+        }
         last_diagnostics_log_time_seconds_ = now_seconds;
         force_diagnostics_log_ = false;
     }
@@ -607,15 +611,6 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             }
         }
         const auto now = clock_->now();
-        // Temporary TRA-3 observation probe: remove after validating live pose stamps.
-        RCLCPP_INFO(logger_,
-                "PID_LOG pose_observation plan_revision=%zu control_now=%.9f "
-                "pose_stamp_sec=%d pose_stamp_nanosec=%u frame=%s "
-                "x=%.9f y=%.9f yaw=%.9f vx=%.6f vy=%.6f omega=%.6f",
-                plan_revision_, now.seconds(), pose.header.stamp.sec,
-                pose.header.stamp.nanosec, pose.header.frame_id.c_str(),
-                pose.pose.position.x, pose.pose.position.y, tf2::getYaw(pose.pose.orientation),
-                velocity.linear.x, velocity.linear.y, velocity.angular.z);
         const double lookahead = getLookAheadDistance(
                 std::hypot(velocity.linear.x, velocity.linear.y));
         if (progress_handoff_pending_) {
