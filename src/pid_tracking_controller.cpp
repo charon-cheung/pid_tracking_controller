@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "angles/angles.h"
 #include "holonomic_command_limiter.hpp"
 #include "holonomic_control_law.hpp"
 #include "holonomic_speed_planner.hpp"
@@ -226,7 +227,7 @@ void PidTrackingController::configure(
     speed_config.a_ref_down = parameter("a_ref_down", 0.20);
     speed_config.stopping_deceleration = parameter("stopping_deceleration", 0.12);
     speed_config.stopping_delay = parameter("stopping_delay", 0.50);
-    speed_config.stopping_min_speed = parameter("stopping_min_speed", 0.02);
+    speed_config.stopping_min_speed = parameter("stopping_min_speed", 0.04);
     speed_config.yaw_feedback_reserve = parameter("yaw_feedback_reserve", 0.05);
     speed_config.configured_min_rate_window = parameter("configured_min_rate_window", 0.30);
     HolonomicCommandLimiterConfig limiter_config;
@@ -518,6 +519,50 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 completion.settled_duration, rotation_ack_candidate_ ? "true" : "false",
                 speed_plan.stopping_distance, speed_plan.stopping_delay_distance,
                 speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false");
+        // Keep progress and control-law evidence in the same diagnostic cycle.
+        const auto & goal = prepared_path_->poses.back().pose;
+        const auto segment_index = progress.cursor.segment_index;
+        const auto * segment = segment_index < prepared_path_->segments.size() ?
+                &prepared_path_->segments[segment_index] : nullptr;
+        const double absent = std::numeric_limits<double>::quiet_NaN();
+        std::size_t next_rotation = progress.prepared_segment_lower_bound;
+        while (next_rotation < prepared_path_->segments.size() &&
+                prepared_path_->segments[next_rotation].type != PathSegmentType::kRotation) {
+            ++next_rotation;
+        }
+        const bool has_rotation = next_rotation < prepared_path_->segments.size();
+        RCLCPP_INFO(logger_,
+                "PID_LOG tracking_state plan_revision=%zu mode=%s control_now=%.9f "
+                "robot_x=%.9f robot_y=%.9f robot_yaw=%.9f "
+                "goal_x=%.9f goal_y=%.9f goal_distance=%.6f goal_yaw_error=%.6f "
+                "segment=%zu source_index=%zu fraction=%.9f lower_bound=%zu segment_count=%zu "
+                "segment_type=%s segment_s_begin=%.9f segment_s_end=%.9f "
+                "progress_s=%.9f total_s=%.9f remaining_s=%.9f budget_remaining=%.9f "
+                "next_rotation_index=%s next_rotation_s=%.9f "
+                "projection_x=%.9f projection_y=%.9f reference_x=%.9f reference_y=%.9f "
+                "carrot_x=%.9f carrot_y=%.9f carrot_s=%.9f "
+                "path_tangent=%.9f target_yaw=%.9f ex_body=%.9f ey_body=%.9f "
+                "vx_ff=%.9f vy_ff=%.9f vx_fb=%.9f vy_fb=%.9f "
+                "measured_vx=%.6f measured_vy=%.6f measured_omega=%.6f",
+                plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
+                input.robot_x, input.robot_y, yaw, goal.position.x, goal.position.y,
+                std::hypot(goal.position.x - input.robot_x, goal.position.y - input.robot_y),
+                angles::normalize_angle(tf2::getYaw(goal.orientation) - yaw),
+                segment_index, progress.segment_index, progress.cursor.segment_fraction,
+                progress.prepared_segment_lower_bound, prepared_path_->segments.size(),
+                segment ? (segment->type == PathSegmentType::kRotation ? "rotation" : "translation") :
+                "terminal",
+                segment ? segment->translation_s_begin : absent,
+                segment ? segment->translation_s_end : absent,
+                progress.progress_arc_length, prepared_path_->total_translation_length,
+                progress.remaining_path_length, progress.progress_budget,
+                has_rotation ? std::to_string(next_rotation).c_str() : "none",
+                has_rotation ? prepared_path_->segments[next_rotation].translation_s_begin : absent,
+                progress.projection.x, progress.projection.y, input.reference_x, input.reference_y,
+                progress.carrot.x, progress.carrot.y, progress.carrot_arc_length,
+                input.path_tangent, input.target_yaw, raw.ex_body, raw.ey_body,
+                raw.vx_ff, raw.vy_ff, raw.vx_fb, raw.vy_fb,
+                measured.vx, measured.vy, measured.omega);
         last_diagnostics_log_time_seconds_ = now_seconds;
         force_diagnostics_log_ = false;
     }

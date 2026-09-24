@@ -867,5 +867,89 @@ TEST_F(CommandContractTest, delayedDriveWithDeadbandReachesTerminalRotation)
   EXPECT_LT(std::abs(omega), 0.01);
 }
 
+TEST_F(CommandContractTest, axisDeadbandStillAllowsIntermediateRotationAndContinuation)
+{
+  // Reproduce a drive that discards each small body-axis command independently.
+  // Retain the original reproduction and also model the confirmed real-drive thresholds.
+  for (const bool real_drive_thresholds : {false, true}) {
+    SCOPED_TRACE(real_drive_thresholds);
+    const double linear_deadband = real_drive_thresholds ? 0.01 : 0.02;
+    const double angular_deadband = real_drive_thresholds ? 0.03 : 0.01;
+    // Use the production yaw tolerance for the real drive, retaining stricter stop checks.
+    const double yaw_tolerance = real_drive_thresholds ? 0.05 : 0.01;
+    for (const double direction : {0.0, M_PI_2, M_PI_4, M_PI, -M_PI_2, -M_PI_4}) {
+      SCOPED_TRACE(direction);
+      speed_.nominal_tracking_speed = 0.8;
+      speed_.max_vx = speed_.max_xy_speed = 0.8;
+      speed_.max_vy = 0.4;
+      speed_.max_ax = speed_.max_ay = speed_.a_ref_up = 0.8;
+      speed_.a_ref_down = speed_.stopping_deceleration = 0.4;
+      limits_.max_vx = limits_.max_xy_speed = 0.8;
+      limits_.max_vy = 0.4;
+      limits_.max_ax = limits_.max_ay = 0.8;
+      limits_.max_decel_x = limits_.max_decel_y = 0.6;
+      PidTrackingControllerTestAccess::initializeHolonomic(
+        controller_, speed_, limits_, {yaw_tolerance, 0.01, 0.01, 0.3});
+      const double tx = std::cos(direction);
+      const double ty = std::sin(direction);
+      nav_msgs::msg::Path path;
+      path.header.frame_id = "map";
+      path.poses = {makeRobotPoseAt(0.0, 0.0), makeRobotPoseAt(0.4 * tx, 0.4 * ty),
+        makeRobotPoseAt(0.4 * tx, 0.4 * ty, 0.4), makeRobotPoseAt(tx, ty, 0.4)};
+      controller_.setPlan(path);
+      constexpr double dt = 1.0 / 15.0;
+      double x = -0.012 * ty;
+      double y = 0.012 * tx;
+      double yaw = 0.0;
+      double world_vx = 0.0;
+      double world_vy = 0.0;
+      double omega = 0.0;
+      bool rotation_started = false;
+      double max_boundary_overshoot = 0.0;
+      double max_goal_overshoot = 0.0;
+      std::vector<geometry_msgs::msg::PoseStamped> history(3, makeRobotPoseAt(x, y));
+      for (int cycle = 0; cycle < 600; ++cycle) {
+        geometry_msgs::msg::Twist measured;
+        measured.linear.x = std::cos(yaw) * world_vx + std::sin(yaw) * world_vy;
+        measured.linear.y = -std::sin(yaw) * world_vx + std::cos(yaw) * world_vy;
+        measured.angular.z = omega;
+        const auto output = step(history[history.size() - 3], measured, dt).twist;
+        if (!rotation_started && std::abs(output.angular.z) >= angular_deadband) {
+          rotation_started = true;
+          EXPECT_LT(std::hypot(world_vx, world_vy), 0.01);
+          EXPECT_NEAR(x, 0.4 * tx, 0.05);
+          EXPECT_NEAR(y, 0.4 * ty, 0.05);
+        }
+        const double body_vx = std::abs(output.linear.x) < linear_deadband ? 0.0 : output.linear.x;
+        const double body_vy = std::abs(output.linear.y) < linear_deadband ? 0.0 : output.linear.y;
+        const double target_vx = std::cos(yaw) * body_vx - std::sin(yaw) * body_vy;
+        const double target_vy = std::sin(yaw) * body_vx + std::cos(yaw) * body_vy;
+        const double alpha = 1.0 - std::exp(-dt / 0.25);
+        const double next_vx = world_vx + alpha * (target_vx - world_vx);
+        const double next_vy = world_vy + alpha * (target_vy - world_vy);
+        x += 0.5 * (world_vx + next_vx) * dt;
+        y += 0.5 * (world_vy + next_vy) * dt;
+        world_vx = next_vx;
+        world_vy = next_vy;
+        omega = std::abs(output.angular.z) < angular_deadband ? 0.0 : output.angular.z;
+        yaw += omega * dt;
+        if (!rotation_started) {
+          max_boundary_overshoot = std::max(max_boundary_overshoot, x * tx + y * ty - 0.4);
+        }
+        max_goal_overshoot = std::max(max_goal_overshoot, x * tx + y * ty - 1.0);
+        history.push_back(makeRobotPoseAt(x, y, yaw));
+      }
+      EXPECT_TRUE(rotation_started);
+      EXPECT_LE(max_boundary_overshoot, 0.05);
+      EXPECT_LE(max_goal_overshoot, 0.05);
+      EXPECT_NEAR(x, tx, 0.05);
+      EXPECT_NEAR(y, ty, 0.05);
+      EXPECT_NEAR(yaw, 0.4, real_drive_thresholds ? 0.05 : 0.02);
+      EXPECT_LT(std::hypot(world_vx, world_vy), 0.01);
+      EXPECT_LT(std::abs(omega), 0.01);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace pid_tracking_controller

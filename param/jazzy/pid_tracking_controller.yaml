@@ -27,8 +27,8 @@ controller_server:
       stopping_deceleration: 0.40
       # Total pose/odometry age, control-cycle and drive-response budget (seconds).
       stopping_delay: 0.50
-      # Reach the exact segment boundary at low speed instead of stalling before rotation.
-      stopping_min_speed: 0.02
+      # Combined approach speed with margin above the 0.01 m/s per-axis drive deadband.
+      stopping_min_speed: 0.04
       max_decel_x: 0.60
       max_decel_y: 0.60
       yaw_feedback_reserve: 0.05

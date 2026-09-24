@@ -36,8 +36,8 @@ struct HolonomicSpeedPlannerConfig
   double stopping_deceleration{0.12};
   // Total observation, control-cycle and drive response allowance, in seconds.
   double stopping_delay{0.5};
-  // Small approach speed to cross the exact path boundary despite drive deadband.
-  double stopping_min_speed{0.02};
+  // Combined approach speed; leave margin above the drive's per-axis deadband.
+  double stopping_min_speed{0.04};
   double yaw_feedback_reserve{0.1};
   double configured_min_rate_window{0.3};
 };
