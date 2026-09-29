@@ -244,6 +244,7 @@ void PidTrackingController::configure(
         throw std::invalid_argument("stopping_deceleration exceeds command braking limits");
     }
     limiter_config.max_alpha = parameter("max_alpha", 0.50);
+    limiter_config.rotation_max_alpha = parameter("rotation_max_alpha", limiter_config.max_alpha);
     limiter_config.control_gap_threshold = parameter("control_gap_threshold", 0.50);
     const double kp_x = parameter("kp_x", 1.0);
     const double kp_y = parameter("kp_y", 1.0);
@@ -263,13 +264,14 @@ void PidTrackingController::configure(
     last_holonomic_mode_ = -1;
     RCLCPP_INFO(logger_, "PID_LOG holonomic_parameters nominal=%.3f max_xy_speed=%.3f "
             "max_vx=%.3f max_vy=%.3f max_omega=%.3f max_ax=%.3f max_ay=%.3f "
-            "max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f "
+            "max_alpha=%.3f rotation_max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f "
             "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f "
             "stopping_deceleration=%.3f stopping_delay=%.3f stopping_min_speed=%.3f "
             "max_decel_x=%.3f max_decel_y=%.3f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
             speed_config.max_vy, speed_config.max_omega, speed_config.max_ax,
-            speed_config.max_ay, limiter_config.max_alpha, kp_x_, kp_y_, kp_yaw_,
+            speed_config.max_ay, limiter_config.max_alpha, *limiter_config.rotation_max_alpha,
+            kp_x_, kp_y_, kp_yaw_,
             control_gap_threshold_, entry_config.stop_confirm_time, entry_config.braking_timeout,
             speed_config.stopping_deceleration, speed_config.stopping_delay,
             speed_config.stopping_min_speed,
@@ -467,7 +469,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     const auto limited = holonomic_command_limiter_->limit(
             {raw.vx, raw.vy, raw.omega},
             measured,
-            reseed ? 0.0 : dt, cap, speed_plan.stopping_speed_limit);
+            reseed ? 0.0 : dt, cap, speed_plan.stopping_speed_limit, rotating && !braking);
     last_commanded_planar_speed_ = std::hypot(limited.command.vx, limited.command.vy);
     geometry_msgs::msg::TwistStamped command;
     command.header.frame_id = base_frame_;

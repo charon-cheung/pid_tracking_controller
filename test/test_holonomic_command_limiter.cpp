@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -93,6 +94,84 @@ TEST(HolonomicCommandLimiter, commonLambdaPreservesTargetDifferenceDirection)
   EXPECT_GT(command_dx * target_dx + command_dy * target_dy, 0.0);
   EXPECT_TRUE(result.ax_limited);
   EXPECT_FALSE(result.ay_limited);
+}
+
+TEST(HolonomicCommandLimiter, admittedRotationAcceleratesBothDirectionsWithinVelocityCap)
+{
+  auto config = makeConfig();
+  config.max_alpha = 0.5;
+  config.rotation_max_alpha = 0.8;
+  config.max_omega = 0.6;
+  const double no_cap = std::numeric_limits<double>::infinity();
+  for (const double sign : {-1.0, 1.0}) {
+    SCOPED_TRACE(sign);
+    HolonomicCommandLimiter limiter(config);
+    limiter.seed(command(0.0, 0.0, 0.0));
+    for (int cycle = 1; cycle <= 10; ++cycle) {
+      const auto result = limiter.limit(
+        command(0.0, 0.0, sign), command(0.0, 0.0, 0.0), 0.1,
+        no_cap, no_cap, true);
+      EXPECT_NEAR(result.command.omega, sign * std::min(0.08 * cycle, 0.6), 1e-12);
+      EXPECT_LE(std::abs(result.command.omega), config.max_omega);
+      EXPECT_TRUE(result.omega_saturated);
+    }
+  }
+}
+
+TEST(HolonomicCommandLimiter, rotationOverrideRequiresAdmissionAndDefaultsToNormalAlpha)
+{
+  const double no_cap = std::numeric_limits<double>::infinity();
+  for (const bool configured : {false, true}) {
+    auto config = makeConfig();
+    config.max_alpha = 0.5;
+    if (configured) {
+      config.rotation_max_alpha = 0.8;
+    }
+    HolonomicCommandLimiter limiter(config);
+    limiter.seed(command(0.0, 0.0, 0.0));
+    const auto normal = limiter.limit(
+      command(0.0, 0.0, 1.0), command(0.0, 0.0, 0.0), 0.1);
+    EXPECT_NEAR(normal.command.omega, 0.05, 1e-12);
+    const auto rotating = limiter.limit(
+      command(0.0, 0.0, 1.0), command(0.0, 0.0, 0.0), 0.1,
+      no_cap, no_cap, true);
+    EXPECT_NEAR(rotating.command.omega, configured ? 0.13 : 0.10, 1e-12);
+  }
+}
+
+TEST(HolonomicCommandLimiter, rotationDecelerationAndReverseCorrectionKeepNormalAlpha)
+{
+  auto config = makeConfig();
+  config.max_alpha = 0.5;
+  config.rotation_max_alpha = 0.8;
+  const double no_cap = std::numeric_limits<double>::infinity();
+  for (const double sign : {-1.0, 1.0}) {
+    SCOPED_TRACE(sign);
+    HolonomicCommandLimiter limiter(config);
+    limiter.seed(command(0.0, 0.0, 0.0));
+    for (int cycle = 0; cycle < 2; ++cycle) {
+      limiter.limit(command(0.0, 0.0, sign), command(0.0, 0.0, 0.0),
+        0.1, no_cap, no_cap, true);
+    }
+    const auto braking = limiter.limit(
+      command(0.0, 0.0, 0.0), command(0.0, 0.0, 0.0), 0.1,
+      no_cap, no_cap, true);
+    EXPECT_NEAR(braking.command.omega, sign * 0.11, 1e-12);
+    for (int cycle = 1; cycle <= 6; ++cycle) {
+      const auto correction = limiter.limit(
+        command(0.0, 0.0, -sign), command(0.0, 0.0, 0.0), 0.1,
+        no_cap, no_cap, true);
+      EXPECT_NEAR(correction.command.omega, sign * (0.11 - 0.05 * cycle), 1e-12);
+    }
+    // A later rotation may start in the opposite direction after another stop gate.
+    const auto stopped = limiter.limit(
+      command(0.0, 0.0, 0.0), command(0.0, 0.0, 0.0), 0.5);
+    EXPECT_DOUBLE_EQ(stopped.command.omega, 0.0);
+    const auto next_turn = limiter.limit(
+      command(0.0, 0.0, -sign), command(0.0, 0.0, 0.0), 0.1,
+      no_cap, no_cap, true);
+    EXPECT_NEAR(next_turn.command.omega, -sign * 0.08, 1e-12);
+  }
 }
 
 TEST(HolonomicCommandLimiter, baseProjectionSatisfiesAllVelocityLimits)
@@ -500,6 +579,13 @@ TEST(HolonomicCommandLimiter, rejectsInvalidConfiguration)
   config = makeConfig();
   config.control_gap_threshold = 0.0;
   expect_invalid(config);
+  for (const double alpha : {0.0, -0.1, std::numeric_limits<double>::infinity(),
+      std::numeric_limits<double>::quiet_NaN()})
+  {
+    config = makeConfig();
+    config.rotation_max_alpha = alpha;
+    expect_invalid(config);
+  }
 }
 
 TEST(HolonomicCommandLimiter, rejectsNonfiniteCommandsAndInvalidExternalCaps)

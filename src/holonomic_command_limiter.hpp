@@ -2,6 +2,7 @@
 #define PID_TRACKING_CONTROLLER__HOLONOMIC_COMMAND_LIMITER_HPP_
 
 #include <limits>
+#include <optional>
 
 namespace pid_tracking_controller
 {
@@ -26,6 +27,8 @@ struct HolonomicCommandLimiterConfig
   double max_decel_y{0.5};
   double max_alpha{1.0};
   double control_gap_threshold{0.5};
+  // Unset preserves max_alpha; applies only after confirmed rotation admission.
+  std::optional<double> rotation_max_alpha;
 };
 
 struct HolonomicCommandLimitResult
@@ -66,12 +69,15 @@ public:
     const HolonomicBodyCommand & measured,
     double dt,
     double external_speed_limit = std::numeric_limits<double>::infinity(),
-    double stopping_speed_limit = std::numeric_limits<double>::infinity());
+    double stopping_speed_limit = std::numeric_limits<double>::infinity(),
+    bool rotation_acceleration = false);
 
 private:
   HolonomicCommandLimiterConfig config_;
   HolonomicBodyCommand previous_command_;
   bool seeded_{false};
+  // Initial turn direction; opposite-direction corrections keep max_alpha.
+  double rotation_direction_{0.0};
 };
 
 }  // namespace pid_tracking_controller

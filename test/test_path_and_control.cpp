@@ -516,6 +516,38 @@ TEST_F(CommandContractTest, rotationBrakesBeforeTurningAndWaitsForMeasuredStop)
   EXPECT_GT(step().twist.angular.z, 0.0);
 }
 
+TEST_F(CommandContractTest, rotationAccelerationOverrideRequiresConfirmedStop)
+{
+  limits_.rotation_max_alpha = 0.8;
+  initialize();
+  controller_.setPlan(makeStraightPath({0.0, 1.0}));
+  geometry_msgs::msg::Twist moving;
+  moving.angular.z = 0.3;
+  step(makeRobotPose(), moving);
+  setRotationPath(true);
+  for (int index = 0; index < 8; ++index) {
+    EXPECT_NEAR(step(makeRobotPose(), moving).twist.angular.z,
+      std::max(0.0, 0.25 - 0.05 * index), 1e-12);
+  }
+  for (int index = 0; index < 3; ++index) {
+    EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  }
+  EXPECT_NEAR(step().twist.angular.z, 0.08, 1e-12);
+  EXPECT_NEAR(step().twist.angular.z, 0.16, 1e-12);
+}
+
+TEST_F(CommandContractTest, rotationAccelerationOverrideDoesNotAffectTranslationYaw)
+{
+  limits_.rotation_max_alpha = 0.8;
+  initialize();
+  controller_.setPlan(makeStraightPath({0.0, 1.0, 3.0}));
+  const auto pose = makeRobotPose(0.2);
+  step(pose);
+  const auto output = step(pose).twist;
+  EXPECT_GT(output.linear.x, 0.0);
+  EXPECT_NEAR(output.angular.z, -0.05, 1e-12);
+}
+
 TEST_F(CommandContractTest, entryBrakesExistingAngularMotionWithoutHardStopping)
 {
   geometry_msgs::msg::Twist moving;

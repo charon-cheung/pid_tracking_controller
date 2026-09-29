@@ -29,6 +29,8 @@ bool configIsValid(const HolonomicCommandLimiterConfig & config)
          std::isfinite(config.max_decel_x) && config.max_decel_x > 0.0 &&
          std::isfinite(config.max_decel_y) && config.max_decel_y > 0.0 &&
          std::isfinite(config.max_alpha) && config.max_alpha > 0.0 &&
+         (!config.rotation_max_alpha ||
+         (std::isfinite(*config.rotation_max_alpha) && *config.rotation_max_alpha > 0.0)) &&
          std::isfinite(config.control_gap_threshold) &&
          config.control_gap_threshold > 0.0;
 }
@@ -181,6 +183,7 @@ void HolonomicCommandLimiter::seed(
   previous_command_ = projectBaseLimits(measured, config_).command;
   applyExternalSpeedLimit(previous_command_, external_speed_limit);
   seeded_ = true;
+  rotation_direction_ = 0.0;
 }
 
 HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
@@ -188,7 +191,8 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
   const HolonomicBodyCommand & measured,
   double dt,
   double external_speed_limit,
-  double stopping_speed_limit)
+  double stopping_speed_limit,
+  bool rotation_acceleration)
 {
   validateCommand(raw);
   validateCommand(measured);
@@ -216,6 +220,7 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     result.stopping_limit_unreachable = translationSpeed(result.command) > stopping_speed_limit;
     previous_command_ = result.command;
     seeded_ = true;
+    rotation_direction_ = 0.0;
     return result;
   }
 
@@ -260,10 +265,22 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     result.translation_lambda = 0.0;
   }
 
+  if (!rotation_acceleration) {
+    rotation_direction_ = 0.0;
+  } else if (rotation_direction_ == 0.0 && target.command.omega != 0.0) {
+    rotation_direction_ = std::copysign(1.0, target.command.omega);
+  }
+  const bool accelerating_turn = rotation_acceleration && rotation_direction_ != 0.0 &&
+    std::signbit(target.command.omega) == std::signbit(rotation_direction_) &&
+    (previous_command_.omega == 0.0 ||
+    std::signbit(target.command.omega) == std::signbit(previous_command_.omega)) &&
+    std::abs(target.command.omega) > std::abs(previous_command_.omega);
+  const double max_alpha = accelerating_turn ?
+    config_.rotation_max_alpha.value_or(config_.max_alpha) : config_.max_alpha;
   const long double delta_omega =
     static_cast<long double>(target.command.omega) - previous_command_.omega;
   const long double max_delta_omega =
-    static_cast<long double>(config_.max_alpha) * dt;
+    static_cast<long double>(max_alpha) * dt;
   result.alpha_limited = std::abs(delta_omega) > max_delta_omega;
   const double omega_candidate = quantizeTowardPrevious(
     static_cast<long double>(previous_command_.omega) + std::clamp(
