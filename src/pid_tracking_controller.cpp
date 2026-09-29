@@ -521,7 +521,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                     rotation_entry_gate_->stoppedDuration(), completion.settled_duration,
                     rotation_ack_candidate_ ? "true" : "false");
         }
-        if (logger_.get_effective_level() <= rclcpp::Logger::Level::Debug) {
+        // Temporary TRA-15 capture: restore this gate and log to DEBUG after sampling.
+        if (logger_.get_effective_level() <= rclcpp::Logger::Level::Info) {
             // Keep progress and control-law evidence in the same diagnostic cycle.
             const auto & goal = prepared_path_->poses.back().pose;
             const auto segment_index = progress.cursor.segment_index;
@@ -534,7 +535,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 ++next_rotation;
             }
             const bool has_rotation = next_rotation < prepared_path_->segments.size();
-            RCLCPP_DEBUG(logger_,
+            RCLCPP_INFO(logger_,
                     "PID_LOG tracking_state plan_revision=%zu mode=%s control_now=%.9f "
                     "robot_x=%.9f robot_y=%.9f robot_yaw=%.9f "
                     "goal_x=%.9f goal_y=%.9f goal_distance=%.6f goal_yaw_error=%.6f "
