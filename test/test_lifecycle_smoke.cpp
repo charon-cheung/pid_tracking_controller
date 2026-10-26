@@ -122,13 +122,14 @@ double loggedDouble(const std::string & text, const std::string & field)
   return std::stod(text.substr(position + field.size()));
 }
 
-TEST(LifecycleSmoke, publishesCarrotAndCompactActiveDiagnosticsWithoutDiagnosticTopic)
+TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
 {
   rclcpp::init(0, nullptr);
 
   bool carrot_received = false;
   geometry_msgs::msg::PointStamped received_carrot;
   geometry_msgs::msg::TwistStamped active_command;
+  geometry_msgs::msg::TwistStamped received_raw;
   ScopedLogCapture log_capture;
   auto control_clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
 
@@ -159,13 +160,19 @@ TEST(LifecycleSmoke, publishesCarrotAndCompactActiveDiagnosticsWithoutDiagnostic
         received_carrot = *message;
         carrot_received = true;
       });
+    auto raw_subscription = observer->create_subscription<geometry_msgs::msg::TwistStamped>(
+      "/tracking_cmd_vel_raw", rclcpp::QoS(10).reliable(),
+      [&](const geometry_msgs::msg::TwistStamped::SharedPtr message) {
+        received_raw = *message;
+      });
     rclcpp::executors::SingleThreadedExecutor executor;
     executor.add_node(parent->get_node_base_interface());
     executor.add_node(observer);
 
     const auto discovery_deadline = std::chrono::steady_clock::now() + 1s;
     while (std::chrono::steady_clock::now() < discovery_deadline &&
-      observer->count_publishers("/pid_tracking_controller/carrot") == 0u)
+      (observer->count_publishers("/pid_tracking_controller/carrot") == 0u ||
+      raw_subscription->get_publisher_count() == 0u))
     {
       executor.spin_some();
       std::this_thread::sleep_for(10ms);
@@ -206,9 +213,25 @@ TEST(LifecycleSmoke, publishesCarrotAndCompactActiveDiagnosticsWithoutDiagnostic
       controller.setPlan(makeAngularLimitedLifecyclePath());
       geometry_msgs::msg::PoseStamped pose;
       pose.header.frame_id = "map";
-      pose.pose.orientation.w = 1.0;
-      controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
+      pose.pose.position.x = 0.1;
+      pose.pose.orientation.z = std::sin(0.1);
+      pose.pose.orientation.w = std::cos(0.1);
+      active_command = controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
     }
+    const auto raw_deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < raw_deadline &&
+      received_raw.header.stamp != active_command.header.stamp)
+    {
+      executor.spin_some();
+      std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_EQ(received_raw.header, active_command.header);
+    EXPECT_EQ(received_raw.header.frame_id, "base_link");
+    // The offset requires negative-x correction; acceleration limiting delays it.
+    EXPECT_LT(received_raw.twist.linear.x, -0.05);
+    EXPECT_GT(std::abs(received_raw.twist.linear.x), std::abs(active_command.twist.linear.x));
+    EXPECT_GT(received_raw.twist.linear.y, 0.0);
+    EXPECT_NEAR(received_raw.twist.angular.z, -0.2, 1e-12);
     EXPECT_EQ(
       observer->count_publishers("/pid_tracking_controller/tracking_diagnostics"), 0u);
     EXPECT_NE(log_capture.output().find("PID_LOG holonomic_parameters"), std::string::npos);

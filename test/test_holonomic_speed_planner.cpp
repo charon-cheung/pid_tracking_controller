@@ -111,6 +111,172 @@ TEST(HolonomicSpeedPlanner, longStraightUsesNominalSpeed)
   EXPECT_NEAR(plan.reference_velocity, 0.8, 1e-12);
 }
 
+TEST(HolonomicSpeedPlanner, feedbackReservesEitherBodyAxisInBothDirections)
+{
+  for (const bool swap_axes : {false, true}) {
+    for (const double sx : {-1.0, 1.0}) {
+      for (const double sy : {-1.0, 1.0}) {
+        for (const double yaw : {0.0, 1.0}) {
+          SCOPED_TRACE(::testing::Message() << swap_axes << ", " << sx << ", " << sy << ", " << yaw);
+          const double tx = sx * (swap_axes ? 0.8 : 0.6);
+          const double ty = sy * (swap_axes ? 0.6 : 0.8);
+          const HolonomicTranslationFeedback feedback{
+            sx * (swap_axes ? 0.06 : -0.08), sy * (swap_axes ? -0.08 : 0.06)};
+          const auto path = preparePath(makePath({{0.0, 0.0, yaw},
+            {20.0 * (std::cos(yaw) * tx - std::sin(yaw) * ty),
+              20.0 * (std::sin(yaw) * tx + std::cos(yaw) * ty), yaw}}));
+          auto config = makeConfig();
+          config.max_vx = swap_axes ? 0.4 : 0.8;
+          config.max_vy = swap_axes ? 0.8 : 0.4;
+          HolonomicSpeedPlanner planner(config);
+          planner.setPath(path);
+          const auto result = planner.plan(
+            makeReference(path, makePoint(0.0, 0.0)), yaw, 1.0, 0.8, 0.0, feedback);
+          EXPECT_NEAR(result.reference_velocity, 0.425, 1e-12);
+          EXPECT_EQ(result.speed_limit_reason, HolonomicSpeedLimitReason::kFeedbackBudget);
+          EXPECT_FALSE(result.feedback_unreachable);
+          EXPECT_LE(std::abs(tx * result.reference_velocity + feedback.vx), config.max_vx + 1e-12);
+          EXPECT_LE(std::abs(ty * result.reference_velocity + feedback.vy), config.max_vy + 1e-12);
+        }
+      }
+    }
+  }
+}
+
+TEST(HolonomicSpeedPlanner, feedbackRespectsCombinedExternalAndStoppingCaps)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  // Each case has a 0.5 m/s combined budget, imposed by a different source.
+  for (const int source : {0, 1, 2}) {
+    SCOPED_TRACE(source);
+    auto config = makeConfig();
+    config.max_xy_speed = source == 0 ? 0.5 : 1.0;
+    config.stopping_deceleration = 0.25;
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(path);
+    const auto result = planner.plan(
+      makeReference(path, makePoint(source == 2 ? 19.5 : 0.0, 0.0)),
+      0.0, 1.0, source == 1 ? 0.5 : 1.0, 0.0, {0.0, 0.3});
+    EXPECT_NEAR(result.reference_velocity, 0.4, 1e-12);
+    EXPECT_NEAR(std::hypot(result.reference_velocity, 0.3), 0.5, 1e-12);
+    EXPECT_FALSE(result.feedback_unreachable);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, oppositeFeedbackCanBeCancelledWithoutIncreasingOriginalSpeed)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.max_xy_speed = 0.5;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  for (const double feedback : {-0.2, -0.8}) {
+    const auto result = planner.plan(
+      makeReference(path, makePoint(0.0, 0.0)), 0.0, 1.0, 1.0, 0.0, {feedback, 0.0});
+    EXPECT_NEAR(result.reference_velocity, 0.5, 1e-12);
+    EXPECT_FALSE(result.feedback_unreachable);
+    EXPECT_LE(std::abs(result.reference_velocity + feedback), 0.5);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, positiveFeasibilityMinimumDoesNotBypassReferenceAcceleration)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.max_xy_speed = 0.5;
+  config.a_ref_up = 0.2;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  const auto reference = makeReference(path, makePoint(0.0, 0.0));
+  // FF must reach 0.3 to cancel enough feedback, but must not jump there.
+  const auto starting = planner.plan(reference, 0.0, 0.1, 1.0, 0.0, {-0.8, 0.0});
+  EXPECT_NEAR(starting.reference_velocity, 0.02, 1e-12);
+  EXPECT_TRUE(starting.feedback_unreachable);
+  const auto later = planner.plan(reference, 0.0, 2.0, 1.0, 0.0, {-0.8, 0.0});
+  EXPECT_NEAR(later.reference_velocity, 0.42, 1e-12);
+  EXPECT_FALSE(later.feedback_unreachable);
+}
+
+TEST(HolonomicSpeedPlanner, infeasibleFeedbackRemovesOnlyFeedforward)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.max_vy = config.max_xy_speed = 0.5;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  const auto reference = makeReference(path, makePoint(0.0, 0.0));
+  // Perpendicular excess, forward excess, and cancellation requiring excessive FF.
+  for (const auto feedback : {HolonomicTranslationFeedback{0.0, 0.6},
+    HolonomicTranslationFeedback{0.6, 0.0}, HolonomicTranslationFeedback{-1.1, 0.0}})
+  {
+    planner.seed(0.5);
+    const auto result = planner.plan(reference, 0.0, 0.01, 1.0, 0.0, feedback);
+    EXPECT_DOUBLE_EQ(result.reference_velocity, 0.0);
+    EXPECT_TRUE(result.feedback_unreachable);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, feedbackBudgetBecomesRecoveryStateWithoutForcingMinimumSpeed)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.max_xy_speed = 0.5;
+  config.a_ref_up = config.a_ref_down = 0.2;
+  config.stopping_min_speed = 0.06;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  planner.seed(0.5);
+  const auto reference = makeReference(path, makePoint(0.0, 0.0));
+  const auto limited = planner.plan(reference, 0.0, 0.1, 1.0, 0.0, {0.0, 0.3});
+  EXPECT_NEAR(limited.reference_velocity, 0.4, 1e-12);
+  const auto recovered = planner.plan(reference, 0.0, 0.1);
+  EXPECT_NEAR(recovered.reference_velocity, 0.42, 1e-12);
+
+  const auto near_goal = makeReference(path, makePoint(19.9999, 0.0));
+  const auto approaching = planner.plan(near_goal, 0.0, 0.1, 1.0, 0.0, {0.0, 0.05});
+  EXPECT_NEAR(approaching.stopping_speed_limit, 0.06, 1e-12);
+  EXPECT_NEAR(approaching.reference_velocity, std::sqrt(0.0011), 1e-12);
+  EXPECT_NEAR(std::hypot(approaching.reference_velocity, 0.05), 0.06, 1e-12);
+}
+
+TEST(HolonomicSpeedPlanner, nonbindingFeedbackPreservesExistingReferenceDeceleration)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  auto config = makeConfig();
+  config.nominal_tracking_speed = 0.5;
+  config.a_ref_down = 0.2;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  for (const double lateral_feedback : {0.0, 0.01}) {
+    planner.seed(0.8);
+    const auto result = planner.plan(
+      makeReference(path, makePoint(0.0, 0.0)), 0.0, 0.1, 1.0, 0.0, {0.0, lateral_feedback});
+    EXPECT_NEAR(result.reference_velocity, 0.78, 1e-12);
+    EXPECT_EQ(result.speed_limit_reason, HolonomicSpeedLimitReason::kNominal);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, feedbackCannotCreateFeedforwardDuringRotationOrTerminal)
+{
+  const auto path = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  HolonomicSpeedPlanner planner(makeConfig());
+  planner.setPath(path);
+  auto reference = makeReference(path, makePoint(0.0, 0.0));
+  for (const auto mode : {HolonomicReferenceMode::kRotationPending, HolonomicReferenceMode::kTerminal}) {
+    reference.mode = mode;
+    planner.seed(0.8);
+    EXPECT_DOUBLE_EQ(planner.plan(reference, 0.0, 0.1, 1.0, 0.0, {-0.8, 0.3}).reference_velocity, 0.0);
+    reference.mode = HolonomicReferenceMode::kTranslation;
+    EXPECT_NEAR(planner.plan(reference, 0.0, 0.1).reference_velocity, 0.4, 1e-12);
+  }
+  for (const double invalid : {std::numeric_limits<double>::quiet_NaN(),
+    std::numeric_limits<double>::infinity()})
+  {
+    EXPECT_THROW(planner.plan(reference, 0.0, 0.1, 1.0, 0.0, {invalid, 0.0}), std::domain_error);
+    EXPECT_THROW(planner.plan(reference, 0.0, 0.1, 1.0, 0.0, {0.0, invalid}), std::domain_error);
+  }
+}
+
 TEST(HolonomicSpeedPlanner, bodyAxesAndCombinedSpeedLimitPathDirection)
 {
   const double diagonal = std::sqrt(0.5);

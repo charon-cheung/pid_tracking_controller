@@ -130,6 +130,64 @@ protected:
   PidTrackingController controller_;
 };
 
+TEST_F(CommandContractTest, saturatedFeedforwardPreservesNormalPositionCorrection)
+{
+  speed_.nominal_tracking_speed = speed_.max_vx = speed_.max_xy_speed = 0.8;
+  speed_.max_vy = 0.4;
+  speed_.max_ax = speed_.max_ay = speed_.a_ref_up = speed_.a_ref_down = 0.8;
+  limits_.max_vx = limits_.max_xy_speed = 0.8;
+  limits_.max_vy = 0.4;
+  limits_.max_ax = limits_.max_ay = 0.8;
+  initialize();
+  auto path = makeStraightPath({0.0});
+  path.poses.push_back(makeRobotPoseAt(12.0, 16.0));
+  controller_.setPlan(path);
+  const auto pose = makeRobotPoseAt(0.08, -0.06);
+  geometry_msgs::msg::Twist output;
+  for (int cycle = 0; cycle < 20; ++cycle) {
+    output = step(pose).twist;
+  }
+  // t=(0.6,0.8), feedback=(-0.08,0.06): v must fall from 0.5 to 0.425.
+  EXPECT_NEAR(output.linear.x, 0.175, 1e-6);
+  EXPECT_NEAR(output.linear.y, 0.4, 1e-6);
+  EXPECT_NEAR(-0.8 * output.linear.x + 0.6 * output.linear.y, 0.1, 1e-6);
+}
+
+TEST_F(CommandContractTest, combinedSpeedCapPreservesLateralPositionCorrection)
+{
+  speed_.nominal_tracking_speed = speed_.max_xy_speed = 0.5;
+  speed_.max_vx = speed_.max_vy = 1.0;
+  limits_.max_xy_speed = 0.5;
+  limits_.max_vx = limits_.max_vy = 1.0;
+  initialize();
+  auto path = makeStraightPath({0.0, 20.0});
+  path.poses.back().pose.orientation = makeRobotPose(1.0).pose.orientation;
+  controller_.setPlan(path);
+  geometry_msgs::msg::Twist output;
+  for (int cycle = 0; cycle < 40; ++cycle) {
+    output = step(makeRobotPoseAt(0.0, -0.2)).twist;
+  }
+  EXPECT_NEAR(output.linear.x, std::sqrt(0.21), 1e-6);
+  EXPECT_NEAR(output.linear.y, 0.2, 1e-6);
+  EXPECT_LE(std::hypot(output.linear.x, output.linear.y), 0.5 + 1e-12);
+  // Yaw FF uses the reduced path speed (1 rad / 20 m), not the original 0.5 m/s.
+  EXPECT_NEAR(output.angular.z, 0.05 * std::sqrt(0.21), 1e-6);
+}
+
+TEST_F(CommandContractTest, infeasibleFeedbackStillProducesBoundedCorrection)
+{
+  controller_.setPlan(makeStraightPath({0.0, 20.0}));
+  geometry_msgs::msg::Twist output;
+  for (int cycle = 0; cycle < 30; ++cycle) {
+    const auto previous = output;
+    output = step(makeRobotPoseAt(0.0, -0.5)).twist;
+    EXPECT_LE(std::abs(output.linear.y - previous.linear.y), limits_.max_ay * 0.1 + 1e-12);
+    EXPECT_LE(std::hypot(output.linear.x, output.linear.y), limits_.max_xy_speed + 1e-12);
+  }
+  EXPECT_NEAR(output.linear.x, 0.0, 1e-12);
+  EXPECT_NEAR(output.linear.y, 0.2, 1e-12);
+}
+
 TEST(Lookahead, lookaheadKeepsSpeedTimeClamp)
 {
   PidTrackingController controller;

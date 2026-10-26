@@ -118,6 +118,8 @@ private:
   nav2_costmap_2d::Costmap2D * costmap_{nullptr};
   rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PointStamped>::SharedPtr
     carrot_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::TwistStamped>::SharedPtr
+    raw_cmd_pub_;
 };
 
 }  // namespace pid_tracking_controller

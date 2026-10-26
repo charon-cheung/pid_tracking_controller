@@ -18,6 +18,7 @@ enum class HolonomicSpeedLimitReason
   kYawRate,
   kTangentRate,
   kStoppingDistance,
+  kFeedbackBudget,
   kRotation,
   kTerminal
 };
@@ -54,11 +55,20 @@ struct HolonomicSpeedPlan
   double stopping_distance{0.0};
   double stopping_delay_distance{0.0};
   double external_speed_limit{std::numeric_limits<double>::infinity()};
+  double feedback_speed_limit{std::numeric_limits<double>::infinity()};
+  // No feasible FF speed, or its minimum cannot yet be reached under acceleration limits.
+  bool feedback_unreachable{false};
   double max_abs_target_yaw_rate_per_meter{0.0};
   double max_abs_path_tangent_rate_per_meter{0.0};
   double representative_path_spacing{0.0};
   double rate_window_length{0.0};
   HolonomicSpeedLimitReason speed_limit_reason{HolonomicSpeedLimitReason::kNominal};
+};
+
+struct HolonomicTranslationFeedback
+{
+  double vx{0.0};
+  double vy{0.0};
 };
 
 double convertExternalSpeedLimitToAbsolute(
@@ -81,7 +91,8 @@ public:
     double robot_yaw,
     double dt,
     double external_speed_limit = std::numeric_limits<double>::infinity(),
-    double observed_speed = 0.0);
+    double observed_speed = 0.0,
+    HolonomicTranslationFeedback feedback = {});
 
 private:
   HolonomicSpeedPlannerConfig config_;

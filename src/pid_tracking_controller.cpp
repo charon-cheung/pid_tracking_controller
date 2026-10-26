@@ -88,6 +88,7 @@ const char * holonomicLimitReasonName(HolonomicSpeedLimitReason reason)
 {
     switch (reason) {
         case HolonomicSpeedLimitReason::kNominal: return "nominal";
+        case HolonomicSpeedLimitReason::kFeedbackBudget: return "feedback_budget";
         case HolonomicSpeedLimitReason::kExternal: return "external";
         case HolonomicSpeedLimitReason::kBodyAxis: return "body_axis";
         case HolonomicSpeedLimitReason::kCombinedSpeed: return "xy_speed";
@@ -282,6 +283,8 @@ void PidTrackingController::configure(
 
     carrot_pub_ = node->create_publisher<geometry_msgs::msg::PointStamped>(
       "pid_tracking_controller/carrot", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
+    raw_cmd_pub_ = node->create_publisher<geometry_msgs::msg::TwistStamped>(
+      "tracking_cmd_vel_raw", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
 
     plan_revision_ = 0;
     force_diagnostics_log_ = true;
@@ -304,6 +307,9 @@ void PidTrackingController::activate()
     if (carrot_pub_) {
         carrot_pub_->on_activate();
     }
+    if (raw_cmd_pub_) {
+        raw_cmd_pub_->on_activate();
+    }
     force_diagnostics_log_ = true;
 }
 
@@ -314,6 +320,9 @@ void PidTrackingController::deactivate()
     if (carrot_pub_) {
         carrot_pub_->on_deactivate();
     }
+    if (raw_cmd_pub_) {
+        raw_cmd_pub_->on_deactivate();
+    }
 }
 
 void PidTrackingController::cleanup()
@@ -323,6 +332,7 @@ void PidTrackingController::cleanup()
     holonomic_command_limiter_.reset();
     resetRotationState();
     carrot_pub_.reset();
+    raw_cmd_pub_.reset();
     prepared_path_.reset();
     progress_handoff_pending_ = false;
     costmap_ = nullptr;
@@ -439,6 +449,19 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     }
     last_rotation_braking_ = braking;
 
+    HolonomicControlInput input;
+    input.robot_x = pose.pose.position.x;
+    input.robot_y = pose.pose.position.y;
+    input.robot_yaw = yaw;
+    input.reference_x = rotating ? input.robot_x : reference.current.position.x;
+    input.reference_y = rotating ? input.robot_y : reference.current.position.y;
+    input.path_tangent = reference.current.path_tangent;
+    input.target_yaw = rotating ? reference.rotation_target_yaw : reference.current.target_yaw;
+    input.target_yaw_rate_per_meter =
+            reference.mode == HolonomicReferenceMode::kTranslation ?
+            reference.current.target_yaw_rate_per_meter : 0.0;
+    // Use the same pose, reference and gains for the budget and final control law.
+    const auto feedback = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
     HolonomicSpeedPlan speed_plan;
     if (reseed) {
         const double relative_tangent = reference.current.path_tangent - yaw;
@@ -448,20 +471,10 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 std::max(0.0, measured_progress_speed) : 0.0);
     } else {
         speed_plan = holonomic_speed_planner_->plan(reference, yaw, dt, cap,
-                std::max(std::hypot(measured.vx, measured.vy), last_commanded_planar_speed_));
+                std::max(std::hypot(measured.vx, measured.vy), last_commanded_planar_speed_),
+                {feedback.vx_fb, feedback.vy_fb});
     }
-    HolonomicControlInput input;
-    input.robot_x = pose.pose.position.x;
-    input.robot_y = pose.pose.position.y;
-    input.robot_yaw = yaw;
-    input.reference_x = rotating ? input.robot_x : reference.current.position.x;
-    input.reference_y = rotating ? input.robot_y : reference.current.position.y;
-    input.path_tangent = reference.current.path_tangent;
-    input.target_yaw = rotating ? reference.rotation_target_yaw : reference.current.target_yaw;
     input.reference_velocity = speed_plan.reference_velocity;
-    input.target_yaw_rate_per_meter =
-            reference.mode == HolonomicReferenceMode::kTranslation ?
-            reference.current.target_yaw_rate_per_meter : 0.0;
     auto raw = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
     if (braking) {
         raw.vx = raw.vy = raw.omega = 0.0;
@@ -505,14 +518,20 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "reference_effective=%.6f limit_reason=%s "
                 "raw_vx=%.6f raw_vy=%.6f limited_vx=%.6f limited_vy=%.6f "
                 "translation_lambda=%.6f reseed=%s control_gap=%s "
-                "stop_speed_limit=%.6f stop_limit_unreachable=%s",
+                "stop_speed_limit=%.6f stop_limit_unreachable=%s "
+                "feedback_speed_limit=%.6f feedback_unreachable=%s "
+                "vx_saturated=%s vy_saturated=%s xy_saturated=%s ax_limited=%s ay_limited=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                 reseed ? "false" : "true",
                 speed_plan.reference_velocity,
                 reseed ? "not_planned" : holonomicLimitReasonName(speed_plan.speed_limit_reason),
                 raw.vx, raw.vy, limited.command.vx, limited.command.vy,
                 limited.translation_lambda, reseed_reason, gap ? "true" : "false",
-                speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false");
+                speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false",
+                speed_plan.feedback_speed_limit, speed_plan.feedback_unreachable ? "true" : "false",
+                limited.vx_saturated ? "true" : "false", limited.vy_saturated ? "true" : "false",
+                limited.xy_saturated ? "true" : "false", limited.ax_limited ? "true" : "false",
+                limited.ay_limited ? "true" : "false");
         if (rotating) {
             RCLCPP_INFO(logger_,
                     "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.9f "
@@ -574,6 +593,15 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         force_diagnostics_log_ = false;
     }
     last_holonomic_mode_ = static_cast<int>(reference.mode);
+    if (raw_cmd_pub_ && raw_cmd_pub_->is_activated()) {
+        // Exact limiter input, including the rotation-entry braking gate.
+        geometry_msgs::msg::TwistStamped raw_command;
+        raw_command.header = command.header;
+        raw_command.twist.linear.x = raw.vx;
+        raw_command.twist.linear.y = raw.vy;
+        raw_command.twist.angular.z = raw.omega;
+        raw_cmd_pub_->publish(raw_command);
+    }
     return command;
 }
 
