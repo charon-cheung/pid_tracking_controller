@@ -89,6 +89,8 @@ const char * holonomicLimitReasonName(HolonomicSpeedLimitReason reason)
     switch (reason) {
         case HolonomicSpeedLimitReason::kNominal: return "nominal";
         case HolonomicSpeedLimitReason::kFeedbackBudget: return "feedback_budget";
+        case HolonomicSpeedLimitReason::kAccelerationPreview: return "acceleration_preview";
+        case HolonomicSpeedLimitReason::kAccelerationBudget: return "acceleration_budget";
         case HolonomicSpeedLimitReason::kExternal: return "external";
         case HolonomicSpeedLimitReason::kBodyAxis: return "body_axis";
         case HolonomicSpeedLimitReason::kCombinedSpeed: return "xy_speed";
@@ -472,7 +474,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     } else {
         speed_plan = holonomic_speed_planner_->plan(reference, yaw, dt, cap,
                 std::max(std::hypot(measured.vx, measured.vy), last_commanded_planar_speed_),
-                {feedback.vx_fb, feedback.vy_fb});
+                {feedback.vx_fb, feedback.vy_fb}, holonomic_command_limiter_->previousCommand());
     }
     input.reference_velocity = speed_plan.reference_velocity;
     auto raw = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
@@ -520,6 +522,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "translation_lambda=%.6f reseed=%s control_gap=%s "
                 "stop_speed_limit=%.6f stop_limit_unreachable=%s "
                 "feedback_speed_limit=%.6f feedback_unreachable=%s "
+                "acceleration_speed_limit=%.6f acceleration_unreachable=%s "
                 "vx_saturated=%s vy_saturated=%s xy_saturated=%s ax_limited=%s ay_limited=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                 reseed ? "false" : "true",
@@ -529,6 +532,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 limited.translation_lambda, reseed_reason, gap ? "true" : "false",
                 speed_plan.stopping_speed_limit, limited.stopping_limit_unreachable ? "true" : "false",
                 speed_plan.feedback_speed_limit, speed_plan.feedback_unreachable ? "true" : "false",
+                speed_plan.acceleration_speed_limit, speed_plan.acceleration_unreachable ? "true" : "false",
                 limited.vx_saturated ? "true" : "false", limited.vy_saturated ? "true" : "false",
                 limited.xy_saturated ? "true" : "false", limited.ax_limited ? "true" : "false",
                 limited.ay_limited ? "true" : "false");

@@ -64,6 +64,12 @@ public:
     const HolonomicBodyCommand & measured,
     double external_speed_limit = std::numeric_limits<double>::infinity());
 
+  // The speed planner uses the final output, including all downstream limits.
+  std::optional<HolonomicBodyCommand> previousCommand() const
+  {
+    return seeded_ ? std::optional<HolonomicBodyCommand>{previous_command_} : std::nullopt;
+  }
+
   HolonomicCommandLimitResult limit(
     const HolonomicBodyCommand & raw,
     const HolonomicBodyCommand & measured,

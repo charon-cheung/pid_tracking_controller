@@ -588,6 +588,109 @@ TEST(PathProgressTracker, handoffSkipsOnlyRotationsStrictlyBeforeItsBoundary)
   }
 }
 
+TEST(PathProgressTracker, handoffPreservesInitialRotationForRecordedStartOffsets)
+{
+  struct Case
+  {
+    const char * name;
+    double x, y, yaw_before, yaw_after, next_x, next_y, end_x, end_y, robot_x, robot_y;
+  };
+  // First four recorded path poses and first controller observation, 2026-10-26.
+  const Case cases[] = {
+    {"P2", -0.376336756405, 2.432739440695, 1.542931601429, -1.859451041216,
+      -0.376335888368, 2.432739226195, -0.393415966111, 2.423967253735,
+      -0.376639534000, 2.432365074000},
+    {"P6", 4.614394463688, -0.445546884611, -0.200973577834, -1.731624046366,
+      4.596950453675, -0.435789807092, 4.579446944392, -0.426139865532,
+      4.614094483000, -0.445434164000},
+    {"P9", -0.465840518337, -0.351243173739, 0.500324181007, -1.818115521602,
+      -0.465904590934, -0.311243211574, -0.465968663531, -0.271243249843,
+      -0.466236923000, -0.351229146000},
+    {"P7", -0.498012673423, -0.547499244270, -1.727530214720, 0.855339007114,
+      -0.498013131742, -0.547499965004, -0.515156686046, -0.538928187852,
+      -0.497781653000, -0.547562884000}
+  };
+  for (const auto & test : cases) {
+    SCOPED_TRACE(test.name);
+    auto path = makePath({{test.x, test.y}, {test.x, test.y},
+        {test.next_x, test.next_y}, {test.end_x, test.end_y}});
+    setYaw(path.poses.front(), test.yaw_before);
+    for (std::size_t i = 1; i < path.poses.size(); ++i) {
+      setYaw(path.poses[i], test.yaw_after);
+    }
+    const auto prepared = preparePath(path);
+    PathProgressTracker tracker;
+    tracker.setPath(prepared);
+    const auto robot = makePoint(test.robot_x, test.robot_y);
+    const auto handoff = tracker.initializePathHandoff(robot, 0.5);
+    EXPECT_EQ(buildHolonomicTrackingReference(*prepared, handoff, 0.5).mode,
+      HolonomicReferenceMode::kRotationPending);
+    // Later position observations cannot silently consume the pending rotation.
+    EXPECT_EQ(buildHolonomicTrackingReference(*prepared, tracker.update(robot, 0.5), 0.5).mode,
+      HolonomicReferenceMode::kRotationPending);
+    EXPECT_NO_THROW(tracker.acknowledgeRotationComplete(0u));
+    EXPECT_EQ(buildHolonomicTrackingReference(*prepared, tracker.update(robot, 0.5), 0.5).mode,
+      HolonomicReferenceMode::kTranslation);
+  }
+}
+
+TEST(PathProgressTracker, initialRotationHandoffRequiresBothPositionAndArcProximity)
+{
+  auto path = makePath({{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}, {1.0, 0.0}});
+  setYaw(path.poses[1], 0.3);
+  setYaw(path.poses[2], 0.6);
+  setYaw(path.poses[3], 0.6);
+  const auto prepared = preparePath(path);
+  struct Case {double x, y; bool pending;};
+  for (const auto & test : {
+      Case{-0.005, 0.0, true}, Case{0.0, -0.005, true}, Case{0.0, 0.005, true},
+      Case{0.005, 0.0, true}, Case{0.01, 0.0, true}, Case{0.019, 0.0, true},
+      Case{0.02, 0.0, true}, Case{0.020001, 0.0, false}, Case{0.03, 0.0, false},
+      Case{0.05, 0.0, false}, Case{0.005, 0.019, true},
+      Case{0.005, 0.020, false}, Case{0.005, -0.020, false}})
+  {
+    SCOPED_TRACE(::testing::Message() << test.x << ", " << test.y);
+    PathProgressTracker tracker;
+    tracker.setPath(prepared);
+    const auto robot = makePoint(test.x, test.y);
+    const auto handoff = tracker.initializePathHandoff(robot, 0.1);
+    EXPECT_EQ(buildHolonomicTrackingReference(*prepared, handoff, 0.1).mode,
+      test.pending ? HolonomicReferenceMode::kRotationPending :
+      HolonomicReferenceMode::kTranslation);
+    if (test.pending) {
+      EXPECT_NO_THROW(tracker.acknowledgeRotationComplete(0u));
+      EXPECT_EQ(buildHolonomicTrackingReference(*prepared, tracker.update(robot, 0.1), 0.1).mode,
+        HolonomicReferenceMode::kTranslation);
+    }
+  }
+
+  // A return leg is near the initial anchor but has already passed it along the path.
+  auto returning = makePath({{0.0, 0.0}, {0.0, 0.0}, {0.04, 0.0},
+      {0.04, 0.04}, {0.005, 0.04}, {0.005, 0.015}});
+  for (std::size_t i = 1; i < returning.poses.size(); ++i) {
+    setYaw(returning.poses[i], 0.6);
+  }
+  const auto return_prepared = preparePath(returning);
+  PathProgressTracker tracker;
+  tracker.setPath(return_prepared);
+  const auto handoff = tracker.initializePathHandoff(makePoint(0.005, 0.015), 0.1);
+  EXPECT_NEAR(handoff.progress_arc_length, 0.14, 1e-10);
+  EXPECT_NE(buildHolonomicTrackingReference(*return_prepared, handoff, 0.1).mode,
+    HolonomicReferenceMode::kRotationPending);
+}
+
+TEST(PathProgressTracker, initialRotationProtectionDoesNotBypassBranchAmbiguity)
+{
+  auto path = makePath({{0.0, 0.0}, {0.0, 0.0}, {1.0, 0.0},
+      {1.0, 0.01}, {0.0, 0.01}});
+  for (std::size_t i = 1; i < path.poses.size(); ++i) {
+    setYaw(path.poses[i], 0.6);
+  }
+  PathProgressTracker tracker;
+  tracker.setPath(preparePath(path));
+  EXPECT_THROW(tracker.initializePathHandoff(makePoint(0.005, 0.005), 0.1), std::domain_error);
+}
+
 TEST(PathProgressTracker, handoffSelectsClearlyNearestBranchDespiteRemoteAlternatives)
 {
   for (const bool reverse_order : {false, true}) {

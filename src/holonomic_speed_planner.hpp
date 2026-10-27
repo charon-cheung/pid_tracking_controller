@@ -2,6 +2,9 @@
 #define PID_TRACKING_CONTROLLER__HOLONOMIC_SPEED_PLANNER_HPP_
 
 #include <limits>
+#include <optional>
+
+#include "holonomic_command_limiter.hpp"
 
 #include "holonomic_tracking_reference.hpp"
 #include "prepared_path.hpp"
@@ -19,6 +22,8 @@ enum class HolonomicSpeedLimitReason
   kTangentRate,
   kStoppingDistance,
   kFeedbackBudget,
+  kAccelerationPreview,
+  kAccelerationBudget,
   kRotation,
   kTerminal
 };
@@ -58,6 +63,8 @@ struct HolonomicSpeedPlan
   double feedback_speed_limit{std::numeric_limits<double>::infinity()};
   // No feasible FF speed, or its minimum cannot yet be reached under acceleration limits.
   bool feedback_unreachable{false};
+  double acceleration_speed_limit{std::numeric_limits<double>::infinity()};
+  bool acceleration_unreachable{false};
   double max_abs_target_yaw_rate_per_meter{0.0};
   double max_abs_path_tangent_rate_per_meter{0.0};
   double representative_path_spacing{0.0};
@@ -92,7 +99,8 @@ public:
     double dt,
     double external_speed_limit = std::numeric_limits<double>::infinity(),
     double observed_speed = 0.0,
-    HolonomicTranslationFeedback feedback = {});
+    HolonomicTranslationFeedback feedback = {},
+    std::optional<HolonomicBodyCommand> previous_command = std::nullopt);
 
 private:
   HolonomicSpeedPlannerConfig config_;

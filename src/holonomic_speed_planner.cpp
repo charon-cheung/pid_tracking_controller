@@ -1,5 +1,7 @@
 #include "holonomic_speed_planner.hpp"
 
+#include "holonomic_acceleration_envelope.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <optional>
@@ -38,25 +40,29 @@ struct SpeedInterval
   long double upper{std::numeric_limits<long double>::infinity()};
 };
 
+void constrainAffineAxis(
+  SpeedInterval & interval, long double tangent, long double bias,
+  long double lower, long double upper)
+{
+  if (tangent == 0.0L) {
+    if (bias < lower || bias > upper) {
+      interval.upper = -1.0L;
+    }
+    return;
+  }
+  const long double first = (lower - bias) / tangent;
+  const long double second = (upper - bias) / tangent;
+  interval.lower = std::max(interval.lower, std::min(first, second));
+  interval.upper = std::min(interval.upper, std::max(first, second));
+}
+
 SpeedInterval feedbackSpeedInterval(
   long double tx, long double ty, const HolonomicTranslationFeedback & feedback,
   const HolonomicSpeedPlannerConfig & config, long double combined_limit)
 {
   SpeedInterval interval;
-  const auto constrainAxis = [&interval](long double tangent, long double bias, long double limit) {
-      if (tangent == 0.0L) {
-        if (std::abs(bias) > limit) {
-          interval.upper = -1.0L;
-        }
-        return;
-      }
-      const long double first = (-limit - bias) / tangent;
-      const long double second = (limit - bias) / tangent;
-      interval.lower = std::max(interval.lower, std::min(first, second));
-      interval.upper = std::min(interval.upper, std::max(first, second));
-    };
-  constrainAxis(tx, feedback.vx, config.max_vx);
-  constrainAxis(ty, feedback.vy, config.max_vy);
+  constrainAffineAxis(interval, tx, feedback.vx, -config.max_vx, config.max_vx);
+  constrainAffineAxis(interval, ty, feedback.vy, -config.max_vy, config.max_vy);
 
   // Intersect |v*t + feedback| <= combined_limit with the signed axis intervals.
   // A positive lower bound matters when FF can cancel opposing feedback.
@@ -189,8 +195,8 @@ RateSample spatialRates(
     }
 
     if (index != candidate.segment_index) {
-      tangent_delta += angles::normalize_angle(
-        segment.path_tangent - previous_tangent);
+      tangent_delta += std::abs(angles::normalize_angle(
+        segment.path_tangent - previous_tangent));
       previous_tangent = segment.path_tangent;
     }
 
@@ -353,7 +359,8 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   double dt,
   double external_speed_limit,
   double observed_speed,
-  HolonomicTranslationFeedback feedback)
+  HolonomicTranslationFeedback feedback,
+  std::optional<HolonomicBodyCommand> previous_command)
 {
   if (!path_) {
     throw std::logic_error("speed planner has no path");
@@ -361,7 +368,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   if (!std::isfinite(robot_yaw) || !std::isfinite(dt) || dt <= 0.0 ||
     std::isnan(external_speed_limit) || external_speed_limit < 0.0 ||
     !std::isfinite(observed_speed) || observed_speed < 0.0 ||
-    !std::isfinite(feedback.vx) || !std::isfinite(feedback.vy))
+    !std::isfinite(feedback.vx) || !std::isfinite(feedback.vy) ||
+    (previous_command && (!std::isfinite(previous_command->vx) ||
+    !std::isfinite(previous_command->vy))))
   {
     throw std::domain_error("speed planner inputs are invalid");
   }
@@ -499,6 +508,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
         propagatedSpeed(tangent_local_limit, config_.a_ref_down, distance));
     }
 
+    plan.acceleration_speed_limit = translationAccelerationSpeedLimit(
+      *path_, reference, robot_yaw, dt, external_speed_limit, config_);
+
     plan.stopping_distance = std::max(
       0.0, horizon_arc_length - current_arc_length);
     // Reserve distance consumed before a reduced command can affect the robot.
@@ -531,6 +543,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
       plan.reference_velocity_target, plan.speed_limit_reason);
     applyLimit(
       plan.tangent_speed_limit, HolonomicSpeedLimitReason::kTangentRate,
+      plan.reference_velocity_target, plan.speed_limit_reason);
+    applyLimit(
+      plan.acceleration_speed_limit, HolonomicSpeedLimitReason::kAccelerationPreview,
       plan.reference_velocity_target, plan.speed_limit_reason);
     applyLimit(
       plan.stopping_speed_limit, HolonomicSpeedLimitReason::kStoppingDistance,
@@ -567,6 +582,54 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     plan.reference_velocity,
     std::min({external_speed_limit, plan.axis_speed_limit, config_.max_xy_speed,
       plan.yaw_ff_speed_limit, plan.stopping_speed_limit, plan.feedback_speed_limit}));
+  // Only ordinary translation uses this rectangle. A previous command outside
+  // the stopping cap belongs to the limiter's separate braking/deceleration policy.
+  if (previous_command &&
+    std::hypot(previous_command->vx, previous_command->vy) <= plan.stopping_speed_limit)
+  {
+    const double tangent = reference.current.path_tangent - robot_yaw;
+    const long double tx = std::cos(tangent);
+    const long double ty = std::sin(tangent);
+    SpeedInterval reachable;
+    reachable.lower = std::max(static_cast<long double>(lower), feedback_interval.lower);
+    reachable.upper = std::min({static_cast<long double>(upper), feedback_interval.upper,
+      static_cast<long double>(external_speed_limit),
+      static_cast<long double>(plan.axis_speed_limit),
+      static_cast<long double>(config_.max_xy_speed),
+      static_cast<long double>(plan.yaw_ff_speed_limit),
+      static_cast<long double>(plan.stopping_speed_limit),
+      static_cast<long double>(plan.feedback_speed_limit)});
+    const long double dx = static_cast<long double>(config_.max_ax) * dt;
+    const long double dy = static_cast<long double>(config_.max_ay) * dt;
+    constrainAffineAxis(reachable, tx, feedback.vx,
+      static_cast<long double>(previous_command->vx) - dx,
+      static_cast<long double>(previous_command->vx) + dx);
+    constrainAffineAxis(reachable, ty, feedback.vy,
+      static_cast<long double>(previous_command->vy) - dy,
+      static_cast<long double>(previous_command->vy) + dy);
+    if (reachable.lower <= reachable.upper) {
+      const long double candidate = std::clamp(
+        static_cast<long double>(plan.reference_velocity), reachable.lower, reachable.upper);
+      double selected = static_cast<double>(candidate);
+      if (selected < reachable.lower) {
+        selected = std::nextafter(selected, std::numeric_limits<double>::infinity());
+      } else if (selected > reachable.upper) {
+        selected = std::nextafter(selected, -std::numeric_limits<double>::infinity());
+      }
+      if (selected >= reachable.lower && selected <= reachable.upper) {
+        if (selected != plan.reference_velocity) {
+          plan.speed_limit_reason = HolonomicSpeedLimitReason::kAccelerationBudget;
+        }
+        plan.reference_velocity = selected;
+      } else {
+        plan.acceleration_unreachable = true;
+      }
+    } else {
+      // No scalar FF can satisfy every axis this cycle. Keep the planned
+      // deceleration and let the unchanged final limiter handle the transition.
+      plan.acceleration_unreachable = true;
+    }
+  }
   // Do not jump upward to a positive feasibility bound; preserve reference acceleration.
   plan.feedback_unreachable = plan.feedback_unreachable ||
     static_cast<long double>(plan.reference_velocity) < feedback_interval.lower;

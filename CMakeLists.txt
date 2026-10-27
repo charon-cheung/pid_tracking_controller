@@ -42,6 +42,7 @@ add_library(${PROJECT_NAME} SHARED
   src/holonomic_command_limiter.cpp
   src/holonomic_control_law.cpp
   src/holonomic_speed_planner.cpp
+  src/holonomic_acceleration_envelope.cpp
   src/holonomic_tracking_reference.cpp
   src/path_progress_tracker.cpp
   src/prepared_path.cpp

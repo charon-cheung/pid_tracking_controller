@@ -3,6 +3,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -186,6 +187,63 @@ TEST_F(CommandContractTest, infeasibleFeedbackStillProducesBoundedCorrection)
   }
   EXPECT_NEAR(output.linear.x, 0.0, 1e-12);
   EXPECT_NEAR(output.linear.y, 0.2, 1e-12);
+}
+
+
+TEST_F(CommandContractTest, curvedTranslationKeepsAccelerationBoundsAndMakesProgress)
+{
+  speed_.nominal_tracking_speed = speed_.max_vx = speed_.max_xy_speed = 0.8;
+  speed_.max_vy = 0.4;
+  speed_.max_ax = speed_.max_ay = 1.0;
+  speed_.a_ref_up = 0.8;
+  speed_.a_ref_down = speed_.stopping_deceleration = 0.4;
+  limits_.max_vx = limits_.max_xy_speed = 0.8;
+  limits_.max_vy = 0.4;
+  limits_.max_ax = limits_.max_ay = 1.0;
+  limits_.max_decel_x = limits_.max_decel_y = 0.6;
+  initialize();
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (int index = 0; index <= 240; ++index) {
+    const double x = index * 0.025;
+    const double y = x >= 1.0 && x <= 5.0 ?
+      0.25 * (1.0 - std::cos(3.14159265358979323846 * (x - 1.0))) : 0.0;
+    path.poses.push_back(makeRobotPoseAt(x, y));
+  }
+  controller_.setPlan(path);
+  auto pose = makeRobotPoseAt(0.0, 0.0);
+  geometry_msgs::msg::Twist previous;
+  constexpr double dt = 1.0 / 15.0;
+  double max_distance = 0.0;
+  for (int cycle = 0; cycle < 600 && pose.pose.position.x < 5.5; ++cycle) {
+    const auto command = step(pose, previous, dt).twist;
+    ASSERT_TRUE(std::isfinite(command.linear.x));
+    ASSERT_TRUE(std::isfinite(command.linear.y));
+    EXPECT_LE(std::abs(command.linear.x - previous.linear.x), dt + 1e-6);
+    EXPECT_LE(std::abs(command.linear.y - previous.linear.y), dt + 1e-6);
+    EXPECT_LE(std::hypot(command.linear.x, command.linear.y), 0.8 + 1e-6);
+    // Ideal command-following plant: isolates controller/limiter behavior.
+    pose.pose.position.x += command.linear.x * dt;
+    pose.pose.position.y += command.linear.y * dt;
+    double nearest = std::numeric_limits<double>::infinity();
+    for (std::size_t index = 1; index < path.poses.size(); ++index) {
+      const auto & start = path.poses[index - 1u].pose.position;
+      const auto & end = path.poses[index].pose.position;
+      const double dx = end.x - start.x;
+      const double dy = end.y - start.y;
+      const double u = std::clamp(
+        ((pose.pose.position.x - start.x) * dx +
+        (pose.pose.position.y - start.y) * dy) / (dx * dx + dy * dy), 0.0, 1.0);
+      nearest = std::min(nearest, std::hypot(
+        pose.pose.position.x - start.x - u * dx,
+        pose.pose.position.y - start.y - u * dy));
+    }
+    max_distance = std::max(max_distance, nearest);
+    previous = command;
+  }
+  EXPECT_GT(pose.pose.position.x, 5.5);
+  EXPECT_LT(max_distance, 0.08);
+  RecordProperty("max_path_distance_m", std::to_string(max_distance));
 }
 
 TEST(Lookahead, lookaheadKeepsSpeedTimeClamp)
@@ -668,6 +726,29 @@ TEST_F(CommandContractTest, rotationRunAcknowledgesFinalYawAndResumesTranslation
     EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
   }
   EXPECT_GT(step(aligned).twist.linear.x, 0.0);
+}
+
+TEST_F(CommandContractTest, nearStartHandoffRotatesBeforeTranslatingDespitePositiveProjection)
+{
+  setRotationPath(true);
+  const auto unaligned = makeRobotPoseAt(0.005, 0.001);
+  geometry_msgs::msg::Twist measured;
+  for (int index = 0; index < 12; ++index) {
+    const auto command = step(unaligned, measured);
+    EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.0);
+    EXPECT_DOUBLE_EQ(command.twist.linear.y, 0.0);
+    measured = command.twist;
+  }
+  EXPECT_GT(measured.angular.z, 0.0);
+  const auto aligned = makeRobotPoseAt(0.005, 0.001, 0.2);
+  measured = geometry_msgs::msg::Twist();
+  // Existing completion checks and angular rate limiting govern release.
+  geometry_msgs::msg::TwistStamped command;
+  for (int index = 0; index < 15; ++index) {
+    command = step(aligned, measured);
+    measured = command.twist;
+  }
+  EXPECT_GT(command.twist.linear.x, 0.0);
 }
 
 TEST_F(CommandContractTest, finalRotationRunTransitionsToTerminalPositionFeedback)

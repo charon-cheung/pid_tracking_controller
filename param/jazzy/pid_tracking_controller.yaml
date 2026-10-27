@@ -18,8 +18,8 @@ controller_server:
       max_vy: 0.40
       max_xy_speed: 0.80
       max_omega: 0.60
-      max_ax: 1.0
-      max_ay: 1.0
+      max_ax: 1.1
+      max_ay: 1.1
       max_alpha: 0.50
       # In-place turn acceleration after stop confirmation; braking still uses max_alpha.
       rotation_max_alpha: 0.80

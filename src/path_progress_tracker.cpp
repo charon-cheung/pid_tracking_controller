@@ -13,6 +13,8 @@ namespace
 {
 
 constexpr double kGeometryEpsilon = 1e-10;
+// Handoff observation tolerance, separate from exact arc-boundary comparisons.
+constexpr double kInitialRotationHandoffDistance = 0.02;
 
 struct InterpolationResult
 {
@@ -336,11 +338,17 @@ PathProgressReference PathProgressTracker::initializePathHandoff(
     initialized.prepared_segment_lower_bound_ = selected->index;
     for (std::size_t index = 0; index < selected->index; ++index) {
       const auto & segment = path_->segments[index];
+      const bool near_initial_rotation = index == 0u &&
+        selected->arc <= kInitialRotationHandoffDistance &&
+        planarDistance(robot_position, path_->poses[segment.start_pose_index].pose.position) <=
+        kInitialRotationHandoffDistance;
       if (segment.type == PathSegmentType::kRotation &&
-        selected->arc <= segment.translation_s_begin + kRotationBoundaryArcTolerance)
+        (selected->arc <= segment.translation_s_begin + kRotationBoundaryArcTolerance ||
+        near_initial_rotation))
       {
         // A zero-length rotation run at this boundary is still pending, even
-        // when projection selected the outgoing translation's start.
+        // when projection selected the outgoing translation's start. Small
+        // initial observation offsets do not prove that the rotation was completed.
         initialized.prepared_segment_lower_bound_ = index;
         initialized.progress_arc_length_ = segment.translation_s_begin;
         break;
