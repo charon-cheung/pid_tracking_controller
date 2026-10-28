@@ -11,9 +11,13 @@ controller_server:
       min_lookahead_dist: 0.5
       max_lookahead_dist: 0.9
       kp_yaw: 1.0
+      # Fixed-heading translation only; thresholds are yaw errors in radians (2 / 1 degrees).
+      fixed_heading_yaw_hold: true
+      fixed_heading_yaw_enter_error: 0.03490658503988659
+      fixed_heading_yaw_exit_error: 0.017453292519943295
       kp_x: 1.0
       kp_y: 1.0
-      nominal_tracking_speed: 0.80
+      nominal_tracking_speed: 0.60  # 0.8
       max_vx: 0.80
       max_vy: 0.40
       max_xy_speed: 0.80

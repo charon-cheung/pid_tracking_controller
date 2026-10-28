@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "angles/angles.h"
+#include "fixed_heading_yaw_gate.hpp"
 #include "holonomic_command_limiter.hpp"
 #include "holonomic_control_law.hpp"
 #include "holonomic_speed_planner.hpp"
@@ -106,7 +107,8 @@ const char * holonomicLimitReasonName(HolonomicSpeedLimitReason reason)
 }  // namespace
 
 PidTrackingController::PidTrackingController()
-: path_progress_tracker_(std::make_unique<PathProgressTracker>())
+: fixed_heading_yaw_gate_(std::make_unique<FixedHeadingYawGate>()),
+  path_progress_tracker_(std::make_unique<PathProgressTracker>())
 {
 }
 
@@ -212,6 +214,13 @@ void PidTrackingController::configure(
         declare_parameter_if_not_declared(node, key, rclcpp::ParameterValue(initial));
         return node->get_parameter(key).as_double();
     };
+    FixedHeadingYawGateConfig yaw_gate_config;
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".fixed_heading_yaw_hold",
+            rclcpp::ParameterValue(yaw_gate_config.enabled));
+    node->get_parameter(controller_plugin_name + ".fixed_heading_yaw_hold", yaw_gate_config.enabled);
+    yaw_gate_config.enter_error = parameter("fixed_heading_yaw_enter_error", yaw_gate_config.enter_error);
+    yaw_gate_config.exit_error = parameter("fixed_heading_yaw_exit_error", yaw_gate_config.exit_error);
+    fixed_heading_yaw_gate_ = std::make_unique<FixedHeadingYawGate>(yaw_gate_config);
     RotationEntryGateConfig entry_config;
     entry_config.xy_speed_tolerance = rotation_xy_speed_tolerance_;
     entry_config.omega_tolerance = rotation_omega_tolerance_;
@@ -270,7 +279,8 @@ void PidTrackingController::configure(
             "max_alpha=%.3f rotation_max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f "
             "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f "
             "stopping_deceleration=%.3f stopping_delay=%.3f stopping_min_speed=%.3f "
-            "max_decel_x=%.3f max_decel_y=%.3f",
+            "max_decel_x=%.3f max_decel_y=%.3f "
+            "fixed_heading_yaw_hold=%s yaw_enter_error=%.6f yaw_exit_error=%.6f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
             speed_config.max_vy, speed_config.max_omega, speed_config.max_ax,
             speed_config.max_ay, limiter_config.max_alpha, *limiter_config.rotation_max_alpha,
@@ -278,7 +288,9 @@ void PidTrackingController::configure(
             control_gap_threshold_, entry_config.stop_confirm_time, entry_config.braking_timeout,
             speed_config.stopping_deceleration, speed_config.stopping_delay,
             speed_config.stopping_min_speed,
-            limiter_config.max_decel_x, limiter_config.max_decel_y);
+            limiter_config.max_decel_x, limiter_config.max_decel_y,
+            yaw_gate_config.enabled ? "true" : "false",
+            yaw_gate_config.enter_error, yaw_gate_config.exit_error);
     
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
@@ -361,6 +373,7 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
     RCLCPP_INFO(logger_, "PidTrackingController received a path");
     resetRotationState(true);
+    fixed_heading_yaw_gate_->reset();
     force_diagnostics_log_ = true;
     prepared_path_.reset();
     progress_handoff_pending_ = false;
@@ -478,6 +491,15 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     }
     input.reference_velocity = speed_plan.reference_velocity;
     auto raw = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
+    const bool was_yaw_suppressed = fixed_heading_yaw_gate_->suppressing();
+    if (reseed) {
+        fixed_heading_yaw_gate_->reset();
+    }
+    fixed_heading_yaw_gate_->apply(reference, raw);
+    const bool yaw_suppressed = fixed_heading_yaw_gate_->suppressing();
+    if (yaw_suppressed != was_yaw_suppressed) {
+        force_diagnostics_log_ = true;
+    }
     if (braking) {
         raw.vx = raw.vy = raw.omega = 0.0;
     }
@@ -523,7 +545,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "stop_speed_limit=%.6f stop_limit_unreachable=%s "
                 "feedback_speed_limit=%.6f feedback_unreachable=%s "
                 "acceleration_speed_limit=%.6f acceleration_unreachable=%s "
-                "vx_saturated=%s vy_saturated=%s xy_saturated=%s ax_limited=%s ay_limited=%s",
+                "vx_saturated=%s vy_saturated=%s xy_saturated=%s ax_limited=%s ay_limited=%s "
+                "yaw_hold=%s yaw_error=%.6f raw_omega=%.6f limited_omega=%.6f",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                 reseed ? "false" : "true",
                 speed_plan.reference_velocity,
@@ -535,7 +558,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 speed_plan.acceleration_speed_limit, speed_plan.acceleration_unreachable ? "true" : "false",
                 limited.vx_saturated ? "true" : "false", limited.vy_saturated ? "true" : "false",
                 limited.xy_saturated ? "true" : "false", limited.ax_limited ? "true" : "false",
-                limited.ay_limited ? "true" : "false");
+                limited.ay_limited ? "true" : "false", yaw_suppressed ? "true" : "false",
+                raw.yaw_error, raw.omega, limited.command.omega);
         if (rotating) {
             RCLCPP_INFO(logger_,
                     "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.9f "
@@ -598,7 +622,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     }
     last_holonomic_mode_ = static_cast<int>(reference.mode);
     if (raw_cmd_pub_ && raw_cmd_pub_->is_activated()) {
-        // Exact limiter input, including the rotation-entry braking gate.
+        // Exact limiter input, including yaw suppression and rotation-entry braking.
         geometry_msgs::msg::TwistStamped raw_command;
         raw_command.header = command.header;
         raw_command.twist.linear.x = raw.vx;

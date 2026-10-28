@@ -28,6 +28,7 @@ class PidTrackingControllerTestAccess;
 class PathProgressTracker;
 class RotationCompletionTracker;
 class RotationEntryGate;
+class FixedHeadingYawGate;
 class HolonomicSpeedPlanner;
 class HolonomicCommandLimiter;
 struct PreparedPath;
@@ -96,6 +97,7 @@ private:
   double rotation_settle_time_{0.30};
   std::unique_ptr<RotationCompletionTracker> rotation_completion_tracker_;
   std::unique_ptr<RotationEntryGate> rotation_entry_gate_;
+  std::unique_ptr<FixedHeadingYawGate> fixed_heading_yaw_gate_;
   bool rotation_pending_{false};
   bool last_rotation_braking_{false};
   std::size_t pending_rotation_segment_index_{0};

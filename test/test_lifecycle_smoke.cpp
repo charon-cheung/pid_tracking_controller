@@ -265,6 +265,8 @@ TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
     options.append_parameter_override("Controller.max_vx", 0.4);
     options.append_parameter_override("Controller.max_vy", 0.4);
     options.append_parameter_override("Controller.kp_y", 0.5);
+    options.append_parameter_override("Controller.fixed_heading_yaw_enter_error", 0.1);
+    options.append_parameter_override("Controller.fixed_heading_yaw_exit_error", 0.05);
     // Legacy activation constraints must no longer gate the active holonomic chain.
     options.append_parameter_override("Controller.cruise_speed", 0.8);
     options.append_parameter_override("Controller.max_v", 0.1);
@@ -287,6 +289,11 @@ TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
     measured.linear.y = 0.3;
     const auto seed = controller.computeVelocityCommands(makePose(0.0, 0.0), measured, nullptr);
     EXPECT_NEAR(seed.twist.linear.y, 0.2, 1e-12);  // max_xy 0.4, not nominal 0.1.
+    // 0.06 rad exceeds the default 2 degrees but is below the configured 0.1.
+    ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 1050000000LL), RCL_RET_OK);
+    const auto held = controller.computeVelocityCommands(
+      makePose(0.0, 0.06), geometry_msgs::msg::Twist(), nullptr);
+    EXPECT_DOUBLE_EQ(held.twist.angular.z, 0.0);
     controller.deactivate();
     controller.activate();
     controller.setSpeedLimit(0.0, false);
@@ -316,6 +323,19 @@ TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
       pose, geometry_msgs::msg::Twist(), nullptr);
     EXPECT_DOUBLE_EQ(recovered.twist.linear.x, 0.0);
     EXPECT_DOUBLE_EQ(recovered.twist.linear.y, 0.0);
+    controller.cleanup();
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter("Controller.kp_y", 0.5)).successful);
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter(
+      "Controller.fixed_heading_yaw_hold", false)).successful);
+    controller.configure(parent, "Controller", tf, costmap);
+    PidTrackingControllerTestAccess::setClock(controller, clock);
+    ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 1200000000LL), RCL_RET_OK);
+    controller.setPlan(makeLifecyclePath());
+    controller.computeVelocityCommands(makePose(0.0, 0.01), geometry_msgs::msg::Twist(), nullptr);
+    ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 1300000000LL), RCL_RET_OK);
+    const auto unfiltered = controller.computeVelocityCommands(
+      makePose(0.0, 0.01), geometry_msgs::msg::Twist(), nullptr);
+    EXPECT_NEAR(unfiltered.twist.angular.z, -0.01, 1e-12);
     controller.cleanup();
     costmap->cleanup();
   }
@@ -353,6 +373,15 @@ TEST(LifecycleSmoke, invalidHolonomicParameterFailsBeforeRuntimeCanBeUsed)
     EXPECT_EQ(parent->count_publishers("/pid_tracking_controller/carrot"), 0u);
     ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter(
       "PidTrackingController.max_alpha", 0.5)).successful);
+    // The failed configuration declared this default from the then-zero max_alpha.
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter(
+      "PidTrackingController.rotation_max_alpha", 0.5)).successful);
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter(
+      "PidTrackingController.fixed_heading_yaw_enter_error", 0.01)).successful);
+    EXPECT_THROW(
+      controller.configure(parent, "PidTrackingController", tf, costmap), std::invalid_argument);
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter(
+      "PidTrackingController.fixed_heading_yaw_enter_error", 0.03490658503988659)).successful);
     EXPECT_NO_THROW(
       controller.configure(parent, "PidTrackingController", tf, costmap));
     EXPECT_EQ(parent->count_publishers("/pid_tracking_controller/carrot"), 1u);

@@ -131,6 +131,60 @@ protected:
   PidTrackingController controller_;
 };
 
+TEST_F(CommandContractTest, fixedHeadingTranslationSuppressesSmallYawWithHysteresis)
+{
+  const double degree = std::acos(-1.0) / 180.0;
+  const auto settled = [&](double yaw) {
+      geometry_msgs::msg::Twist result;
+      for (int cycle = 0; cycle < 10; ++cycle) {
+        result = step(makeRobotPoseAt(0.0, -0.03, yaw)).twist;
+      }
+      return result;
+    };
+  const auto holding = settled(1.5 * degree);
+  EXPECT_DOUBLE_EQ(holding.angular.z, 0.0);
+  // Suppressing yaw must preserve both translation components and position correction.
+  EXPECT_GT(holding.linear.x, 0.0);
+  EXPECT_GT(holding.linear.y, 0.0);
+  EXPECT_NEAR(settled(2.5 * degree).angular.z, -2.5 * degree, 1e-12);
+  EXPECT_NEAR(settled(1.5 * degree).angular.z, -1.5 * degree, 1e-12);
+  EXPECT_DOUBLE_EQ(settled(0.5 * degree).angular.z, 0.0);
+  EXPECT_DOUBLE_EQ(settled(-1.5 * degree).angular.z, 0.0);
+}
+
+TEST_F(CommandContractTest, yawHoldResetOnNewPathAndControlGap)
+{
+  const double degree = std::acos(-1.0) / 180.0;
+  step(makeRobotPose(3.0 * degree));
+  EXPECT_LT(step(makeRobotPose(3.0 * degree)).twist.angular.z, -0.03);
+  controller_.setPlan(makeStraightPath({0.0, 1.0, 3.0}));
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    step(makeRobotPose(1.5 * degree));
+  }
+  EXPECT_DOUBLE_EQ(step(makeRobotPose(1.5 * degree)).twist.angular.z, 0.0);
+  step(makeRobotPose(3.0 * degree));
+  step(makeRobotPose(3.0 * degree));
+  step(makeRobotPose(1.5 * degree), geometry_msgs::msg::Twist(), 1.0);
+  EXPECT_DOUBLE_EQ(step(makeRobotPose(1.5 * degree)).twist.angular.z, 0.0);
+}
+
+TEST_F(CommandContractTest, yawHoldExitRetainsAngularDecelerationLimit)
+{
+  step(makeRobotPose(0.2));
+  geometry_msgs::msg::Twist output;
+  for (int cycle = 0; cycle < 10; ++cycle) {
+    output = step(makeRobotPose(0.2)).twist;
+  }
+  EXPECT_NEAR(output.angular.z, -0.2, 1e-12);
+  const auto stopping = step(makeRobotPose(0.005)).twist;
+  EXPECT_LT(stopping.angular.z, 0.0);
+  EXPECT_LE(std::abs(stopping.angular.z - output.angular.z), limits_.max_alpha * 0.1 + 1e-12);
+  for (int cycle = 0; cycle < 10; ++cycle) {
+    output = step(makeRobotPose(0.005)).twist;
+  }
+  EXPECT_DOUBLE_EQ(output.angular.z, 0.0);
+}
+
 TEST_F(CommandContractTest, saturatedFeedforwardPreservesNormalPositionCorrection)
 {
   speed_.nominal_tracking_speed = speed_.max_vx = speed_.max_xy_speed = 0.8;
