@@ -11,6 +11,8 @@ controller_server:
       min_lookahead_dist: 0.5
       max_lookahead_dist: 0.9
       kp_yaw: 1.0
+      # Odom-rate angular feedback low-pass (seconds); 0 disables. Stop checks stay raw.
+      omega_feedback_filter_tau: 0.05
       # Fixed-heading translation only; thresholds are yaw errors in radians (2 / 1 degrees).
       fixed_heading_yaw_hold: true
       fixed_heading_yaw_enter_error: 0.03490658503988659
@@ -18,9 +20,9 @@ controller_server:
       kp_x: 1.0
       kp_y: 1.0
       nominal_tracking_speed: 0.8   # 0.8
-      max_vx: 0.80
-      max_vy: 0.40
-      max_xy_speed: 0.9
+      max_vx: 0.8
+      max_vy: 0.5
+      max_xy_speed: 1.0
       max_omega: 0.60
       max_ax: 1.1
       max_ay: 1.1

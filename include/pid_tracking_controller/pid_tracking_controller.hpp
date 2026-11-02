@@ -15,6 +15,7 @@
 #include "nav2_costmap_2d/costmap_2d.hpp"
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "nav_msgs/msg/path.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/logger.hpp"
 #include "rclcpp/time.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -31,6 +32,7 @@ class RotationEntryGate;
 class FixedHeadingYawGate;
 class HolonomicSpeedPlanner;
 class HolonomicCommandLimiter;
+class AngularVelocityFeedbackFilter;
 struct PreparedPath;
 struct PathProgressReference;
 
@@ -87,6 +89,8 @@ private:
   std::atomic<double> external_speed_limit_{std::numeric_limits<double>::infinity()};
   std::unique_ptr<HolonomicSpeedPlanner> holonomic_speed_planner_;
   std::unique_ptr<HolonomicCommandLimiter> holonomic_command_limiter_;
+  std::shared_ptr<AngularVelocityFeedbackFilter> omega_feedback_filter_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr omega_feedback_sub_;
   rclcpp::Time last_control_time_{0, 0, RCL_ROS_TIME};
   bool control_time_valid_{false};
   bool rotation_last_all_conditions_{false};

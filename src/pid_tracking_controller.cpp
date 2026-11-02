@@ -8,12 +8,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <locale>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
 #include "angles/angles.h"
+#include "angular_velocity_feedback_filter.hpp"
 #include "fixed_heading_yaw_gate.hpp"
 #include "holonomic_command_limiter.hpp"
 #include "holonomic_control_law.hpp"
@@ -149,6 +153,8 @@ void PidTrackingController::configure(
     progress_handoff_pending_ = false;
     holonomic_speed_planner_.reset();
     holonomic_command_limiter_.reset();
+    omega_feedback_sub_.reset();
+    omega_feedback_filter_.reset();
     resetRotationState();
     logger_ = node->get_logger();
     clock_ = node->get_clock();
@@ -222,6 +228,10 @@ void PidTrackingController::configure(
     yaw_gate_config.enter_error = parameter("fixed_heading_yaw_enter_error", yaw_gate_config.enter_error);
     yaw_gate_config.exit_error = parameter("fixed_heading_yaw_exit_error", yaw_gate_config.exit_error);
     fixed_heading_yaw_gate_ = std::make_unique<FixedHeadingYawGate>(yaw_gate_config);
+    const double omega_filter_tau = parameter("omega_feedback_filter_tau", 0.05);
+    if (!std::isfinite(omega_filter_tau) || omega_filter_tau < 0.0) {
+        throw std::invalid_argument("omega_feedback_filter_tau must be finite and nonnegative");
+    }
     RotationEntryGateConfig entry_config;
     entry_config.xy_speed_tolerance = rotation_xy_speed_tolerance_;
     entry_config.omega_tolerance = rotation_omega_tolerance_;
@@ -315,6 +325,57 @@ void PidTrackingController::configure(
     raw_cmd_pub_ = node->create_publisher<geometry_msgs::msg::TwistStamped>(
       "tracking_cmd_vel_raw", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
 
+    if (omega_filter_tau > 0.0) {
+        declare_parameter_if_not_declared(node, "odom_topic", rclcpp::ParameterValue("odom"));
+        const auto topic = node->get_parameter("odom_topic").as_string();
+        omega_feedback_filter_ = std::make_shared<AngularVelocityFeedbackFilter>(omega_filter_tau);
+        omega_feedback_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
+                topic, rclcpp::SensorDataQoS(),
+                [filter = omega_feedback_filter_, frame = base_frame_](
+                    const nav_msgs::msg::Odometry::ConstSharedPtr message) {
+                    if (message->child_frame_id != frame) {
+                        filter->reset();
+                        return;
+                    }
+                    const int64_t stamp_ns = static_cast<int64_t>(message->header.stamp.sec) *
+                            1000000000LL + message->header.stamp.nanosec;
+                    filter->update(message->twist.twist.angular.z, stamp_ns);
+                });
+    }
+    RCLCPP_INFO(logger_, "PID_LOG omega_feedback_filter tau=%.6f max_age=0.100 "
+            "stop_source=raw reseed_source=%s", omega_filter_tau,
+            omega_feedback_filter_ ? "filtered_if_fresh" : "raw");
+
+    // Snapshot live values rather than reading a possibly different YAML on disk.
+    // Keep one parameter per line so downstream tools retain names and value types.
+    auto parameter_names = node->list_parameters({controller_plugin_name}, 0).names;
+    for (const auto * name : {"controller_frequency", "failure_tolerance", "publish_zero_velocity"}) {
+        parameter_names.emplace_back(name);
+    }
+    std::sort(parameter_names.begin(), parameter_names.end());
+    RCLCPP_INFO(logger_, "PID_LOG parameter_snapshot_begin controller=%s count=%zu",
+            controller_plugin_name.c_str(), parameter_names.size());
+    for (const auto & name : parameter_names) {
+        rclcpp::Parameter entry;
+        const bool available = node->get_parameter(name, entry);
+        std::ostringstream value;
+        value.imbue(std::locale::classic());
+        if (!available) {
+            value << "null";
+        } else if (entry.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+            value << std::setprecision(std::numeric_limits<double>::max_digits10) << entry.as_double();
+        } else if (entry.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
+            value << std::quoted(entry.as_string());
+        } else {
+            value << entry.value_to_string();
+        }
+        RCLCPP_INFO(logger_, "PID_LOG parameter name=%s type=%s value=%s",
+                name.c_str(), available ? entry.get_type_name().c_str() : "not_set",
+                value.str().c_str());
+    }
+    RCLCPP_INFO(logger_, "PID_LOG parameter_snapshot_end controller=%s count=%zu",
+            controller_plugin_name.c_str(), parameter_names.size());
+
     plan_revision_ = 0;
     force_diagnostics_log_ = true;
 
@@ -332,6 +393,9 @@ void PidTrackingController::configure(
 void PidTrackingController::activate()
 {
     control_time_valid_ = false;
+    if (omega_feedback_filter_) {
+        omega_feedback_filter_->reset();
+    }
     resetRotationState();
     if (carrot_pub_) {
         carrot_pub_->on_activate();
@@ -345,6 +409,9 @@ void PidTrackingController::activate()
 void PidTrackingController::deactivate()
 {
     control_time_valid_ = false;
+    if (omega_feedback_filter_) {
+        omega_feedback_filter_->reset();
+    }
     resetRotationState();
     if (carrot_pub_) {
         carrot_pub_->on_deactivate();
@@ -357,6 +424,8 @@ void PidTrackingController::deactivate()
 void PidTrackingController::cleanup()
 {
     control_time_valid_ = false;
+    omega_feedback_sub_.reset();
+    omega_feedback_filter_.reset();
     holonomic_speed_planner_.reset();
     holonomic_command_limiter_.reset();
     resetRotationState();
@@ -473,6 +542,12 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         pending_rotation_segment_index_ = *reference.pending_rotation_segment_index;
     }
     const HolonomicBodyCommand measured{velocity.linear.x, velocity.linear.y, velocity.angular.z};
+    const auto omega_sample = omega_feedback_filter_ ?
+            omega_feedback_filter_->sample(now.nanoseconds()) : std::nullopt;
+    auto limiter_measured = measured;
+    if (omega_sample) {
+        limiter_measured.omega = omega_sample->filtered;
+    }
     const bool braking = rotating && !rotation_entry_gate_->beginCycle(measured);
     if (braking != last_rotation_braking_) {
         force_diagnostics_log_ = true;
@@ -524,7 +599,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     }
     const auto limited = holonomic_command_limiter_->limit(
             {raw.vx, raw.vy, raw.omega},
-            measured,
+            limiter_measured,
             reseed ? 0.0 : dt, cap, speed_plan.stopping_speed_limit, rotating && !braking);
     last_commanded_planar_speed_ = std::hypot(limited.command.vx, limited.command.vy);
     geometry_msgs::msg::TwistStamped command;
@@ -565,7 +640,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "feedback_speed_limit=%.6f feedback_unreachable=%s "
                 "acceleration_speed_limit=%.6f acceleration_unreachable=%s "
                 "vx_saturated=%s vy_saturated=%s xy_saturated=%s ax_limited=%s ay_limited=%s "
-                "yaw_hold=%s yaw_error=%.6f raw_omega=%.6f limited_omega=%.6f",
+                "yaw_hold=%s yaw_error=%.6f raw_omega=%.6f limited_omega=%.6f "
+                "measured_omega=%.6f filtered_omega=%.6f omega_filter_valid=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                 reseed ? "false" : "true",
                 speed_plan.reference_velocity,
@@ -578,7 +654,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 limited.vx_saturated ? "true" : "false", limited.vy_saturated ? "true" : "false",
                 limited.xy_saturated ? "true" : "false", limited.ax_limited ? "true" : "false",
                 limited.ay_limited ? "true" : "false", yaw_suppressed ? "true" : "false",
-                raw.yaw_error, raw.omega, limited.command.omega);
+                raw.yaw_error, raw.omega, limited.command.omega,
+                measured.omega, limiter_measured.omega, omega_sample ? "true" : "false");
         if (rotating) {
             RCLCPP_INFO(logger_,
                     "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.9f "

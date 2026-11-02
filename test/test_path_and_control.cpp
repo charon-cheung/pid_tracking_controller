@@ -9,6 +9,7 @@
 #include "gtest/gtest.h"
 
 #include "controller_test_access.hpp"
+#include "angular_velocity_feedback_filter.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "rclcpp/clock.hpp"
 #include "rcl/time.h"
@@ -130,6 +131,65 @@ protected:
   nav2_costmap_2d::Costmap2D costmap_{100, 100, 0.05, -2.5, -2.5};
   PidTrackingController controller_;
 };
+
+TEST_F(CommandContractTest, filtersOnlyAngularReseedingAndKeepsHistoryAcrossTasks)
+{
+  auto filter = std::make_shared<AngularVelocityFeedbackFilter>(0.05);
+  PidTrackingControllerTestAccess::setOmegaFeedbackFilter(controller_, filter);
+  filter->update(0.0, now_ns_ + 90000000LL);
+  filter->update(0.1, now_ns_ + 100000000LL);
+  geometry_msgs::msg::Twist measured;
+  measured.linear.x = 0.1;
+  measured.linear.y = -0.05;
+  measured.angular.z = 0.1;
+  const auto first = step(makeRobotPose(), measured).twist;
+  EXPECT_NEAR(first.angular.z, 0.0181269246922, 1e-12);
+  EXPECT_DOUBLE_EQ(first.linear.x, measured.linear.x);
+  EXPECT_DOUBLE_EQ(first.linear.y, measured.linear.y);
+  controller_.reset();
+  controller_.setPlan(makeStraightPath({0.0, 1.0}));
+  EXPECT_NEAR(step(makeRobotPose(), measured, 0.01).twist.angular.z, first.angular.z, 1e-12);
+  // A control gap with no fresh odometry must use the original feedback.
+  EXPECT_DOUBLE_EQ(step(makeRobotPose(), measured, 0.6).twist.angular.z, measured.angular.z);
+}
+
+TEST_F(CommandContractTest, filteredNearZeroCannotAdmitRotationWhileRawFeedbackMoves)
+{
+  auto filter = std::make_shared<AngularVelocityFeedbackFilter>(0.05);
+  PidTrackingControllerTestAccess::setOmegaFeedbackFilter(controller_, filter);
+  setRotationPath(true);
+  geometry_msgs::msg::Twist moving;
+  moving.angular.z = 0.02;  // Above this fixture's 0.01 rad/s raw stop threshold.
+  for (int i = 0; i < 15; ++i) {
+    filter->update(0.0, now_ns_ + 99000000LL);
+    filter->update(moving.angular.z, now_ns_ + 100000000LL);
+    const auto output = step(makeRobotPose(), moving).twist;
+    EXPECT_DOUBLE_EQ(output.linear.x, 0.0);
+    EXPECT_LT(std::abs(output.angular.z), 0.01);
+  }
+}
+
+TEST_F(CommandContractTest, filteredNearZeroCannotCompleteRotationWhileRawFeedbackMoves)
+{
+  setRotationPath(true);
+  const auto aligned = makeRobotPose(0.2);
+  for (int i = 0; i < 4; ++i) {
+    step(aligned);  // Admit rotation with genuine stopped measurements.
+  }
+  auto filter = std::make_shared<AngularVelocityFeedbackFilter>(0.05);
+  PidTrackingControllerTestAccess::setOmegaFeedbackFilter(controller_, filter);
+  geometry_msgs::msg::Twist moving;
+  moving.angular.z = 0.02;
+  for (int i = 0; i < 10; ++i) {
+    filter->update(0.0, now_ns_ + 99000000LL);
+    filter->update(moving.angular.z, now_ns_ + 100000000LL);
+    EXPECT_DOUBLE_EQ(step(aligned, moving).twist.linear.x, 0.0);
+  }
+  for (int i = 0; i < 5; ++i) {
+    step(aligned);
+  }
+  EXPECT_GT(step(aligned).twist.linear.x, 0.0);
+}
 
 TEST_F(CommandContractTest, growingOutwardTurnErrorHoldsAccelerationButPreservesCorrection)
 {

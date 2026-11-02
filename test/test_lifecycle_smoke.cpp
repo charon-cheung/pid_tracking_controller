@@ -137,6 +137,13 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
     rclcpp::NodeOptions parent_options;
     auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
       "pid_tracking_controller_test_node", parent_options);
+    parent->declare_parameter("controller_frequency", 15.0);
+    parent->declare_parameter("failure_tolerance", 0.0);
+    parent->declare_parameter("publish_zero_velocity", true);
+    parent->declare_parameter("PidTrackingController.plugin",
+      "pid_tracking_controller::PidTrackingController");
+    parent->declare_parameter("PidTrackingController.fixed_heading_yaw_enter_error",
+      0.03490658503988659);
     auto observer = std::make_shared<rclcpp::Node>(
       "pid_tracking_controller_test_observer");
     auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(
@@ -236,6 +243,22 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
       observer->count_publishers("/pid_tracking_controller/tracking_diagnostics"), 0u);
     EXPECT_NE(log_capture.output().find("PID_LOG holonomic_parameters"), std::string::npos);
     EXPECT_NE(log_capture.output().find("nominal=0.200"), std::string::npos);
+    for (const auto & name : parent->list_parameters({"PidTrackingController"}, 0).names) {
+      EXPECT_NE(log_capture.output().find("PID_LOG parameter name=" + name + " type="),
+        std::string::npos) << name;
+    }
+    for (const auto & field : {
+        "name=controller_frequency type=double value=15",
+        "name=failure_tolerance type=double value=0",
+        "name=publish_zero_velocity type=bool value=true",
+        "name=PidTrackingController.plugin type=string value=\"pid_tracking_controller::PidTrackingController\"",
+        "name=PidTrackingController.base_frame type=string value=\"base_link\"",
+        "name=PidTrackingController.fixed_heading_yaw_enter_error type=double value=0.03490658503988659"})
+    {
+      EXPECT_NE(log_capture.output().find(field), std::string::npos) << field;
+    }
+    EXPECT_NE(log_capture.output().find("PID_LOG parameter_snapshot_begin"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("PID_LOG parameter_snapshot_end"), std::string::npos);
     EXPECT_NE(log_capture.output().find("PID_LOG holonomic plan_revision=1"), std::string::npos);
     EXPECT_NE(log_capture.output().find("mode=translation"), std::string::npos);
     EXPECT_NE(log_capture.output().find("planner_step=true"), std::string::npos);
@@ -336,6 +359,94 @@ TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
     const auto unfiltered = controller.computeVelocityCommands(
       makePose(0.0, 0.01), geometry_msgs::msg::Twist(), nullptr);
     EXPECT_NEAR(unfiltered.twist.angular.z, -0.01, 1e-12);
+    controller.cleanup();
+    costmap->cleanup();
+  }
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, odometryCallbackFiltersReseedingAndFallsBackAcrossLifecycle)
+{
+  rclcpp::init(0, nullptr);
+  {
+    ScopedLogCapture logs;
+    rclcpp::NodeOptions options;
+    options.append_parameter_override("odom_topic", "/omega_feedback_test_odom");
+    options.append_parameter_override("Controller.base_frame", "rbs_base_link");
+    auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>("omega_feedback_parent", options);
+    auto publisher_node = std::make_shared<rclcpp::Node>("omega_feedback_publisher");
+    auto publisher = publisher_node->create_publisher<nav_msgs::msg::Odometry>(
+      "/omega_feedback_test_odom", rclcpp::QoS(10));
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("omega_feedback_costmap");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->configure();
+    ASSERT_EQ(costmap->get_current_state().label(), "inactive");
+    auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+    auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+    ASSERT_EQ(rcl_enable_ros_time_override(clock->get_clock_handle()), RCL_RET_OK);
+    PidTrackingController controller;
+    controller.configure(parent, "Controller", tf, costmap);
+    controller.activate();
+    PidTrackingControllerTestAccess::setClock(controller, clock);
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(parent->get_node_base_interface());
+    executor.add_node(publisher_node);
+    const auto discovery_deadline = std::chrono::steady_clock::now() + 2s;
+    while (publisher->get_subscription_count() == 0u &&
+      std::chrono::steady_clock::now() < discovery_deadline)
+    {
+      executor.spin_some();
+      std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_GT(publisher->get_subscription_count(), 0u);
+    const auto send_and_check = [&](double omega, int64_t stamp, const std::string & frame,
+        double expected, bool valid) {
+        nav_msgs::msg::Odometry message;
+        message.header.stamp = rclcpp::Time(stamp);
+        message.child_frame_id = frame;
+        message.twist.twist.angular.z = omega;
+        ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), stamp), RCL_RET_OK);
+        controller.reset();
+        controller.setPlan(makeLifecyclePath());
+        publisher->publish(message);
+        geometry_msgs::msg::Twist measured;
+        measured.linear.x = 0.1;
+        measured.angular.z = omega;
+        bool matched = false;
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (std::chrono::steady_clock::now() < deadline && !matched) {
+          executor.spin_some();
+          const auto begin = logs.output().size();
+          const auto command = controller.computeVelocityCommands(makePose(0.0, 0.0), measured, nullptr);
+          const auto cycle_log = logs.output().substr(begin);
+          matched = std::abs(command.twist.angular.z - expected) < 1e-10 &&
+            cycle_log.find(valid ? "omega_filter_valid=true" : "omega_filter_valid=false") !=
+            std::string::npos;
+          EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.1);
+          if (!matched) {
+            std::this_thread::sleep_for(5ms);
+          }
+        }
+        EXPECT_TRUE(matched) << "omega=" << omega << " expected=" << expected;
+      };
+    send_and_check(0.2, 1000000000LL, "rbs_base_link", 0.2, true);
+    send_and_check(0.1, 1010000000LL, "rbs_base_link", 0.1818730753078, true);
+    send_and_check(-0.2, 1020000000LL, "wrong_frame", -0.2, false);
+    send_and_check(0.3, 1030000000LL, "rbs_base_link", 0.3, true);
+    controller.deactivate();
+    controller.activate();
+    send_and_check(-0.1, 1040000000LL, "rbs_base_link", -0.1, true);
+    controller.deactivate();
+    controller.cleanup();
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter("Controller.omega_feedback_filter_tau", 0.0)).successful);
+    controller.configure(parent, "Controller", tf, costmap);
+    controller.activate();
+    PidTrackingControllerTestAccess::setClock(controller, clock);
+    send_and_check(0.1, 1050000000LL, "rbs_base_link", 0.1, false);
+    controller.deactivate();
+    controller.cleanup();
+    ASSERT_TRUE(parent->set_parameter(rclcpp::Parameter("Controller.omega_feedback_filter_tau", -0.1)).successful);
+    EXPECT_THROW(controller.configure(parent, "Controller", tf, costmap), std::invalid_argument);
     controller.cleanup();
     costmap->cleanup();
   }

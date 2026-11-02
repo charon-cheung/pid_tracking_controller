@@ -29,6 +29,13 @@ public:
     controller.control_time_valid_ = false;
   }
 
+  static void setOmegaFeedbackFilter(
+    PidTrackingController & controller,
+    const std::shared_ptr<AngularVelocityFeedbackFilter> & filter)
+  {
+    controller.omega_feedback_filter_ = filter;
+  }
+
   static void setLookaheadParameters(
     PidTrackingController & controller, double time, double minimum, double maximum)
   {

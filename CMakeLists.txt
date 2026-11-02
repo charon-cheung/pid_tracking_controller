@@ -39,6 +39,7 @@ set(dependencies
 
 add_library(${PROJECT_NAME} SHARED
   src/pid_tracking_controller.cpp
+  src/angular_velocity_feedback_filter.cpp
   src/holonomic_command_limiter.cpp
   src/holonomic_control_law.cpp
   src/fixed_heading_yaw_gate.cpp
@@ -148,6 +149,10 @@ if(BUILD_TESTING)
   target_include_directories(test_fixed_heading_yaw_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   ament_target_dependencies(test_fixed_heading_yaw_gate geometry_msgs nav_msgs)
   target_link_libraries(test_fixed_heading_yaw_gate ${PROJECT_NAME})
+
+  ament_add_gtest(test_angular_velocity_feedback_filter test/test_angular_velocity_feedback_filter.cpp)
+  target_include_directories(test_angular_velocity_feedback_filter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_angular_velocity_feedback_filter ${PROJECT_NAME})
 
   ament_add_gtest(test_holonomic_speed_planner
     test/test_holonomic_speed_planner.cpp
