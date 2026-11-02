@@ -42,6 +42,7 @@ add_library(${PROJECT_NAME} SHARED
   src/holonomic_command_limiter.cpp
   src/holonomic_control_law.cpp
   src/fixed_heading_yaw_gate.cpp
+  src/translation_tracking_guard.cpp
   src/holonomic_speed_planner.cpp
   src/holonomic_acceleration_envelope.cpp
   src/holonomic_tracking_reference.cpp
@@ -161,6 +162,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_holonomic_speed_planner
     ${PROJECT_NAME}
   )
+
+  ament_add_gtest(test_translation_tracking_guard test/test_translation_tracking_guard.cpp)
+  target_include_directories(test_translation_tracking_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_translation_tracking_guard ${PROJECT_NAME})
 
   ament_add_gtest(test_holonomic_command_limiter
     test/test_holonomic_command_limiter.cpp

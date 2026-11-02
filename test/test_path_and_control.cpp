@@ -131,6 +131,54 @@ protected:
   PidTrackingController controller_;
 };
 
+TEST_F(CommandContractTest, growingOutwardTurnErrorHoldsAccelerationButPreservesCorrection)
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (int i = 0; i <= 60; ++i) {
+    path.poses.push_back(makeRobotPoseAt(2.0 * std::sin(0.05 * i),
+      2.0 * (1.0 - std::cos(0.05 * i))));
+  }
+  const double tangent = 0.275;  // Outgoing chord at theta=0.25.
+  const double tx = std::cos(tangent), ty = std::sin(tangent);
+  const double nx = -ty, ny = tx;
+  for (const double side : {-1.0, 1.0}) {
+    const auto run = [&](bool guard_enabled) {
+        speed_.nominal_tracking_speed = speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = 0.8;
+        speed_.max_ax = speed_.max_ay = 1.1;
+        speed_.a_ref_up = 0.2;
+        speed_.a_ref_down = speed_.stopping_deceleration = 0.4;
+        speed_.tracking_guard.enter_error = guard_enabled ? 0.03 : 10.0;
+        speed_.tracking_guard.exit_error = guard_enabled ? 0.015 : 5.0;
+        limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = 0.8;
+        limits_.max_ax = limits_.max_ay = 1.1;
+        initialize();
+        controller_.setPlan(path);
+        geometry_msgs::msg::Twist measured;
+        measured.linear.x = 0.2 * tx + side * 0.1 * nx;
+        measured.linear.y = 0.2 * ty + side * 0.1 * ny;
+        geometry_msgs::msg::Twist result;
+        for (int i = 0; i < 12; ++i) {
+          const double error = side * (0.04 + 0.003 * i);
+          result = step(makeRobotPoseAt(path.poses[5].pose.position.x + error * nx,
+            path.poses[5].pose.position.y + error * ny), measured).twist;
+        }
+        return result;
+      };
+    const auto guarded = run(true);
+    const auto baseline = run(false);
+    // The inside offset projects onto the incoming chord (0.225 rad),
+    // while the outside offset keeps the outgoing chord (0.275 rad).
+    const double accepted_tangent = side > 0.0 ? 0.225 : 0.275;
+    const double along_x = std::cos(accepted_tangent), along_y = std::sin(accepted_tangent);
+    EXPECT_LT(along_x * guarded.linear.x + along_y * guarded.linear.y,
+      along_x * baseline.linear.x + along_y * baseline.linear.y - 0.05);
+    EXPECT_NEAR(-along_y * guarded.linear.x + along_x * guarded.linear.y,
+      -along_y * baseline.linear.x + along_x * baseline.linear.y, 1e-9);
+    EXPECT_GT(-side * (-along_y * guarded.linear.x + along_x * guarded.linear.y), 0.06);
+  }
+}
+
 TEST_F(CommandContractTest, fixedHeadingTranslationSuppressesSmallYawWithHysteresis)
 {
   const double degree = std::acos(-1.0) / 180.0;

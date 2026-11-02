@@ -8,6 +8,7 @@
 
 #include "holonomic_tracking_reference.hpp"
 #include "prepared_path.hpp"
+#include "translation_tracking_guard.hpp"
 
 namespace pid_tracking_controller
 {
@@ -25,7 +26,8 @@ enum class HolonomicSpeedLimitReason
   kAccelerationPreview,
   kAccelerationBudget,
   kRotation,
-  kTerminal
+  kTerminal,
+  kTrackingResponse
 };
 
 struct HolonomicSpeedPlannerConfig
@@ -46,6 +48,9 @@ struct HolonomicSpeedPlannerConfig
   double stopping_min_speed{0.04};
   double yaw_feedback_reserve{0.1};
   double configured_min_rate_window{0.3};
+  // Tracking normal-acceleration budget; physical command limits remain unchanged.
+  double max_translation_curve_accel{0.35};
+  TranslationTrackingGuardConfig tracking_guard;
 };
 
 struct HolonomicSpeedPlan
@@ -67,6 +72,9 @@ struct HolonomicSpeedPlan
   bool acceleration_unreachable{false};
   double max_abs_target_yaw_rate_per_meter{0.0};
   double max_abs_path_tangent_rate_per_meter{0.0};
+  double local_path_tangent_rate_per_meter{0.0};
+  double tracking_speed_limit{std::numeric_limits<double>::infinity()};
+  bool tracking_acceleration_held{false};
   double representative_path_spacing{0.0};
   double rate_window_length{0.0};
   HolonomicSpeedLimitReason speed_limit_reason{HolonomicSpeedLimitReason::kNominal};
@@ -76,6 +84,13 @@ struct HolonomicTranslationFeedback
 {
   double vx{0.0};
   double vy{0.0};
+};
+
+struct HolonomicTrackingObservation
+{
+  double lateral_error{0.0};  // Robot-minus-path along the left normal, metres.
+  double measured_vx{0.0};  // Body-frame measured velocity, m/s.
+  double measured_vy{0.0};
 };
 
 double convertExternalSpeedLimitToAbsolute(
@@ -100,11 +115,13 @@ public:
     double external_speed_limit = std::numeric_limits<double>::infinity(),
     double observed_speed = 0.0,
     HolonomicTranslationFeedback feedback = {},
-    std::optional<HolonomicBodyCommand> previous_command = std::nullopt);
+    std::optional<HolonomicBodyCommand> previous_command = std::nullopt,
+    std::optional<HolonomicTrackingObservation> observation = std::nullopt);
 
 private:
   HolonomicSpeedPlannerConfig config_;
   PreparedPathPtr path_;
+  TranslationTrackingGuard tracking_guard_;
   double previous_reference_velocity_{0.0};
   double representative_path_spacing_{0.0};
   double rate_window_length_{0.0};

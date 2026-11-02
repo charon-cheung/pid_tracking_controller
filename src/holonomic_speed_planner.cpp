@@ -104,7 +104,9 @@ bool configIsValid(const HolonomicSpeedPlannerConfig & config)
          config.yaw_feedback_reserve >= 0.0 &&
          config.yaw_feedback_reserve < config.max_omega &&
          std::isfinite(config.configured_min_rate_window) &&
-         config.configured_min_rate_window >= 0.0;
+         config.configured_min_rate_window >= 0.0 &&
+         std::isfinite(config.max_translation_curve_accel) &&
+         config.max_translation_curve_accel > 0.0;
 }
 
 bool pointIsFinite(const geometry_msgs::msg::Point & point)
@@ -326,7 +328,7 @@ double convertExternalSpeedLimitToAbsolute(
 
 HolonomicSpeedPlanner::HolonomicSpeedPlanner(
   const HolonomicSpeedPlannerConfig & config)
-: config_(config)
+: config_(config), tracking_guard_(config.tracking_guard)
 {
   if (!configIsValid(config_)) {
     throw std::invalid_argument("holonomic speed planner configuration is invalid");
@@ -339,6 +341,7 @@ void HolonomicSpeedPlanner::setPath(PreparedPathPtr path)
     throw std::invalid_argument("speed planner path must not be empty");
   }
   path_ = std::move(path);
+  tracking_guard_.reset();
   representative_path_spacing_ = representativeSpacing(*path_);
   rate_window_length_ = std::max(
     config_.configured_min_rate_window,
@@ -351,6 +354,7 @@ void HolonomicSpeedPlanner::seed(double reference_velocity)
     throw std::domain_error("speed planner seed must be finite and nonnegative");
   }
   previous_reference_velocity_ = reference_velocity;
+  tracking_guard_.reset();
 }
 
 HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
@@ -360,7 +364,8 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   double external_speed_limit,
   double observed_speed,
   HolonomicTranslationFeedback feedback,
-  std::optional<HolonomicBodyCommand> previous_command)
+  std::optional<HolonomicBodyCommand> previous_command,
+  std::optional<HolonomicTrackingObservation> observation)
 {
   if (!path_) {
     throw std::logic_error("speed planner has no path");
@@ -370,7 +375,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     !std::isfinite(observed_speed) || observed_speed < 0.0 ||
     !std::isfinite(feedback.vx) || !std::isfinite(feedback.vy) ||
     (previous_command && (!std::isfinite(previous_command->vx) ||
-    !std::isfinite(previous_command->vy))))
+    !std::isfinite(previous_command->vy))) ||
+    (observation && (!std::isfinite(observation->lateral_error) ||
+    !std::isfinite(observation->measured_vx) || !std::isfinite(observation->measured_vy))))
   {
     throw std::domain_error("speed planner inputs are invalid");
   }
@@ -391,6 +398,7 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
       plan.stopping_speed_limit = 0.0;
     }
     previous_reference_velocity_ = 0.0;
+    tracking_guard_.reset();
     return plan;
   } else {
     const auto & cursor = reference.current.cursor;
@@ -415,6 +423,10 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     const double horizon_arc_length = rotation_ahead ?
       path_->segments[rotation_index].translation_s_begin :
       path_->total_translation_length;
+
+    plan.local_path_tangent_rate_per_meter = spatialRates(
+      *path_, {current_arc_length, cursor.segment_index}, rotation_index,
+      horizon_arc_length, rate_window_length_).path_tangent_rate;
 
     const double omega_available = config_.max_omega - config_.yaw_feedback_reserve;
     const auto yawFeedforwardSpeed = [omega_available](double rate) {
@@ -465,7 +477,8 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
             horizon_arc_length)});
     }
 
-    const double normal_acceleration = std::min(config_.max_ax, config_.max_ay);
+    const double normal_acceleration =
+      std::min({config_.max_translation_curve_accel, config_.max_ax, config_.max_ay});
     // Between event points each spatial rate is monotone. Applying the larger
     // endpoint magnitude from the earlier distance is conservative over the
     // complete interval, including an interior propagated-speed minimum.
@@ -573,9 +586,25 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     }
   }
 
+  if (observation) {
+    const double tangent = reference.current.path_tangent - robot_yaw;
+    const double normal_speed = -std::sin(tangent) * observation->measured_vx +
+      std::cos(tangent) * observation->measured_vy;
+    plan.tracking_acceleration_held = tracking_guard_.update(
+      observation->lateral_error, normal_speed, plan.local_path_tangent_rate_per_meter, dt);
+    if (plan.tracking_acceleration_held) {
+      plan.tracking_speed_limit = previous_reference_velocity_;
+      applyLimit(plan.tracking_speed_limit, HolonomicSpeedLimitReason::kTrackingResponse,
+        plan.reference_velocity_target, plan.speed_limit_reason);
+    }
+  } else {
+    tracking_guard_.reset();
+  }
+
   const double lower = std::max(
     0.0, previous_reference_velocity_ - config_.a_ref_down * dt);
-  const double upper = previous_reference_velocity_ + config_.a_ref_up * dt;
+  const double upper = std::min(
+    previous_reference_velocity_ + config_.a_ref_up * dt, plan.tracking_speed_limit);
   plan.reference_velocity = std::clamp(
     plan.reference_velocity_target, lower, upper);
   plan.reference_velocity = std::min(

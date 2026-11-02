@@ -70,6 +70,8 @@ HolonomicSpeedPlannerConfig makeConfig()
   config.yaw_feedback_reserve = 0.0;
   config.configured_min_rate_window = 0.0;
   config.stopping_delay = 0.0;
+  // Existing fixtures use the physical axis budget unless a tracking budget is under test.
+  config.max_translation_curve_accel = 4.0;
   return config;
 }
 
@@ -110,6 +112,174 @@ TEST(HolonomicSpeedPlanner, longStraightUsesNominalSpeed)
   EXPECT_EQ(plan.speed_limit_reason, HolonomicSpeedLimitReason::kNominal);
   EXPECT_NEAR(plan.reference_velocity_target, 0.8, 1e-12);
   EXPECT_NEAR(plan.reference_velocity, 0.8, 1e-12);
+}
+
+// A unit-radius arc at 0.8 m/s requires 0.64 m/s^2 normal acceleration.
+// The tracking budget should slow it in advance while leaving a straight at 0.8.
+TEST(HolonomicSpeedPlanner, defaultTrackingBudgetSlowsCurveButKeepsStraightSpeed)
+{
+  nav_msgs::msg::Path curve;
+  curve.header.frame_id = "map";
+  for (int i = 0; i <= 100; ++i) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.pose.position = makePoint(std::sin(0.02 * i), 1.0 - std::cos(0.02 * i));
+    pose.pose.orientation.w = 1.0;
+    curve.poses.push_back(pose);
+  }
+  const auto path = preparePath(curve);
+  HolonomicSpeedPlannerConfig config;
+  config.max_ax = config.max_ay = 1.1;
+  config.a_ref_up = 0.8;
+  config.a_ref_down = config.stopping_deceleration = 0.4;
+  config.stopping_delay = 0.0;
+  HolonomicSpeedPlanner planner(config);
+  planner.setPath(path);
+  planner.seed(0.8);
+  const auto turn = planAt(planner, path, curve.poses[5].pose.position, 0.0, 1.0 / 15.0);
+  EXPECT_LT(turn.reference_velocity_target, 0.62);
+  EXPECT_GT(turn.reference_velocity_target, 0.4);
+  EXPECT_GE(turn.reference_velocity, 0.8 - 0.4 / 15.0 - 1e-12);
+  const auto straight = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  planner.setPath(straight);
+  planner.seed(0.8);
+  EXPECT_NEAR(planAt(planner, straight, makePoint(1.0, 0.0)).reference_velocity, 0.8, 1e-12);
+}
+
+TEST(HolonomicSpeedPlanner, smoothTurnBudgetAvoidsPerVertexSamplingSlowdown)
+{
+  // Radius 2 m at 0.8 m/s needs 0.32 m/s^2, below the 0.35 tracking budget.
+  for (const double angle_step : {0.01, 0.05}) {
+    nav_msgs::msg::Path curve;
+    curve.header.frame_id = "map";
+    for (int i = 0; i <= static_cast<int>(2.0 / angle_step); ++i) {
+      geometry_msgs::msg::PoseStamped pose;
+      pose.pose.position = makePoint(2.0 * std::sin(angle_step * i),
+        2.0 * (1.0 - std::cos(angle_step * i)));
+      pose.pose.orientation.w = 1.0;
+      curve.poses.push_back(pose);
+    }
+    const auto path = preparePath(curve);
+    HolonomicSpeedPlannerConfig config;
+    config.max_ax = config.max_ay = 1.1;
+    config.a_ref_up = 0.8;
+    config.a_ref_down = config.stopping_deceleration = 0.4;
+    config.stopping_delay = 0.0;
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(path);
+    planner.seed(0.8);
+    const auto result = planAt(planner, path,
+      makePoint(2.0 * std::sin(0.2), 2.0 * (1.0 - std::cos(0.2))), 0.0, 1.0 / 15.0);
+    // Windowed piecewise curvature is conservative (up to 0.625 /m here),
+    // but must not introduce the per-vertex cap of roughly 0.55 m/s.
+    EXPECT_GT(result.reference_velocity_target, 0.74);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, trackingHoldPreservesCorrectionAndCannotBeOverriddenByReachability)
+{
+  for (const double yaw : {0.0, 1.2}) {
+    for (const double side : {-1.0, 1.0}) {
+      nav_msgs::msg::Path curve;
+      curve.header.frame_id = "map";
+      for (int i = 0; i <= 60; ++i) {
+        geometry_msgs::msg::PoseStamped pose;
+        pose.pose.position = makePoint(2.0 * std::sin(0.05 * i),
+          2.0 * (1.0 - std::cos(0.05 * i)));
+        pose.pose.orientation = makeQuaternion(yaw);
+        curve.poses.push_back(pose);
+      }
+      const auto path = preparePath(curve);
+      HolonomicSpeedPlannerConfig config;
+      config.max_ax = config.max_ay = 1.1;
+      config.a_ref_up = 0.8;
+      config.a_ref_down = config.stopping_deceleration = 0.4;
+      config.stopping_delay = 0.0;
+      HolonomicSpeedPlanner planner(config);
+      planner.setPath(path);
+      planner.seed(0.1);
+      const auto reference = makeReference(path, curve.poses[5].pose.position);
+      const double tangent = reference.current.path_tangent - yaw;
+      const double tx = std::cos(tangent), ty = std::sin(tangent);
+      const double nx = -ty, ny = tx;
+      const auto observation = [&](double error) {
+          return HolonomicTrackingObservation{side * error,
+          0.2 * tx + side * 0.1 * nx, 0.2 * ty + side * 0.1 * ny};
+        };
+      for (const double error : {0.04, 0.05, 0.06}) {
+        EXPECT_FALSE(planner.plan(reference, yaw, 0.1, 0.8, 0.2,
+          {-side * error * nx, -side * error * ny}, std::nullopt,
+          observation(error)).tracking_acceleration_held);
+      }
+      // The physical rectangle demands a higher FF speed than the held 0.34.
+      // It must report infeasibility, never undo the tracking acceleration hold.
+      const auto held = planner.plan(reference, yaw, 0.1, 0.8, 0.2,
+          {-side * 0.07 * nx, -side * 0.07 * ny},
+        HolonomicBodyCommand{0.7 * tx, 0.7 * ty, 0.0}, observation(0.07));
+      EXPECT_TRUE(held.tracking_acceleration_held);
+      EXPECT_TRUE(held.acceleration_unreachable);
+      EXPECT_NEAR(held.reference_velocity, 0.34, 1e-10);
+      EXPECT_EQ(held.speed_limit_reason, HolonomicSpeedLimitReason::kTrackingResponse);
+      // Holding FF leaves the entire requested normal correction intact.
+      EXPECT_NEAR(nx * (held.reference_velocity * tx - side * 0.07 * nx) +
+        ny * (held.reference_velocity * ty - side * 0.07 * ny), -side * 0.07, 1e-12);
+      const auto capped = planner.plan(reference, yaw, 0.1, 0.1, 0.2, {}, std::nullopt,
+        observation(0.07));
+      EXPECT_TRUE(capped.tracking_acceleration_held);
+      EXPECT_LE(capped.reference_velocity, 0.1);
+      EXPECT_LE(planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
+        observation(0.07)).reference_velocity, 0.1);
+      // Sustained small error releases the hold with the normal acceleration ramp.
+      for (int i = 0; i < 2; ++i) {
+        EXPECT_TRUE(planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
+          observation(0.01)).tracking_acceleration_held);
+      }
+      const auto released = planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
+        observation(0.01));
+      EXPECT_FALSE(released.tracking_acceleration_held);
+      EXPECT_NEAR(released.reference_velocity, 0.18, 1e-10);
+    }
+  }
+}
+
+TEST(HolonomicSpeedPlanner, trackingHoldResetsAtPathSeedRotationTerminalAndMissingObservation)
+{
+  const auto path = preparePath(makePath({{0, 0, 0}, {1, 0, 0}, {1.2, 0.1, 0}, {5, 3, 0}}));
+  for (int reset = 0; reset < 5; ++reset) {
+    auto config = makeConfig();
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(path);
+    auto reference = makeReference(path, makePoint(0.9, 0.0));
+    for (int i = 0; i < 5; ++i) {
+      planner.plan(reference, 0.0, 0.1, 0.8, 0.2, {}, std::nullopt,
+        HolonomicTrackingObservation{0.04 + 0.01 * i, 0.2, 0.1});
+    }
+    ASSERT_TRUE(planner.plan(reference, 0.0, 0.1, 0.8, 0.2, {}, std::nullopt,
+      HolonomicTrackingObservation{0.08, 0.2, 0.1}).tracking_acceleration_held);
+    PathProgressTracker approach_tracker;
+    approach_tracker.setPath(path);
+    const auto approach_progress = approach_tracker.initializePathHandoff(makePoint(4.999, 2.999), 0.5);
+    const auto approaching = buildHolonomicTrackingReference(*path, approach_progress, 0.5);
+    ASSERT_EQ(approaching.current.cursor.segment_index, path->segments.size() - 1u);
+    const auto stopping = planner.plan(approaching, 0.0, 0.1, 0.8, 0.2, {}, std::nullopt,
+      HolonomicTrackingObservation{0.08, 0.2, 0.1});
+    EXPECT_TRUE(stopping.tracking_acceleration_held);
+    EXPECT_LE(stopping.reference_velocity, stopping.stopping_speed_limit);
+    EXPECT_LT(stopping.reference_velocity, 0.12);
+    if (reset == 0) {
+      planner.setPath(path);
+    } else if (reset == 1) {
+      planner.seed(0.2);
+    } else if (reset == 2 || reset == 3) {
+      auto stopped = reference;
+      stopped.mode = reset == 2 ? HolonomicReferenceMode::kRotationPending :
+        HolonomicReferenceMode::kTerminal;
+      EXPECT_DOUBLE_EQ(planner.plan(stopped, 0.0, 0.1).reference_velocity, 0.0);
+    } else {
+      planner.plan(reference, 0.0, 0.1);
+    }
+    EXPECT_FALSE(planner.plan(reference, 0.0, 0.1, 0.8, 0.2, {}, std::nullopt,
+      HolonomicTrackingObservation{0.08, 0.2, 0.1}).tracking_acceleration_held);
+  }
 }
 
 TEST(HolonomicSpeedPlanner, feedbackReservesEitherBodyAxisInBothDirections)
@@ -378,6 +548,84 @@ TEST(HolonomicSpeedPlanner, shortOpposingTurnBrakesBeforeTheDirectionJump)
   const double corner_speed = config.max_ay * dt / std::sin(angle);
   EXPECT_LE(result.reference_velocity_target,
     std::sqrt(corner_speed * corner_speed + 2.0 * config.a_ref_down * 0.01) + 1e-9);
+}
+
+TEST(HolonomicSpeedPlanner, curveBudgetLeavesAccelerationForNormalCorrection)
+{
+  nav_msgs::msg::Path curve;
+  curve.header.frame_id = "map";
+  for (int i = 0; i <= 100; ++i) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.pose.position = makePoint(std::sin(0.02 * i), 1.0 - std::cos(0.02 * i));
+    pose.pose.orientation.w = 1.0;
+    curve.poses.push_back(pose);
+  }
+  const auto path = preparePath(curve);
+  constexpr double dt = 1.0 / 15.0;
+  for (const double yaw : {0.0, 1.2}) {
+    HolonomicSpeedPlannerConfig config;
+    config.max_ax = config.max_ay = 1.1;
+    config.a_ref_up = 0.8;
+    config.a_ref_down = config.stopping_deceleration = 0.4;
+    config.stopping_delay = 0.0;
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(path);
+    planner.seed(0.8);
+    const auto reference = makeReference(path, curve.poses[5].pose.position);
+    const double speed = planner.plan(reference, yaw, dt).reference_velocity_target;
+    EXPECT_LT(speed, 0.62);
+    // A unit-radius turn advances its tangent by speed*dt each cycle.
+    const double before = reference.current.path_tangent - yaw;
+    const double after = before + speed * dt;
+    const double nx = -std::sin(after), ny = std::cos(after);
+    HolonomicCommandLimiterConfig limits;
+    limits.max_ax = limits.max_ay = 1.1;
+    HolonomicCommandLimiter limiter(limits);
+    const HolonomicBodyCommand previous{speed * std::cos(before), speed * std::sin(before), 0.0};
+    limiter.seed(previous);
+    const auto result = limiter.limit(
+      {speed * std::cos(after) + 0.03 * nx, speed * std::sin(after) + 0.03 * ny, 0.0},
+      previous, dt, 0.8);
+    EXPECT_LE(std::abs(result.command.vx - previous.vx), 1.1 * dt + 1e-12);
+    EXPECT_LE(std::abs(result.command.vy - previous.vy), 1.1 * dt + 1e-12);
+    EXPECT_NEAR(nx * result.command.vx + ny * result.command.vy, 0.03, 1e-10);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, curveBudgetKeepsStraightAccelerationAndStopBudgets)
+{
+  const auto straight = preparePath(makePath({{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}}));
+  for (const double budget : {1.0, 0.35, 0.2}) {
+    SCOPED_TRACE(budget);
+    auto config = makeConfig();
+    config.nominal_tracking_speed = 0.8;
+    config.max_ax = config.max_ay = 1.0;
+    config.a_ref_up = 0.8;
+    config.a_ref_down = config.stopping_deceleration = 0.4;
+    config.max_translation_curve_accel = budget;
+    HolonomicSpeedPlanner planner(config);
+    planner.setPath(straight);
+    planner.seed(0.4);
+    EXPECT_NEAR(planAt(planner, straight, makePoint(1.0, 0.0), 0.0, 0.1).
+      reference_velocity, 0.48, 1e-12);
+    planner.seed(0.8);
+    EXPECT_NEAR(planAt(planner, straight, makePoint(1.0, 0.0), 0.0, 0.1).
+      reference_velocity, 0.8, 1e-12);
+    const auto stop = planAt(planner, straight, makePoint(19.9, 0.0), 0.0, 0.1);
+    EXPECT_NEAR(stop.stopping_speed_limit, std::sqrt(0.08), 1e-12);
+    EXPECT_LE(stop.reference_velocity, std::sqrt(0.08) + 1e-12);
+  }
+}
+
+TEST(HolonomicSpeedPlanner, rejectsInvalidCurveBudget)
+{
+  for (const double budget : {-0.01, 0.0,
+      std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
+  {
+    auto config = makeConfig();
+    config.max_translation_curve_accel = budget;
+    EXPECT_THROW(HolonomicSpeedPlanner{config}, std::invalid_argument);
+  }
 }
 
 TEST(HolonomicSpeedPlanner, propagatesFutureYawConstraintBackByDistance)
@@ -703,6 +951,7 @@ TEST(HolonomicSpeedPlanner, actualCommandBudgetPreservesCorrectionAcrossAxesAndF
           {20.0 * (std::cos(yaw) * tx - std::sin(yaw) * ty),
             20.0 * (std::sin(yaw) * tx + std::cos(yaw) * ty), yaw}}));
         auto config = makeConfig();
+        config.max_translation_curve_accel = 0.35;
         config.nominal_tracking_speed = config.max_xy_speed = 0.8;
         config.max_ax = config.max_ay = config.a_ref_up = config.a_ref_down = 0.8;
         config.stopping_deceleration = 0.4;

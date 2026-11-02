@@ -88,6 +88,7 @@ const char * holonomicReferenceModeName(HolonomicReferenceMode mode)
 const char * holonomicLimitReasonName(HolonomicSpeedLimitReason reason)
 {
     switch (reason) {
+        case HolonomicSpeedLimitReason::kTrackingResponse: return "tracking_response";
         case HolonomicSpeedLimitReason::kNominal: return "nominal";
         case HolonomicSpeedLimitReason::kFeedbackBudget: return "feedback_budget";
         case HolonomicSpeedLimitReason::kAccelerationPreview: return "acceleration_preview";
@@ -242,6 +243,12 @@ void PidTrackingController::configure(
     speed_config.stopping_min_speed = parameter("stopping_min_speed", 0.04);
     speed_config.yaw_feedback_reserve = parameter("yaw_feedback_reserve", 0.05);
     speed_config.configured_min_rate_window = parameter("configured_min_rate_window", 0.30);
+    speed_config.max_translation_curve_accel = parameter(
+      "max_translation_curve_accel", speed_config.max_translation_curve_accel);
+    speed_config.tracking_guard.enter_error = parameter("tracking_guard_enter_error", 0.03);
+    speed_config.tracking_guard.exit_error = parameter("tracking_guard_exit_error", 0.015);
+    speed_config.tracking_guard.min_outward_speed = parameter("tracking_guard_min_outward_speed", 0.02);
+    speed_config.tracking_guard.confirm_time = parameter("tracking_guard_confirm_time", 0.15);
     HolonomicCommandLimiterConfig limiter_config;
     limiter_config.max_vx = speed_config.max_vx;
     limiter_config.max_vy = speed_config.max_vy;
@@ -280,6 +287,10 @@ void PidTrackingController::configure(
             "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f "
             "stopping_deceleration=%.3f stopping_delay=%.3f stopping_min_speed=%.3f "
             "max_decel_x=%.3f max_decel_y=%.3f "
+            "max_translation_curve_accel=%.3f a_ref_up=%.3f a_ref_down=%.3f "
+            "tracking_guard_enter=%.3f tracking_guard_exit=%.3f "
+            "tracking_guard_outward=%.3f tracking_guard_confirm=%.3f "
+            "configured_min_rate_window=%.3f yaw_feedback_reserve=%.3f "
             "fixed_heading_yaw_hold=%s yaw_enter_error=%.6f yaw_exit_error=%.6f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
             speed_config.max_vy, speed_config.max_omega, speed_config.max_ax,
@@ -289,6 +300,10 @@ void PidTrackingController::configure(
             speed_config.stopping_deceleration, speed_config.stopping_delay,
             speed_config.stopping_min_speed,
             limiter_config.max_decel_x, limiter_config.max_decel_y,
+            speed_config.max_translation_curve_accel, speed_config.a_ref_up, speed_config.a_ref_down,
+            speed_config.tracking_guard.enter_error, speed_config.tracking_guard.exit_error,
+            speed_config.tracking_guard.min_outward_speed, speed_config.tracking_guard.confirm_time,
+            speed_config.configured_min_rate_window, speed_config.yaw_feedback_reserve,
             yaw_gate_config.enabled ? "true" : "false",
             yaw_gate_config.enter_error, yaw_gate_config.exit_error);
     
@@ -477,6 +492,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
             reference.current.target_yaw_rate_per_meter : 0.0;
     // Use the same pose, reference and gains for the budget and final control law.
     const auto feedback = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
+    const double normal_x = -std::sin(input.path_tangent - yaw);
+    const double normal_y = std::cos(input.path_tangent - yaw);
+    const double lateral = -(normal_x * feedback.ex_body + normal_y * feedback.ey_body);
     HolonomicSpeedPlan speed_plan;
     if (reseed) {
         const double relative_tangent = reference.current.path_tangent - yaw;
@@ -487,7 +505,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     } else {
         speed_plan = holonomic_speed_planner_->plan(reference, yaw, dt, cap,
                 std::max(std::hypot(measured.vx, measured.vy), last_commanded_planar_speed_),
-                {feedback.vx_fb, feedback.vy_fb}, holonomic_command_limiter_->previousCommand());
+                {feedback.vx_fb, feedback.vy_fb}, holonomic_command_limiter_->previousCommand(),
+                HolonomicTrackingObservation{lateral, measured.vx, measured.vy});
     }
     input.reference_velocity = speed_plan.reference_velocity;
     auto raw = computeHolonomicRawCommand(input, {kp_x_, kp_y_, kp_yaw_});
@@ -619,6 +638,49 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         }
         last_diagnostics_log_time_seconds_ = now_seconds;
         force_diagnostics_log_ = false;
+    }
+    // Temporary response capture: only sample translation anomalies, at most 10 Hz.
+    // These are same-cycle differences, not estimates of physical response delay.
+    if (reference.mode == HolonomicReferenceMode::kTranslation &&
+        logger_.get_effective_level() <= rclcpp::Logger::Level::Info) {
+        const double response_delta = std::hypot(
+                limited.command.vx - measured.vx, limited.command.vy - measured.vy);
+        const double limiter_delta = std::hypot(
+                raw.vx - limited.command.vx, raw.vy - limited.command.vy);
+        if (std::abs(lateral) >= 0.02 || response_delta >= 0.06 || limiter_delta >= 0.005 ||
+            speed_plan.tracking_acceleration_held) {
+            // Pose header age is not sensor/odometry latency; velocity has no stamp here.
+            const double pose_stamp = static_cast<double>(pose.header.stamp.sec) +
+                    1e-9 * pose.header.stamp.nanosec;
+            RCLCPP_INFO_THROTTLE(logger_, *clock_, 100,
+                    "PID_LOG translation_response plan_revision=%zu control_now=%.9f dt=%.6f "
+                    "planner_step=%s pose_stamp=%.9f pose_header_age=%.6f "
+                    "progress_s=%.6f segment=%zu robot_yaw=%.6f path_tangent=%.6f lateral=%.6f "
+                    "reference_target=%.6f reference_effective=%.6f limit_reason=%s "
+                    "tangent_rate=%.6f rate_window=%.6f acceleration_cap=%.6f feedback_cap=%.6f "
+                    "local_tangent_rate=%.6f tracking_hold=%s tracking_cap=%.6f "
+                    "vx_ff=%.6f vy_ff=%.6f vx_fb=%.6f vy_fb=%.6f "
+                    "raw_vx=%.6f raw_vy=%.6f limited_vx=%.6f limited_vy=%.6f "
+                    "measured_vx=%.6f measured_vy=%.6f normal_command=%.6f normal_measured=%.6f "
+                    "translation_lambda=%.6f ax_limited=%s ay_limited=%s "
+                    "yaw_hold=%s yaw_error=%.6f limited_omega=%.6f measured_omega=%.6f",
+                    plan_revision_, now_seconds, dt, reseed ? "false" : "true", pose_stamp,
+                    pose_stamp == 0.0 ? std::numeric_limits<double>::quiet_NaN() : now_seconds - pose_stamp,
+                    progress.progress_arc_length, progress.cursor.segment_index, yaw, input.path_tangent,
+                    lateral, speed_plan.reference_velocity_target, speed_plan.reference_velocity,
+                    reseed ? "not_planned" : holonomicLimitReasonName(speed_plan.speed_limit_reason),
+                    speed_plan.max_abs_path_tangent_rate_per_meter, speed_plan.rate_window_length,
+                    speed_plan.acceleration_speed_limit, speed_plan.feedback_speed_limit,
+                    speed_plan.local_path_tangent_rate_per_meter,
+                    speed_plan.tracking_acceleration_held ? "true" : "false", speed_plan.tracking_speed_limit,
+                    raw.vx_ff, raw.vy_ff, raw.vx_fb, raw.vy_fb, raw.vx, raw.vy,
+                    limited.command.vx, limited.command.vy, measured.vx, measured.vy,
+                    normal_x * limited.command.vx + normal_y * limited.command.vy,
+                    normal_x * measured.vx + normal_y * measured.vy,
+                    limited.translation_lambda, limited.ax_limited ? "true" : "false",
+                    limited.ay_limited ? "true" : "false", yaw_suppressed ? "true" : "false",
+                    raw.yaw_error, limited.command.omega, measured.omega);
+        }
     }
     last_holonomic_mode_ = static_cast<int>(reference.mode);
     if (raw_cmd_pub_ && raw_cmd_pub_->is_activated()) {
