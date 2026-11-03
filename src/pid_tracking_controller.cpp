@@ -259,6 +259,8 @@ void PidTrackingController::configure(
     speed_config.tracking_guard.exit_error = parameter("tracking_guard_exit_error", 0.015);
     speed_config.tracking_guard.min_outward_speed = parameter("tracking_guard_min_outward_speed", 0.02);
     speed_config.tracking_guard.confirm_time = parameter("tracking_guard_confirm_time", 0.15);
+    speed_config.tracking_guard.release_confirm_time = parameter(
+      "tracking_guard_release_confirm_time", 0.40);
     HolonomicCommandLimiterConfig limiter_config;
     limiter_config.max_vx = speed_config.max_vx;
     limiter_config.max_vy = speed_config.max_vy;
@@ -300,6 +302,7 @@ void PidTrackingController::configure(
             "max_translation_curve_accel=%.3f a_ref_up=%.3f a_ref_down=%.3f "
             "tracking_guard_enter=%.3f tracking_guard_exit=%.3f "
             "tracking_guard_outward=%.3f tracking_guard_confirm=%.3f "
+            "tracking_guard_release_confirm=%.3f "
             "configured_min_rate_window=%.3f yaw_feedback_reserve=%.3f "
             "fixed_heading_yaw_hold=%s yaw_enter_error=%.6f yaw_exit_error=%.6f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
@@ -313,6 +316,7 @@ void PidTrackingController::configure(
             speed_config.max_translation_curve_accel, speed_config.a_ref_up, speed_config.a_ref_down,
             speed_config.tracking_guard.enter_error, speed_config.tracking_guard.exit_error,
             speed_config.tracking_guard.min_outward_speed, speed_config.tracking_guard.confirm_time,
+            speed_config.tracking_guard.release_confirm_time,
             speed_config.configured_min_rate_window, speed_config.yaw_feedback_reserve,
             yaw_gate_config.enabled ? "true" : "false",
             yaw_gate_config.enter_error, yaw_gate_config.exit_error);

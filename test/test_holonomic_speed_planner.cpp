@@ -177,66 +177,71 @@ TEST(HolonomicSpeedPlanner, smoothTurnBudgetAvoidsPerVertexSamplingSlowdown)
 
 TEST(HolonomicSpeedPlanner, trackingHoldPreservesCorrectionAndCannotBeOverriddenByReachability)
 {
-  for (const double yaw : {0.0, 1.2}) {
-    for (const double side : {-1.0, 1.0}) {
-      nav_msgs::msg::Path curve;
-      curve.header.frame_id = "map";
-      for (int i = 0; i <= 60; ++i) {
-        geometry_msgs::msg::PoseStamped pose;
-        pose.pose.position = makePoint(2.0 * std::sin(0.05 * i),
-          2.0 * (1.0 - std::cos(0.05 * i)));
-        pose.pose.orientation = makeQuaternion(yaw);
-        curve.poses.push_back(pose);
+  for (const bool curved : {false, true}) {
+    for (const double yaw : {0.0, 1.2}) {
+      for (const double side : {-1.0, 1.0}) {
+        nav_msgs::msg::Path curve;
+        curve.header.frame_id = "map";
+        for (int i = 0; i <= 60; ++i) {
+          geometry_msgs::msg::PoseStamped pose;
+          pose.pose.position = curved ? makePoint(2.0 * std::sin(0.05 * i),
+            2.0 * (1.0 - std::cos(0.05 * i))) : makePoint(0.1 * i, 0.0);
+          pose.pose.orientation = makeQuaternion(yaw);
+          curve.poses.push_back(pose);
+        }
+        const auto path = preparePath(curve);
+        HolonomicSpeedPlannerConfig config;
+        config.max_ax = config.max_ay = 1.1;
+        config.a_ref_up = 0.8;
+        config.a_ref_down = config.stopping_deceleration = 0.4;
+        config.stopping_delay = 0.0;
+        HolonomicSpeedPlanner planner(config);
+        planner.setPath(path);
+        planner.seed(0.1);
+        const auto reference = makeReference(path, curve.poses[5].pose.position);
+        const double tangent = reference.current.path_tangent - yaw;
+        const double tx = std::cos(tangent), ty = std::sin(tangent);
+        const double nx = -ty, ny = tx;
+        const auto observation = [&](double error) {
+            // Straight cases reproduce growing position error with inward odometry;
+            // curve cases retain the existing outward-velocity entry coverage.
+            const double normal_speed = side * (curved ? 0.1 : -0.01);
+            return HolonomicTrackingObservation{side * error,
+            0.2 * tx + normal_speed * nx, 0.2 * ty + normal_speed * ny};
+          };
+        for (const double error : {0.04, 0.05, 0.06}) {
+          EXPECT_FALSE(planner.plan(reference, yaw, 0.1, 0.8, 0.2,
+            {-side * error * nx, -side * error * ny}, std::nullopt,
+            observation(error)).tracking_acceleration_held);
+        }
+        // The physical rectangle demands a higher FF speed than the held 0.34.
+        // It must report infeasibility, never undo the tracking acceleration hold.
+        const auto held = planner.plan(reference, yaw, 0.1, 0.8, 0.2,
+            {-side * 0.07 * nx, -side * 0.07 * ny},
+          HolonomicBodyCommand{0.7 * tx, 0.7 * ty, 0.0}, observation(0.07));
+        EXPECT_TRUE(held.tracking_acceleration_held);
+        EXPECT_TRUE(held.acceleration_unreachable);
+        EXPECT_NEAR(held.reference_velocity, 0.34, 1e-10);
+        EXPECT_EQ(held.speed_limit_reason, HolonomicSpeedLimitReason::kTrackingResponse);
+        // Holding FF leaves the entire requested normal correction intact.
+        EXPECT_NEAR(nx * (held.reference_velocity * tx - side * 0.07 * nx) +
+          ny * (held.reference_velocity * ty - side * 0.07 * ny), -side * 0.07, 1e-12);
+        const auto capped = planner.plan(reference, yaw, 0.1, 0.1, 0.2, {}, std::nullopt,
+          observation(0.07));
+        EXPECT_TRUE(capped.tracking_acceleration_held);
+        EXPECT_LE(capped.reference_velocity, 0.1);
+        EXPECT_LE(planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
+          observation(0.07)).reference_velocity, 0.1);
+        // Sustained small error releases the hold with the normal acceleration ramp.
+        for (int i = 0; i < 4; ++i) {
+          EXPECT_TRUE(planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
+            observation(0.01)).tracking_acceleration_held);
+        }
+        const auto released = planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
+          observation(0.01));
+        EXPECT_FALSE(released.tracking_acceleration_held);
+        EXPECT_NEAR(released.reference_velocity, 0.18, 1e-10);
       }
-      const auto path = preparePath(curve);
-      HolonomicSpeedPlannerConfig config;
-      config.max_ax = config.max_ay = 1.1;
-      config.a_ref_up = 0.8;
-      config.a_ref_down = config.stopping_deceleration = 0.4;
-      config.stopping_delay = 0.0;
-      HolonomicSpeedPlanner planner(config);
-      planner.setPath(path);
-      planner.seed(0.1);
-      const auto reference = makeReference(path, curve.poses[5].pose.position);
-      const double tangent = reference.current.path_tangent - yaw;
-      const double tx = std::cos(tangent), ty = std::sin(tangent);
-      const double nx = -ty, ny = tx;
-      const auto observation = [&](double error) {
-          return HolonomicTrackingObservation{side * error,
-          0.2 * tx + side * 0.1 * nx, 0.2 * ty + side * 0.1 * ny};
-        };
-      for (const double error : {0.04, 0.05, 0.06}) {
-        EXPECT_FALSE(planner.plan(reference, yaw, 0.1, 0.8, 0.2,
-          {-side * error * nx, -side * error * ny}, std::nullopt,
-          observation(error)).tracking_acceleration_held);
-      }
-      // The physical rectangle demands a higher FF speed than the held 0.34.
-      // It must report infeasibility, never undo the tracking acceleration hold.
-      const auto held = planner.plan(reference, yaw, 0.1, 0.8, 0.2,
-          {-side * 0.07 * nx, -side * 0.07 * ny},
-        HolonomicBodyCommand{0.7 * tx, 0.7 * ty, 0.0}, observation(0.07));
-      EXPECT_TRUE(held.tracking_acceleration_held);
-      EXPECT_TRUE(held.acceleration_unreachable);
-      EXPECT_NEAR(held.reference_velocity, 0.34, 1e-10);
-      EXPECT_EQ(held.speed_limit_reason, HolonomicSpeedLimitReason::kTrackingResponse);
-      // Holding FF leaves the entire requested normal correction intact.
-      EXPECT_NEAR(nx * (held.reference_velocity * tx - side * 0.07 * nx) +
-        ny * (held.reference_velocity * ty - side * 0.07 * ny), -side * 0.07, 1e-12);
-      const auto capped = planner.plan(reference, yaw, 0.1, 0.1, 0.2, {}, std::nullopt,
-        observation(0.07));
-      EXPECT_TRUE(capped.tracking_acceleration_held);
-      EXPECT_LE(capped.reference_velocity, 0.1);
-      EXPECT_LE(planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
-        observation(0.07)).reference_velocity, 0.1);
-      // Sustained small error releases the hold with the normal acceleration ramp.
-      for (int i = 0; i < 2; ++i) {
-        EXPECT_TRUE(planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
-          observation(0.01)).tracking_acceleration_held);
-      }
-      const auto released = planner.plan(reference, yaw, 0.1, 0.8, 0.2, {}, std::nullopt,
-        observation(0.01));
-      EXPECT_FALSE(released.tracking_acceleration_held);
-      EXPECT_NEAR(released.reference_velocity, 0.18, 1e-10);
     }
   }
 }

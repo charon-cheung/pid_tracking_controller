@@ -591,7 +591,7 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     const double normal_speed = -std::sin(tangent) * observation->measured_vx +
       std::cos(tangent) * observation->measured_vy;
     plan.tracking_acceleration_held = tracking_guard_.update(
-      observation->lateral_error, normal_speed, plan.local_path_tangent_rate_per_meter, dt);
+      observation->lateral_error, normal_speed, dt);
     if (plan.tracking_acceleration_held) {
       plan.tracking_speed_limit = previous_reference_velocity_;
       applyLimit(plan.tracking_speed_limit, HolonomicSpeedLimitReason::kTrackingResponse,

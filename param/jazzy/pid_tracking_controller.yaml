@@ -28,11 +28,12 @@ controller_server:
       max_ay: 1.1
       # Unified turn tracking budget (m/s^2); final axis limits retain max_ax/max_ay.
       max_translation_curve_accel: 0.35
-      # Hold feedforward acceleration during confirmed outward error growth in a turn.
+      # Hold feedforward acceleration during confirmed outward error growth in translation.
       tracking_guard_enter_error: 0.03  # metres
       tracking_guard_exit_error: 0.015  # metres
-      tracking_guard_min_outward_speed: 0.02  # m/s
-      tracking_guard_confirm_time: 0.15  # seconds, entry and release
+      tracking_guard_min_outward_speed: 0.02  # m/s; outward velocity or position-error growth
+      tracking_guard_confirm_time: 0.15  # seconds, entry
+      tracking_guard_release_confirm_time: 0.40  # seconds, sustained small error before release
       max_alpha: 0.50
       # In-place turn acceleration after stop confirmation; braking still uses max_alpha.
       rotation_max_alpha: 0.80
