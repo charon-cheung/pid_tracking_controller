@@ -55,6 +55,15 @@ struct HolonomicCommandLimitResult
   bool stopping_limit_unreachable{false};
 };
 
+enum class HolonomicSafetyMode {kInactive, kBraking, kHold, kEmergency};
+
+struct HolonomicBrakeResult
+{
+  HolonomicBodyCommand command;
+  // Hold means zero COMMAND only. Emergency has no rate-bound guarantee.
+  HolonomicSafetyMode mode{HolonomicSafetyMode::kEmergency};
+};
+
 class HolonomicCommandLimiter
 {
 public:
@@ -78,7 +87,18 @@ public:
     double stopping_speed_limit = std::numeric_limits<double>::infinity(),
     bool rotation_acceleration = false);
 
+  // Explicit stop request. accepted_output MUST be the last issued command,
+  // captured before limit() computes a candidate; nullopt means unknown history.
+  // Zero command / measured velocity alone are not physical standstill confirmation.
+  HolonomicBrakeResult brake(const HolonomicBodyCommand & measured, double dt,
+    std::optional<HolonomicBodyCommand> accepted_output);
+  // Used only after downstream safety validation; preserves the slew history.
+  void commitSafetyOutput(const HolonomicBodyCommand & command);
+
 private:
+  void logSafetyState(HolonomicSafetyMode mode, const HolonomicBodyCommand & command,
+    const HolonomicBodyCommand & measured, double dt, const char * reason);
+  HolonomicSafetyMode safety_mode_{HolonomicSafetyMode::kInactive};
   HolonomicCommandLimiterConfig config_;
   HolonomicBodyCommand previous_command_;
   bool seeded_{false};

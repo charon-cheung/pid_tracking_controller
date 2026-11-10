@@ -21,6 +21,8 @@
 #include "rcutils/logging.h"
 #include "tf2_ros/buffer.h"
 #include "controller_test_access.hpp"
+#include "pid_tracking_controller/msg/tracking_progress.hpp"
+#include "pid_tracking_controller/path_identity.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "rcl/time.h"
 
@@ -113,20 +115,12 @@ geometry_msgs::msg::PoseStamped makePose(double x, double yaw)
 
 
 
-double loggedDouble(const std::string & text, const std::string & field)
-{
-  const std::size_t position = text.find(field);
-  if (position == std::string::npos) {
-    throw std::runtime_error("required numeric log field is absent: " + field);
-  }
-  return std::stod(text.substr(position + field.size()));
-}
-
-TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
+TEST(LifecycleSmoke, publishesCarrotRawCommandAndProgressWithoutPidLogs)
 {
   rclcpp::init(0, nullptr);
 
   bool carrot_received = false;
+  msg::TrackingProgress received_progress;
   geometry_msgs::msg::PointStamped received_carrot;
   geometry_msgs::msg::TwistStamped active_command;
   geometry_msgs::msg::TwistStamped received_raw;
@@ -138,6 +132,7 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
     auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
       "pid_tracking_controller_test_node", parent_options);
     parent->declare_parameter("controller_frequency", 15.0);
+    parent->declare_parameter("PidTrackingController.publish_tracking_progress", true);
     parent->declare_parameter("failure_tolerance", 0.0);
     parent->declare_parameter("publish_zero_velocity", true);
     parent->declare_parameter("PidTrackingController.plugin",
@@ -161,6 +156,9 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
       controller.activate();
     }
 
+    auto progress_subscription = observer->create_subscription<msg::TrackingProgress>(
+      "/pid_tracking_controller/tracking_progress", rclcpp::QoS(10).reliable(),
+      [&](msg::TrackingProgress::ConstSharedPtr message) {received_progress = *message;});
     auto carrot_subscription = observer->create_subscription<geometry_msgs::msg::PointStamped>(
       "/pid_tracking_controller/carrot", rclcpp::QoS(10).reliable(),
       [&](const geometry_msgs::msg::PointStamped::SharedPtr message) {
@@ -179,7 +177,7 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
     const auto discovery_deadline = std::chrono::steady_clock::now() + 1s;
     while (std::chrono::steady_clock::now() < discovery_deadline &&
       (observer->count_publishers("/pid_tracking_controller/carrot") == 0u ||
-      raw_subscription->get_publisher_count() == 0u))
+      raw_subscription->get_publisher_count() == 0u || progress_subscription->get_publisher_count() == 0u))
     {
       executor.spin_some();
       std::this_thread::sleep_for(10ms);
@@ -201,13 +199,21 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
     }
 
     const auto message_deadline = std::chrono::steady_clock::now() + 1s;
-    while (std::chrono::steady_clock::now() < message_deadline && !carrot_received)
+    while (std::chrono::steady_clock::now() < message_deadline && (!carrot_received || !received_progress.valid))
     {
       executor.spin_some();
       std::this_thread::sleep_for(10ms);
     }
 
     ASSERT_TRUE(carrot_received);
+    ASSERT_TRUE(received_progress.valid);
+    EXPECT_FALSE(received_progress.controller_instance.empty());
+    EXPECT_EQ(received_progress.path_header, makeLifecyclePath().header);
+    EXPECT_EQ(received_progress.path_fingerprint, path_identity::fingerprintPath(makeLifecyclePath()));
+    EXPECT_EQ(received_progress.plan_revision, 1u);
+    EXPECT_EQ(received_progress.segment_index, 0u);
+    EXPECT_DOUBLE_EQ(received_progress.segment_fraction, 0.0);
+    const auto instance = received_progress.controller_instance;
     EXPECT_EQ(received_carrot.header.frame_id, "map");
     EXPECT_NEAR(received_carrot.point.x, 0.3, 1e-12);
     EXPECT_DOUBLE_EQ(received_carrot.point.y, 0.0);
@@ -241,32 +247,51 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
     EXPECT_NEAR(received_raw.twist.angular.z, -0.2, 1e-12);
     EXPECT_EQ(
       observer->count_publishers("/pid_tracking_controller/tracking_diagnostics"), 0u);
-    EXPECT_NE(log_capture.output().find("PID_LOG holonomic_parameters"), std::string::npos);
-    EXPECT_NE(log_capture.output().find("nominal=0.200"), std::string::npos);
-    for (const auto & name : parent->list_parameters({"PidTrackingController"}, 0).names) {
-      EXPECT_NE(log_capture.output().find("PID_LOG parameter name=" + name + " type="),
-        std::string::npos) << name;
-    }
-    for (const auto & field : {
-        "name=controller_frequency type=double value=15",
-        "name=failure_tolerance type=double value=0",
-        "name=publish_zero_velocity type=bool value=true",
-        "name=PidTrackingController.plugin type=string value=\"pid_tracking_controller::PidTrackingController\"",
-        "name=PidTrackingController.base_frame type=string value=\"base_link\"",
-        "name=PidTrackingController.fixed_heading_yaw_enter_error type=double value=0.03490658503988659"})
-    {
-      EXPECT_NE(log_capture.output().find(field), std::string::npos) << field;
-    }
     EXPECT_NE(log_capture.output().find("PID_LOG parameter_snapshot_begin"), std::string::npos);
     EXPECT_NE(log_capture.output().find("PID_LOG parameter_snapshot_end"), std::string::npos);
-    EXPECT_NE(log_capture.output().find("PID_LOG holonomic plan_revision=1"), std::string::npos);
-    EXPECT_NE(log_capture.output().find("mode=translation"), std::string::npos);
-    EXPECT_NE(log_capture.output().find("planner_step=true"), std::string::npos);
-    EXPECT_NE(log_capture.output().find("limited_vy="), std::string::npos);
-    EXPECT_EQ(log_capture.output().find("phase=TRACKING"), std::string::npos);
+    EXPECT_NE(log_capture.output().find("PID_LOG holonomic plan_revision="), std::string::npos);
+    EXPECT_NE(log_capture.output().find("external_speed_limit="), std::string::npos);
 
     if (costmap_configured) {
+      controller.reset();
+      for (int i = 0; i < 20 && received_progress.valid; ++i) {
+        executor.spin_some(); std::this_thread::sleep_for(10ms);
+      }
+      EXPECT_FALSE(received_progress.valid);
+      EXPECT_EQ(received_progress.controller_instance, instance);
+      // Reloading identical geometry is a new execution revision, not a new hash.
+      controller.setPlan(makeLifecyclePath());
+      controller.computeVelocityCommands(makePose(0, 0), geometry_msgs::msg::Twist(), nullptr);
+      for (int i = 0; i < 20 && (!received_progress.valid || received_progress.plan_revision != 3u); ++i) {
+        executor.spin_some(); std::this_thread::sleep_for(10ms);
+      }
+      EXPECT_TRUE(received_progress.valid);
+      EXPECT_EQ(received_progress.plan_revision, 3u);
+      EXPECT_EQ(received_progress.path_fingerprint, path_identity::fingerprintPath(makeLifecyclePath()));
+      auto rotation_path = makeLifecyclePath();
+      rotation_path.poses = {makePose(0, 0), makePose(0, 0),
+        makePose(0, M_PI_2), makePose(0, M_PI_2)};
+      controller.setPlan(rotation_path);
+      ASSERT_EQ(rcl_set_ros_time_override(control_clock->get_clock_handle(), 2000000000LL), RCL_RET_OK);
+      controller.computeVelocityCommands(makePose(0, 0), geometry_msgs::msg::Twist(), nullptr);
+      for (int i = 0; i < 30 && (!received_progress.valid || received_progress.plan_revision != 4u); ++i) {
+        executor.spin_some(); std::this_thread::sleep_for(10ms);
+      }
+      EXPECT_EQ(received_progress.segment_index, 1u) << "duplicate prefix before pure rotation";
+      for (int i = 1; i <= 15; ++i) {
+        ASSERT_EQ(rcl_set_ros_time_override(control_clock->get_clock_handle(),
+          2000000000LL + i * 100000000LL), RCL_RET_OK);
+        controller.computeVelocityCommands(makePose(0, M_PI_2), geometry_msgs::msg::Twist(), nullptr);
+        executor.spin_some(); std::this_thread::sleep_for(10ms);
+      }
+      for (int i = 0; i < 10; ++i) {executor.spin_some(); std::this_thread::sleep_for(10ms);}
+      EXPECT_FALSE(received_progress.rotating);
+      EXPECT_EQ(received_progress.segment_index, 3u) << "consumed rotation must publish terminal original index";
       controller.deactivate();
+      for (int i = 0; i < 20 && received_progress.valid; ++i) {
+        executor.spin_some(); std::this_thread::sleep_for(10ms);
+      }
+      EXPECT_FALSE(received_progress.valid);
       controller.cleanup();
       costmap->cleanup();
     }
@@ -280,7 +305,6 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndCompactActiveDiagnostics)
 TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
 {
   rclcpp::init(0, nullptr);
-  ScopedLogCapture logs;
   {
     rclcpp::NodeOptions options;
     options.append_parameter_override("Controller.nominal_tracking_speed", 0.1);
@@ -294,6 +318,12 @@ TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
     options.append_parameter_override("Controller.cruise_speed", 0.8);
     options.append_parameter_override("Controller.max_v", 0.1);
     auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>("active_parent", options);
+    geometry_msgs::msg::TwistStamped received_raw;
+    auto raw_subscription = parent->create_subscription<geometry_msgs::msg::TwistStamped>(
+      "/tracking_cmd_vel_raw", rclcpp::QoS(10).reliable(),
+      [&](const geometry_msgs::msg::TwistStamped::SharedPtr message) {received_raw = *message;});
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(parent->get_node_base_interface());
     auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("active_costmap");
     costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
     costmap->configure();
@@ -325,11 +355,18 @@ TEST(LifecycleSmoke, configuredLimitsAndGainsReachActiveOutput)
     controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
     ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 1100000000LL), RCL_RET_OK);
     controller.setPlan(makeLifecyclePath());
-    const auto begin = logs.output().size();
     const auto command = controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
     EXPECT_LT(command.twist.linear.y, 0.0);
     EXPECT_NEAR(command.twist.angular.z, 0.0, 1e-12);
-    EXPECT_NEAR(loggedDouble(logs.output().substr(begin), "raw_vy="), -0.05, 1e-12);
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (received_raw.header.stamp != command.header.stamp &&
+      std::chrono::steady_clock::now() < deadline)
+    {
+      executor.spin_some();
+      std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_EQ(received_raw.header.stamp, command.header.stamp);
+    EXPECT_NEAR(received_raw.twist.linear.y, -0.05, 1e-12);
     controller.deactivate();
     controller.cleanup();
     controller.configure(parent, "Controller", tf, costmap);
@@ -369,7 +406,6 @@ TEST(LifecycleSmoke, odometryCallbackFiltersReseedingAndFallsBackAcrossLifecycle
 {
   rclcpp::init(0, nullptr);
   {
-    ScopedLogCapture logs;
     rclcpp::NodeOptions options;
     options.append_parameter_override("odom_topic", "/omega_feedback_test_odom");
     options.append_parameter_override("Controller.base_frame", "rbs_base_link");
@@ -411,17 +447,14 @@ TEST(LifecycleSmoke, odometryCallbackFiltersReseedingAndFallsBackAcrossLifecycle
         publisher->publish(message);
         geometry_msgs::msg::Twist measured;
         measured.linear.x = 0.1;
-        measured.angular.z = omega;
+        // Distinguish fallback from the received sample to verify callback consumption.
+        measured.angular.z = valid ? omega + 0.1 : omega;
         bool matched = false;
         const auto deadline = std::chrono::steady_clock::now() + 1s;
         while (std::chrono::steady_clock::now() < deadline && !matched) {
           executor.spin_some();
-          const auto begin = logs.output().size();
           const auto command = controller.computeVelocityCommands(makePose(0.0, 0.0), measured, nullptr);
-          const auto cycle_log = logs.output().substr(begin);
-          matched = std::abs(command.twist.angular.z - expected) < 1e-10 &&
-            cycle_log.find(valid ? "omega_filter_valid=true" : "omega_filter_valid=false") !=
-            std::string::npos;
+          matched = std::abs(command.twist.angular.z - expected) < 1e-10;
           EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.1);
           if (!matched) {
             std::this_thread::sleep_for(5ms);

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "angles/angles.h"
+#include "rclcpp/rclcpp.hpp"
 
 namespace pid_tracking_controller
 {
@@ -357,6 +358,28 @@ void HolonomicSpeedPlanner::seed(double reference_velocity)
   tracking_guard_.reset();
 }
 
+void HolonomicSpeedPlanner::commitSafetyOutput(double actual_progress_speed)
+{
+  if (!std::isfinite(actual_progress_speed) || actual_progress_speed < 0 ||
+    actual_progress_speed > config_.max_xy_speed)
+  {throw std::domain_error("safety progress speed is invalid");}
+  previous_reference_velocity_ = actual_progress_speed;
+}
+
+void HolonomicSpeedPlanner::logObstacleState(
+  std::optional<double> distance, const HolonomicSpeedPlan & plan, double observed_speed)
+{
+  const unsigned state = !distance ? 0 : plan.obstacle_stop_unreachable ? 3 :
+    plan.obstacle_speed_limit == 0 ? 2 : 1;
+  if (state == obstacle_log_state_) {return;}
+  const char * names[] = {"released", "active", "zero_cap", "unreachable"};
+  RCLCPP_INFO(rclcpp::get_logger("pid_tracking_controller.safety"),
+    "PID_SAFETY obstacle event=%s distance_m=%.6f cap_mps=%.6f observed_mps=%.6f "
+    "reference_mps=%.6f", names[state], distance.value_or(-1.0),
+    plan.obstacle_speed_limit, observed_speed, plan.reference_velocity);
+  obstacle_log_state_ = state;
+}
+
 HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   const HolonomicTrackingReference & reference,
   double robot_yaw,
@@ -365,11 +388,15 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   double observed_speed,
   HolonomicTranslationFeedback feedback,
   std::optional<HolonomicBodyCommand> previous_command,
-  std::optional<HolonomicTrackingObservation> observation)
+  std::optional<HolonomicTrackingObservation> observation,
+  std::optional<double> obstacle_stop_distance)
 {
   if (!path_) {
     throw std::logic_error("speed planner has no path");
   }
+  if (obstacle_stop_distance &&
+    (!std::isfinite(*obstacle_stop_distance) || *obstacle_stop_distance < 0))
+  {throw std::domain_error("obstacle stop distance must be finite and nonnegative");}
   if (!std::isfinite(robot_yaw) || !std::isfinite(dt) || dt <= 0.0 ||
     std::isnan(external_speed_limit) || external_speed_limit < 0.0 ||
     !std::isfinite(observed_speed) || observed_speed < 0.0 ||
@@ -387,6 +414,22 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   plan.external_speed_limit = external_speed_limit;
   plan.representative_path_spacing = representative_path_spacing_;
   plan.rate_window_length = rate_window_length_;
+  if (obstacle_stop_distance) {
+    const long double output_speed = previous_command ?
+      std::hypot(static_cast<long double>(previous_command->vx),
+      static_cast<long double>(previous_command->vy)) : 0.0L;
+    const long double motion_speed = std::max<long double>(observed_speed, output_speed);
+    const long double delay = std::max<long double>(motion_speed, previous_reference_velocity_) *
+      config_.stopping_delay;
+    const long double remaining = std::max(0.0L, *obstacle_stop_distance - delay);
+    const long double braking_cap = std::sqrt(2.0L * config_.stopping_deceleration * remaining);
+    const long double cap = std::min<long double>(config_.max_xy_speed, braking_cap);
+    plan.obstacle_speed_limit = static_cast<double>(cap);
+    if (plan.obstacle_speed_limit > cap) {
+      plan.obstacle_speed_limit = std::nextafter(plan.obstacle_speed_limit, 0.0);
+    }
+    plan.obstacle_stop_unreachable = motion_speed > braking_cap;
+  }
 
   if (reference.mode == HolonomicReferenceMode::kRotationPending ||
     reference.mode == HolonomicReferenceMode::kTerminal)
@@ -397,8 +440,10 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
     if (reference.mode == HolonomicReferenceMode::kRotationPending) {
       plan.stopping_speed_limit = 0.0;
     }
+    plan.stopping_speed_limit = std::min(plan.stopping_speed_limit, plan.obstacle_speed_limit);
     previous_reference_velocity_ = 0.0;
     tracking_guard_.reset();
+    logObstacleState(obstacle_stop_distance, plan, observed_speed);
     return plan;
   } else {
     const auto & cursor = reference.current.cursor;
@@ -540,6 +585,8 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
         plan.stopping_speed_limit, config_.stopping_min_speed);
     }
 
+    plan.stopping_speed_limit = std::min(plan.stopping_speed_limit, plan.obstacle_speed_limit);
+
     plan.reference_velocity_target = config_.nominal_tracking_speed;
     plan.speed_limit_reason = HolonomicSpeedLimitReason::kNominal;
     applyLimit(
@@ -561,7 +608,9 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
       plan.acceleration_speed_limit, HolonomicSpeedLimitReason::kAccelerationPreview,
       plan.reference_velocity_target, plan.speed_limit_reason);
     applyLimit(
-      plan.stopping_speed_limit, HolonomicSpeedLimitReason::kStoppingDistance,
+      plan.stopping_speed_limit, obstacle_stop_distance &&
+      plan.obstacle_speed_limit <= plan.stopping_speed_limit ?
+      HolonomicSpeedLimitReason::kObstacleStop : HolonomicSpeedLimitReason::kStoppingDistance,
       plan.reference_velocity_target, plan.speed_limit_reason);
 
     if (feedback.vx != 0.0 || feedback.vy != 0.0) {
@@ -663,6 +712,7 @@ HolonomicSpeedPlan HolonomicSpeedPlanner::plan(
   plan.feedback_unreachable = plan.feedback_unreachable ||
     static_cast<long double>(plan.reference_velocity) < feedback_interval.lower;
   previous_reference_velocity_ = plan.reference_velocity;
+  logObstacleState(obstacle_stop_distance, plan, observed_speed);
   return plan;
 }
 

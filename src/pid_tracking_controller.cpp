@@ -27,6 +27,7 @@
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "path_progress_tracker.hpp"
+#include "tracking_progress_publisher.hpp"
 #include "prepared_path.hpp"
 #include "rotation_completion_tracker.hpp"
 #include "rotation_entry_gate.hpp"
@@ -103,11 +104,13 @@ const char * holonomicLimitReasonName(HolonomicSpeedLimitReason reason)
         case HolonomicSpeedLimitReason::kYawRate: return "yaw_rate";
         case HolonomicSpeedLimitReason::kTangentRate: return "tangent_rate";
         case HolonomicSpeedLimitReason::kStoppingDistance: return "stopping_distance";
+        case HolonomicSpeedLimitReason::kObstacleStop: return "obstacle_stop";
         case HolonomicSpeedLimitReason::kRotation: return "rotation";
         case HolonomicSpeedLimitReason::kTerminal: return "terminal";
     }
     return "unknown";
 }
+
 
 }  // namespace
 
@@ -350,6 +353,12 @@ void PidTrackingController::configure(
             "stop_source=raw reseed_source=%s", omega_filter_tau,
             omega_feedback_filter_ ? "filtered_if_fresh" : "raw");
 
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".publish_tracking_progress",
+            rclcpp::ParameterValue(false));
+    if (node->get_parameter(controller_plugin_name + ".publish_tracking_progress").as_bool()) {
+        tracking_progress_pub_ = std::make_unique<TrackingProgressPublisher>(node);
+    }
+
     // Snapshot live values rather than reading a possibly different YAML on disk.
     // Keep one parameter per line so downstream tools retain names and value types.
     auto parameter_names = node->list_parameters({controller_plugin_name}, 0).names;
@@ -396,6 +405,7 @@ void PidTrackingController::configure(
 
 void PidTrackingController::activate()
 {
+    if (tracking_progress_pub_) {tracking_progress_pub_->activate();}
     control_time_valid_ = false;
     if (omega_feedback_filter_) {
         omega_feedback_filter_->reset();
@@ -412,6 +422,7 @@ void PidTrackingController::activate()
 
 void PidTrackingController::deactivate()
 {
+    if (tracking_progress_pub_) {tracking_progress_pub_->deactivate();}
     control_time_valid_ = false;
     if (omega_feedback_filter_) {
         omega_feedback_filter_->reset();
@@ -427,6 +438,7 @@ void PidTrackingController::deactivate()
 
 void PidTrackingController::cleanup()
 {
+    tracking_progress_pub_.reset();
     control_time_valid_ = false;
     omega_feedback_sub_.reset();
     omega_feedback_filter_.reset();
@@ -445,6 +457,7 @@ void PidTrackingController::cleanup()
 
 void PidTrackingController::reset()
 {
+    if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
     // The next task seeds the planner and limiter from measured velocity.
     control_time_valid_ = false;
     last_commanded_planar_speed_ = 0.0;
@@ -459,6 +472,7 @@ void PidTrackingController::reset()
 // Every accepted path replaces tracker/planner geometry while retaining command continuity.
 void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
+    if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
     RCLCPP_INFO(logger_, "PidTrackingController received a path");
     resetRotationState(true);
     fixed_heading_yaw_gate_->reset();
@@ -488,6 +502,9 @@ void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
                 controller_plugin_name + " received an invalid path: " + exception.what());
     }
     ++plan_revision_;
+    if (tracking_progress_pub_) {
+        tracking_progress_pub_->loaded(orig_global_plan, plan_revision_, prepared_path_);
+    }
     progress_handoff_pending_ = true;
 }
 
@@ -637,7 +654,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         now_seconds - last_diagnostics_log_time_seconds_ >= 1.0) {
         RCLCPP_INFO(logger_,
                 "PID_LOG holonomic plan_revision=%zu mode=%s control_now=%.9f planner_step=%s "
-                "reference_effective=%.6f limit_reason=%s "
+                "reference_effective=%.6f external_speed_limit=%.6f limit_reason=%s "
                 "raw_vx=%.6f raw_vy=%.6f limited_vx=%.6f limited_vy=%.6f "
                 "translation_lambda=%.6f reseed=%s control_gap=%s "
                 "stop_speed_limit=%.6f stop_limit_unreachable=%s "
@@ -648,7 +665,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 "measured_omega=%.6f filtered_omega=%.6f omega_filter_valid=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                 reseed ? "false" : "true",
-                speed_plan.reference_velocity,
+                speed_plan.reference_velocity, cap,
                 reseed ? "not_planned" : holonomicLimitReasonName(speed_plan.speed_limit_reason),
                 raw.vx, raw.vy, limited.command.vx, limited.command.vy,
                 limited.translation_lambda, reseed_reason, gap ? "true" : "false",
@@ -857,6 +874,9 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         if (carrot_pub_ && carrot_pub_->is_activated()) {
             carrot_pub_->publish(carrot);
         }
+        if (tracking_progress_pub_) {
+            tracking_progress_pub_->update(progress, tracking_pose, rotation_pending_);
+        }
         // Commit progress only after the entire active command has been validated.
         if (rotation_ack_candidate_) {
             path_progress_tracker_->acknowledgeRotationComplete(pending_rotation_segment_index_);
@@ -867,14 +887,17 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
         }
         return command;
     } catch (const nav2_core::InvalidPath &) {
+        if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
         control_time_valid_ = false;
         resetRotationState();
         throw;
     } catch (const nav2_core::ControllerTFError &) {
+        if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
         control_time_valid_ = false;
         resetRotationState();
         throw;
     } catch (const std::exception & exception) {
+        if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
         control_time_valid_ = false;
         resetRotationState();
         throw nav2_core::NoValidControl(

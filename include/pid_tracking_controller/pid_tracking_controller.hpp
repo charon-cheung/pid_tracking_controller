@@ -27,6 +27,7 @@ namespace pid_tracking_controller
 
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
+class TrackingProgressPublisher;
 class RotationCompletionTracker;
 class RotationEntryGate;
 class FixedHeadingYawGate;
@@ -113,6 +114,7 @@ private:
   bool progress_handoff_failure_logged_{false};
   std::string controller_plugin_name;
 
+  std::unique_ptr<TrackingProgressPublisher> tracking_progress_pub_;
   std::size_t plan_revision_{0};
   double last_diagnostics_log_time_seconds_{0.0};
   bool force_diagnostics_log_{true};

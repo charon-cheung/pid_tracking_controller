@@ -665,5 +665,97 @@ TEST(HolonomicCommandLimiter, stoppingBrakeDoesNotIncreaseReverseAcceleration)
   EXPECT_NEAR(result.command.vx, -0.02, 1e-12);
 }
 
+
+TEST(HolonomicCommandLimiter, explicitBrakeStopsAllAxesWithoutReversal)
+{
+  auto config = makeConfig(); config.max_decel_x = .4; config.max_decel_y = .3;
+  for (const auto start : {command(.6, 0, 0), command(-.6, 0, 0), command(0, -.6, 0),
+      command(0, 0, -.6), command(.6, -.4, .6)})
+  {
+    HolonomicCommandLimiter limiter(config); limiter.seed(start);
+    auto previous = start;
+    for (int i = 0; i < 80; ++i) {
+      const auto result = limiter.brake(previous, .1, previous);
+      EXPECT_NE(result.mode, HolonomicSafetyMode::kEmergency);
+      const auto check = [](double before, double after, double allowance) {
+          EXPECT_LE(std::abs(after), std::abs(before)); EXPECT_GE(before * after, 0);
+          EXPECT_LE(std::abs(after - before), allowance + 1e-12);
+        };
+      check(previous.vx, result.command.vx, config.max_decel_x * .1);
+      check(previous.vy, result.command.vy, config.max_decel_y * .1);
+      check(previous.omega, result.command.omega, config.max_alpha * .1);
+      previous = result.command;
+    }
+    EXPECT_DOUBLE_EQ(previous.vx, 0); EXPECT_DOUBLE_EQ(previous.vy, 0);
+    EXPECT_DOUBLE_EQ(previous.omega, 0);
+    EXPECT_EQ(limiter.brake(start, .1, previous).mode, HolonomicSafetyMode::kHold);
+    // Zero command is a hold, not proof that nonzero measured motion has stopped.
+  }
+}
+
+TEST(HolonomicCommandLimiter, brakeTimeDiscontinuityCannotReseedNonzeroMotion)
+{
+  const auto config = makeConfig();
+  for (double dt : {.1, 0.0, -.1, 1.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    HolonomicCommandLimiter limiter(config);
+    if (dt != .1) {limiter.seed(command(.5, -.3, .4));}
+    const auto result = limiter.brake(command(.5, -.3, .4), dt,
+      dt == .1 ? std::nullopt : std::optional<HolonomicBodyCommand>{command(.5, -.3, .4)});
+    EXPECT_EQ(result.mode, HolonomicSafetyMode::kEmergency);
+    EXPECT_DOUBLE_EQ(result.command.vx, 0); EXPECT_DOUBLE_EQ(result.command.vy, 0);
+    EXPECT_DOUBLE_EQ(result.command.omega, 0);
+    const auto resumed = limiter.limit(command(.5, -.3, .4), command(.5, -.3, .4), .1);
+    EXPECT_LE(std::abs(resumed.command.vx), config.max_ax * .1 + 1e-12);
+    EXPECT_LE(std::abs(resumed.command.vy), config.max_ay * .1 + 1e-12);
+    EXPECT_LE(std::abs(resumed.command.omega), config.max_alpha * .1 + 1e-12);
+  }
+}
+
+TEST(HolonomicCommandLimiter, safetyOutputCommitControlsNextCycleAndRejectsInvalidInput)
+{
+  auto config = makeConfig(); HolonomicCommandLimiter limiter(config);
+  limiter.seed(command(.5, .3, .4));
+  limiter.limit(command(.8, .2, .8), {}, .1);
+  limiter.commitSafetyOutput(command(.1, -.1, .05));
+  for (const auto invalid : {command(2, 0, 0), command(.8, .8, 0), command(0, 0, 2),
+      command(std::numeric_limits<double>::quiet_NaN(), 0, 0)})
+  {EXPECT_THROW(limiter.commitSafetyOutput(invalid), std::domain_error);}
+  EXPECT_THROW(limiter.brake(command(0, 0, std::numeric_limits<double>::quiet_NaN()), .1,
+      command(.1, -.1, .05)),
+    std::domain_error);
+  const auto next = limiter.limit(command(1, 0, 1), {}, .1);
+  EXPECT_LE(next.command.vx, .1 + config.max_ax * .1 + 1e-12);
+  EXPECT_LE(next.command.vy, -.1 + config.max_ay * .1 + 1e-12);
+  EXPECT_LE(next.command.omega, .05 + config.max_alpha * .1 + 1e-12);
+}
+
+
+TEST(HolonomicCommandLimiter, rejectedCandidateCannotBecomeBrakingHistory)
+{
+  auto config = makeConfig(); HolonomicCommandLimiter limiter(config);
+  const auto accepted = command(.4, -.2, .3);
+  limiter.seed(accepted);
+  const auto candidate = limiter.limit(command(.8, -.5, .8), accepted, .1);
+  ASSERT_GT(candidate.command.vx, accepted.vx);
+  const auto stopped = limiter.brake(accepted, .1, accepted);
+  EXPECT_NEAR(stopped.command.vx, .4 - config.max_decel_x * .1, 1e-12);
+  EXPECT_NEAR(stopped.command.vy, -.2 + config.max_decel_y * .1, 1e-12);
+  EXPECT_NEAR(stopped.command.omega, .3 - config.max_alpha * .1, 1e-12);
+  const auto next = limiter.limit(command(.8, -.5, .8), accepted, .1);
+  EXPECT_LE(next.command.vx, stopped.command.vx + config.max_ax * .1 + 1e-12);
+}
+
+TEST(HolonomicCommandLimiter, tinyBrakeStepDoesNotExceedRateByRounding)
+{
+  auto config = makeConfig(); config.max_decel_x = 1;
+  HolonomicCommandLimiter limiter(config);
+  const double dt = std::nextafter(std::ldexp(1.0, -53), 0.0);
+  const auto result = limiter.brake(command(1, 0, 0), dt, command(1, 0, 0));
+  EXPECT_LE(1.0L - result.command.vx, static_cast<long double>(dt));
+  EXPECT_GE(result.command.vx, 0);
+}
+
 }  // namespace
 }  // namespace pid_tracking_controller

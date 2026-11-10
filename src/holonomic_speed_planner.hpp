@@ -27,7 +27,8 @@ enum class HolonomicSpeedLimitReason
   kAccelerationBudget,
   kRotation,
   kTerminal,
-  kTrackingResponse
+  kTrackingResponse,
+  kObstacleStop
 };
 
 struct HolonomicSpeedPlannerConfig
@@ -62,6 +63,9 @@ struct HolonomicSpeedPlan
   double yaw_ff_speed_limit{std::numeric_limits<double>::infinity()};
   double tangent_speed_limit{std::numeric_limits<double>::infinity()};
   double stopping_speed_limit{std::numeric_limits<double>::infinity()};
+  // Separate obstacle envelope: no terminal approach-speed floor.
+  double obstacle_speed_limit{std::numeric_limits<double>::infinity()};
+  bool obstacle_stop_unreachable{false};  // Kinematic envelope, not collision/stop proof.
   double stopping_distance{0.0};
   double stopping_delay_distance{0.0};
   double external_speed_limit{std::numeric_limits<double>::infinity()};
@@ -105,6 +109,9 @@ public:
 
   void setPath(PreparedPathPtr path);
   void seed(double reference_velocity);
+  // Nonnegative projection of the accepted safety output onto the path tangent.
+  // Unlike seed(), this preserves the tracking guard state.
+  void commitSafetyOutput(double actual_progress_speed);
 
   // observed_speed is a nonnegative planar speed, conservatively including both
   // measured motion and the last output; stopping_delay already includes pose age.
@@ -116,9 +123,14 @@ public:
     double observed_speed = 0.0,
     HolonomicTranslationFeedback feedback = {},
     std::optional<HolonomicBodyCommand> previous_command = std::nullopt,
-    std::optional<HolonomicTrackingObservation> observation = std::nullopt);
+    std::optional<HolonomicTrackingObservation> observation = std::nullopt,
+    // Distance in metres after caller-applied margins; absent preserves terminal behavior.
+    std::optional<double> obstacle_stop_distance = std::nullopt);
 
 private:
+  void logObstacleState(std::optional<double> distance, const HolonomicSpeedPlan & plan,
+    double observed_speed);
+  unsigned obstacle_log_state_{0};
   HolonomicSpeedPlannerConfig config_;
   PreparedPathPtr path_;
   TranslationTrackingGuard tracking_guard_;

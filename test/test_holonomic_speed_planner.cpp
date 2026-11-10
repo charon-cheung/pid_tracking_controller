@@ -1214,5 +1214,105 @@ TEST(HolonomicSpeedPlanner, observedSpeedReservesDistanceForDelayedBraking)
   EXPECT_THROW(HolonomicSpeedPlanner{config}, std::invalid_argument);
 }
 
+
+TEST(HolonomicSpeedPlanner, obstacleEnvelopeReservesDelayWithoutApproachFloor)
+{
+  const auto path = preparePath(makePath({{0, 0, 0}, {20, 0, 0}}));
+  const auto ref = makeReference(path, makePoint(0, 0));
+  auto config = makeConfig();
+  config.stopping_deceleration = .4;
+  config.stopping_delay = .5;
+  config.stopping_min_speed = .06;
+  HolonomicSpeedPlanner planner(config); planner.setPath(path);
+  double previous_cap = std::numeric_limits<double>::infinity();
+  for (double distance : {2.0, 1.21, 1.19, .401, .4, .1, 0.0}) {
+    planner.seed(.8);
+    const auto result = planner.plan(ref, 0, .1, config.max_xy_speed, .8, {},
+      HolonomicBodyCommand{.8, 0, 0}, std::nullopt, distance);
+    EXPECT_NEAR(result.obstacle_speed_limit, std::sqrt(.8 * std::max(0.0, distance - .4)), 1e-12);
+    EXPECT_LE(result.obstacle_speed_limit, previous_cap);
+    EXPECT_LE(result.reference_velocity, result.obstacle_speed_limit);
+    EXPECT_EQ(result.obstacle_stop_unreachable, distance < 1.2 - 1e-12);
+    previous_cap = result.obstacle_speed_limit;
+    if (distance <= .4) {EXPECT_DOUBLE_EQ(result.stopping_speed_limit, 0.0);}
+    if (distance == .401) {EXPECT_LT(result.stopping_speed_limit, config.stopping_min_speed);}
+  }
+  // Last actual output must reserve reaction distance even if measured speed is low.
+  planner.seed(0);
+  const auto previous_output = planner.plan(ref, 0, .1, config.max_xy_speed, 0, {},
+    HolonomicBodyCommand{.8, 0, 0}, std::nullopt, .4);
+  EXPECT_DOUBLE_EQ(previous_output.obstacle_speed_limit, 0);
+  EXPECT_TRUE(previous_output.obstacle_stop_unreachable);
+  // An observed speed above the command cap is not by itself an unreachable stop.
+  config.max_xy_speed = .5;
+  HolonomicSpeedPlanner overspeed(config); overspeed.setPath(path); overspeed.seed(.5);
+  const auto distant = overspeed.plan(ref, 0, .1, config.max_xy_speed, .8, {},
+    std::nullopt, std::nullopt, 10.0);
+  EXPECT_LE(distant.obstacle_speed_limit, config.max_xy_speed);
+  EXPECT_FALSE(distant.obstacle_stop_unreachable);
+}
+
+TEST(HolonomicSpeedPlanner, obstacleInputValidationAndSafetyHistoryRecovery)
+{
+  const auto path = preparePath(makePath({{0, 0, 0}, {20, 0, 0}}));
+  const auto ref = makeReference(path, makePoint(0, 0));
+  auto config = makeConfig(); config.a_ref_up = .4;
+  HolonomicSpeedPlanner planner(config); planner.setPath(path); planner.seed(.8);
+  for (double invalid : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    EXPECT_THROW(planner.plan(ref, 0, .1, config.max_xy_speed, 0, {},
+      std::nullopt, std::nullopt, invalid), std::domain_error);
+    EXPECT_THROW(planner.commitSafetyOutput(invalid), std::domain_error);
+  }
+  // Rejected inputs do not corrupt the existing reference history.
+  EXPECT_NEAR(planner.plan(ref, 0, .1).reference_velocity, .84, 1e-12);
+  planner.commitSafetyOutput(0);
+  const auto resumed = planner.plan(ref, 0, .1);
+  EXPECT_NEAR(resumed.reference_velocity, .04, 1e-12);
+  EXPECT_TRUE(std::isinf(resumed.obstacle_speed_limit));
+  EXPECT_FALSE(resumed.obstacle_stop_unreachable);
+}
+
+TEST(HolonomicSpeedPlanner, stopHoldAndResumeAcrossPlannerAndLimiter)
+{
+  const auto path = preparePath(makePath({{0, 0, 0}, {20, 0, 0}}));
+  const auto ref = makeReference(path, makePoint(0, 0));
+  auto config = makeConfig(); config.stopping_deceleration = .4;
+  config.a_ref_up = .4; config.stopping_min_speed = .06;
+  HolonomicSpeedPlanner planner(config); planner.setPath(path); planner.seed(.6);
+  HolonomicCommandLimiterConfig limits; limits.max_decel_x = .4;
+  HolonomicCommandLimiter limiter(limits);
+  HolonomicBodyCommand actual{.6, .2, .3}; limiter.seed(actual);
+  double distance = 1.0;
+  bool stopped = false;
+  for (int cycle = 0; cycle < 80; ++cycle) {
+    const auto plan = planner.plan(ref, 0, .1, limits.max_xy_speed,
+      std::hypot(actual.vx, actual.vy), {}, actual, std::nullopt, distance);
+    const auto before = actual;
+    // Synthetic safety request; the real obstacle trigger belongs to stage 1E.
+    if (cycle >= 10) {
+      actual = limiter.brake(actual, .1, before).command;
+      planner.commitSafetyOutput(std::max(0.0, actual.vx));
+    } else {
+      actual = limiter.limit({plan.reference_velocity, 0, 0}, actual, .1,
+        limits.max_xy_speed, plan.stopping_speed_limit).command;
+    }
+    const double x_rate = cycle >= 10 ? limits.max_decel_x :
+      std::max(limits.max_ax, limits.max_decel_x);
+    EXPECT_LE(std::abs(actual.vx - before.vx), x_rate * .1 + 1e-12);
+    EXPECT_LE(std::abs(actual.vy - before.vy), limits.max_decel_y * .1 + 1e-12);
+    EXPECT_LE(std::abs(actual.omega - before.omega), limits.max_alpha * .1 + 1e-12);
+    EXPECT_GE(actual.vx, 0); EXPECT_GE(actual.vy, 0); EXPECT_GE(actual.omega, 0);
+    distance = std::max(0.0, distance - actual.vx * .1);
+    if (actual.vx == 0 && actual.vy == 0 && actual.omega == 0) {stopped = true;}
+    if (stopped) {EXPECT_DOUBLE_EQ(actual.vx + actual.vy + actual.omega, 0);}
+  }
+  ASSERT_TRUE(stopped);
+  const auto plan = planner.plan(ref, 0, .1, limits.max_xy_speed, 0, {}, actual);
+  actual = limiter.limit({plan.reference_velocity, 0, 0}, actual, .1).command;
+  EXPECT_GT(actual.vx, 0); EXPECT_LE(actual.vx, config.a_ref_up * .1 + 1e-12);
+}
+
 }  // namespace
 }  // namespace pid_tracking_controller

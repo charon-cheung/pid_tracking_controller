@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include "rclcpp/rclcpp.hpp"
 
 namespace pid_tracking_controller
 {
@@ -186,6 +187,60 @@ void HolonomicCommandLimiter::seed(
   rotation_direction_ = 0.0;
 }
 
+void HolonomicCommandLimiter::commitSafetyOutput(const HolonomicBodyCommand & command)
+{
+  validateCommand(command);
+  if (std::abs(command.vx) > config_.max_vx || std::abs(command.vy) > config_.max_vy ||
+    std::abs(command.omega) > config_.max_omega || translationSpeed(command) > config_.max_xy_speed)
+  {throw std::domain_error("safety output exceeds command limits");}
+  previous_command_ = command;
+  seeded_ = true;
+  if (command.omega == 0) {rotation_direction_ = 0.0;}
+}
+
+void HolonomicCommandLimiter::logSafetyState(
+  HolonomicSafetyMode mode, const HolonomicBodyCommand & command,
+  const HolonomicBodyCommand & measured, double dt, const char * reason)
+{
+  if (mode == safety_mode_) {return;}
+  const char * names[] = {"released", "braking", "hold", "emergency"};
+  RCLCPP_INFO(rclcpp::get_logger("pid_tracking_controller.safety"),
+    "PID_SAFETY brake event=%s reason=%s dt=%.6f command=(%.6f,%.6f,%.6f) "
+    "measured=(%.6f,%.6f,%.6f) physical_stop=unverified", names[static_cast<unsigned>(mode)],
+    reason, dt, command.vx, command.vy, command.omega, measured.vx, measured.vy, measured.omega);
+  safety_mode_ = mode;
+}
+
+HolonomicBrakeResult HolonomicCommandLimiter::brake(
+  const HolonomicBodyCommand & measured, double dt,
+  std::optional<HolonomicBodyCommand> accepted_output)
+{
+  validateCommand(measured);
+  if (accepted_output) {commitSafetyOutput(*accepted_output);}
+  HolonomicBrakeResult result;
+  const bool time_valid = std::isfinite(dt) && dt > 0 && dt <= config_.control_gap_threshold;
+  const char * reason = !accepted_output ? "no_output_history" : !time_valid ? "invalid_dt" : "stop_requested";
+  if (accepted_output && time_valid) {
+    const auto axis = [dt](double previous, double deceleration) {
+        const long double magnitude = std::max(0.0L,
+          std::abs(static_cast<long double>(previous)) - static_cast<long double>(deceleration) * dt);
+        const double candidate = quantizeTowardPrevious(std::copysign(magnitude, previous), previous);
+        // Wide subtraction can round at a double boundary for tiny dt.
+        return std::abs(static_cast<long double>(candidate) - previous) <=
+               static_cast<long double>(deceleration) * dt ? candidate : previous;
+      };
+    result.command = {axis(previous_command_.vx, config_.max_decel_x),
+      axis(previous_command_.vy, config_.max_decel_y), axis(previous_command_.omega, config_.max_alpha)};
+    result.mode = result.command.vx == 0 && result.command.vy == 0 && result.command.omega == 0 ?
+      HolonomicSafetyMode::kHold : HolonomicSafetyMode::kBraking;
+  }
+  // Missing history/time cannot certify a bounded ramp. Request zero explicitly;
+  // downstream collision protection and physical stop confirmation remain necessary.
+  commitSafetyOutput(result.command);
+  logSafetyState(result.mode, result.command, measured, dt, reason);
+  return result;
+}
+
 HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
   const HolonomicBodyCommand & raw,
   const HolonomicBodyCommand & measured,
@@ -221,6 +276,7 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     previous_command_ = result.command;
     seeded_ = true;
     rotation_direction_ = 0.0;
+    logSafetyState(HolonomicSafetyMode::kInactive, result.command, measured, dt, "normal_limit");
     return result;
   }
 
@@ -301,6 +357,7 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     applyExternalSpeedLimit(result.command, external_speed_limit);
   result.stopping_limit_unreachable = translationSpeed(result.command) > stopping_speed_limit;
   previous_command_ = result.command;
+  logSafetyState(HolonomicSafetyMode::kInactive, result.command, measured, dt, "normal_limit");
   return result;
 }
 
