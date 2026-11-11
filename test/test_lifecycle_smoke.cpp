@@ -21,6 +21,7 @@
 #include "rcutils/logging.h"
 #include "tf2_ros/buffer.h"
 #include "controller_test_access.hpp"
+#include "motion_observation.hpp"
 #include "pid_tracking_controller/msg/tracking_progress.hpp"
 #include "pid_tracking_controller/path_identity.hpp"
 #include "nav2_core/controller_exceptions.hpp"
@@ -299,6 +300,141 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndProgressWithoutPidLogs)
     executor.remove_node(parent->get_node_base_interface());
   }
 
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, unavailableObservationDoesNotChangeCommands)
+{
+  rclcpp::init(0, nullptr);
+  {
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("observation_control_map");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->configure();
+    ASSERT_EQ(costmap->get_current_state().label(), "inactive");
+    costmap->set_parameter(rclcpp::Parameter("always_send_full_costmap", true));
+    // Declare an observational source without starting a map-update thread.
+    costmap->declare_parameter("test_layer.enabled", true);
+    costmap->declare_parameter("test_layer.observation_sources", "scan");
+    costmap->declare_parameter("test_layer.scan.topic", "/absent_observation_scan");
+    costmap->declare_parameter("test_layer.scan.data_type", "LaserScan");
+    costmap->declare_parameter("test_layer.scan.expected_update_rate", 0.);
+    costmap->declare_parameter("test_layer.scan.marking", true);
+    costmap->declare_parameter("test_layer.scan.clearing", true);
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>{"test_layer"}));
+    std::array<std::vector<geometry_msgs::msg::Twist>, 2> commands;
+    for (int enabled = 0; enabled < 2; ++enabled) {
+      auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>("observation_control_parent");
+      parent->declare_parameter("Controller.observe_execution_inputs", bool(enabled));
+      parent->declare_parameter("Controller.observed_smoothed_velocity_topic", "/absent_smoother");
+      // The same observation path must also work when angular filtering is disabled.
+      parent->declare_parameter("Controller.omega_feedback_filter_tau", 0.0);
+      parent->declare_parameter("odom_topic", "/motion_test_odom");
+      auto odom_pub = parent->create_publisher<nav_msgs::msg::Odometry>("/motion_test_odom", 1);
+      odom_pub->on_activate();
+      rclcpp::executors::SingleThreadedExecutor executor;
+      executor.add_node(parent->get_node_base_interface());
+      auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+      auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+      ASSERT_EQ(rcl_enable_ros_time_override(clock->get_clock_handle()), RCL_RET_OK);
+      PidTrackingController controller;
+      controller.configure(parent, "Controller", tf, costmap); controller.activate();
+      PidTrackingControllerTestAccess::setClock(controller, clock);
+      controller.setPlan(makeLifecyclePath());
+      for (int i = 0; i < 60; ++i) {
+        if (i == 20) {
+          nav_msgs::msg::Path rotation_path;
+          rotation_path.header.frame_id = "map";
+          rotation_path.poses = {makePose(0., 0.), makePose(0., 0.2), makePose(0.6, 0.2)};
+          controller.setPlan(rotation_path);
+        } else if (i == 40) {
+          controller.setPlan(makeLifecyclePath());
+        }
+        ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 1000000000LL + i * 66666667LL), RCL_RET_OK);
+        commands[enabled].push_back(controller.computeVelocityCommands(
+            makePose(0., 0.), geometry_msgs::msg::Twist(), nullptr).twist);
+        if (enabled && i == 39) {
+          const auto motion = PidTrackingControllerTestAccess::motionObservation(controller);
+          ASSERT_NE(motion, nullptr);
+          const auto sample = motion->snapshot(parent->now().nanoseconds())[MotionObservation::Candidate].sample;
+          EXPECT_DOUBLE_EQ(sample.omega, commands[enabled].back().angular.z);
+          EXPECT_EQ(sample.revision, 2u);
+        }
+        nav_msgs::msg::Odometry odom; odom.header.stamp = parent->now();
+        odom.header.frame_id = "odom"; odom.child_frame_id = "base_link";
+        odom.twist.twist.linear.y = -.12; odom.twist.twist.angular.z = .08;
+        odom_pub->publish(odom); executor.spin_some();
+        std::this_thread::sleep_for(10ms);
+      }
+      auto motion = PidTrackingControllerTestAccess::motionObservation(controller);
+      if (enabled) {
+        ASSERT_NE(motion, nullptr);
+        const auto end = std::chrono::steady_clock::now() + 2s;
+        while (!motion->snapshot(parent->now().nanoseconds())[3].sample.count &&
+          std::chrono::steady_clock::now() < end) {executor.spin_some(); std::this_thread::sleep_for(10ms);}
+        const auto evidence = motion->snapshot(parent->now().nanoseconds());
+        EXPECT_EQ(odom_pub->get_subscription_count(), 1u);
+        EXPECT_STREQ(evidence[3].state, "valid");
+        EXPECT_DOUBLE_EQ(evidence[3].sample.vy, -.12); EXPECT_DOUBLE_EQ(evidence[3].sample.omega, .08);
+        EXPECT_EQ(evidence[0].sample.vx, commands[enabled].back().linear.x);
+        EXPECT_EQ(evidence[0].sample.omega, commands[enabled].back().angular.z);
+        EXPECT_EQ(evidence[0].sample.revision, 3u);
+      }
+      controller.deactivate(); controller.cleanup();
+      if (motion) {EXPECT_STREQ(motion->snapshot(parent->now().nanoseconds())[0].state, "missing");}
+    }
+    EXPECT_GT(commands[1][39].angular.z, 0.);  // The comparison includes admitted rotation.
+    EXPECT_DOUBLE_EQ(commands[1][39].linear.x, 0.);
+    EXPECT_GT(commands[1].back().linear.x, 0.);
+    EXPECT_EQ(commands[0], commands[1]);
+    costmap->cleanup();
+  }
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, rotationParametersAffectTurnsWithoutChangingTranslationYaw)
+{
+  rclcpp::init(0, nullptr);
+  {
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("rotation_parameters_map");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->configure();
+    ASSERT_EQ(costmap->get_current_state().label(), "inactive");
+    std::vector<double> turns, translations;
+    for (const auto & settings : {std::pair<double, double>{0.5, 0.0}, {2.5, 0.0}, {2.5, 0.6}}) {
+      auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>("rotation_parameters_parent");
+      parent->declare_parameter("Controller.rotation_kp_yaw", settings.first);
+      parent->declare_parameter("Controller.rotation_response_delay", settings.second);
+      parent->declare_parameter("Controller.kp_yaw", 0.5);
+      parent->declare_parameter("Controller.omega_feedback_filter_tau", 0.0);
+      auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+      auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+      ASSERT_EQ(rcl_enable_ros_time_override(clock->get_clock_handle()), RCL_RET_OK);
+      PidTrackingController controller;
+      controller.configure(parent, "Controller", tf, costmap); controller.activate();
+      PidTrackingControllerTestAccess::setClock(controller, clock);
+      nav_msgs::msg::Path path;
+      path.header.frame_id = "map";
+      path.poses = {makePose(0., 0.), makePose(0., 0.15)};
+      controller.setPlan(path);
+      for (int i = 0; i < 30; ++i) {
+        ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 1000000000LL + i * 66666667LL), RCL_RET_OK);
+        const auto output = controller.computeVelocityCommands(makePose(0., 0.), geometry_msgs::msg::Twist(), nullptr);
+        EXPECT_DOUBLE_EQ(output.twist.linear.x, 0.0);
+        if (i == 29) {turns.push_back(output.twist.angular.z);}
+      }
+      controller.reset(); controller.setPlan(makeLifecyclePath());
+      for (int i = 0; i < 20; ++i) {
+        ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(), 4000000000LL + i * 66666667LL), RCL_RET_OK);
+        const auto output = controller.computeVelocityCommands(makePose(0., 0.2), geometry_msgs::msg::Twist(), nullptr);
+        if (i == 19) {translations.push_back(output.twist.angular.z);}
+      }
+      controller.deactivate(); controller.cleanup();
+    }
+    EXPECT_GT(turns[1], turns[0]);
+    EXPECT_LT(turns[2], turns[1]);
+    for (const auto omega : translations) {EXPECT_NEAR(omega, -0.1, 1e-12);}
+    costmap->cleanup();
+  }
   rclcpp::shutdown();
 }
 

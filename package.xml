@@ -20,6 +20,7 @@
   <depend>nav2_util</depend>
   <depend>nav2_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>pluginlib</depend>
   <build_depend>rbs_mppi_controller</build_depend>
   <depend>rclcpp</depend>

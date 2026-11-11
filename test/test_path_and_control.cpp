@@ -826,6 +826,52 @@ TEST_F(CommandContractTest, rotationAccelerationOverrideDoesNotAffectTranslation
   EXPECT_NEAR(output.angular.z, -0.05, 1e-12);
 }
 
+TEST_F(CommandContractTest, admittedRotationUsesIndependentGainAndStopsTargetWithinTolerance)
+{
+  limits_.rotation_max_alpha = 0.8;
+  initialize();
+  setRotationPath(true);
+  // Final target is 0.2 rad: old gain would request only 0.08 rad/s here.
+  for (int i = 0; i < 8; ++i) {step(makeRobotPose(0.12));}
+  const auto rotating = step(makeRobotPose(0.12)).twist;
+  EXPECT_GT(rotating.angular.z, 0.08);
+  EXPECT_DOUBLE_EQ(rotating.linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(rotating.linear.y, 0.0);
+  // Enter tolerance, but keep raw feedback moving: command brakes, no release.
+  geometry_msgs::msg::Twist moving; moving.angular.z = 0.15;
+  for (int i = 0; i < 10; ++i) {
+    const auto output = step(makeRobotPose(0.195), moving).twist;
+    EXPECT_DOUBLE_EQ(output.linear.x, 0.0);
+    EXPECT_LE(std::abs(output.angular.z), std::abs(rotating.angular.z));
+  }
+  EXPECT_DOUBLE_EQ(step(makeRobotPose(0.195), moving).twist.angular.z, 0.0);
+  EXPECT_LT(step(makeRobotPose(0.23)).twist.angular.z, 0.0);
+}
+
+TEST_F(CommandContractTest, newOppositeRotationAndTaskResetDoNotRetainOldTarget)
+{
+  setRotationPath(true);
+  geometry_msgs::msg::Twist measured;
+  for (int i = 0; i < 10; ++i) {measured = step(makeRobotPose(), measured).twist;}
+  ASSERT_GT(measured.angular.z, 0.0);
+  auto replacement = makeStraightPath({0.0});
+  replacement.poses.push_back(makeRobotPose(-0.3));
+  controller_.setPlan(replacement);
+  // Same live task must brake the previously issued output before the new turn.
+  const double previous = measured.angular.z;
+  measured = step(makeRobotPose(), measured).twist;
+  EXPECT_NEAR(measured.angular.z, previous - limits_.max_alpha * 0.1, 1e-12);
+  for (int i = 0; i < 20; ++i) {measured = step(makeRobotPose(), measured).twist;}
+  EXPECT_LT(measured.angular.z, 0.0);
+  controller_.reset();  // Cancellation/reset cannot reuse the turn or stop evidence.
+  EXPECT_THROW(step(), nav2_core::InvalidPath);
+  setRotationPath(true);
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  EXPECT_DOUBLE_EQ(step().twist.angular.z, 0.0);
+  EXPECT_GT(step().twist.angular.z, 0.0);
+}
+
 TEST_F(CommandContractTest, entryBrakesExistingAngularMotionWithoutHardStopping)
 {
   geometry_msgs::msg::Twist moving;

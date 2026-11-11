@@ -19,6 +19,7 @@
 #include "angles/angles.h"
 #include "angular_velocity_feedback_filter.hpp"
 #include "fixed_heading_yaw_gate.hpp"
+#include "execution_safety_adapter.hpp"
 #include "holonomic_command_limiter.hpp"
 #include "holonomic_control_law.hpp"
 #include "holonomic_speed_planner.hpp"
@@ -31,6 +32,7 @@
 #include "prepared_path.hpp"
 #include "rotation_completion_tracker.hpp"
 #include "rotation_entry_gate.hpp"
+#include "rotation_velocity_planner.hpp"
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
@@ -150,12 +152,15 @@ void PidTrackingController::configure(
         throw std::runtime_error("PidTrackingController requires a valid local costmap");
     }
 
+    execution_safety_adapter_.reset();
+    motion_observation_.reset();
     controller_plugin_name = std::move(name);
     control_time_valid_ = false;
     prepared_path_.reset();
     progress_handoff_pending_ = false;
     holonomic_speed_planner_.reset();
     holonomic_command_limiter_.reset();
+    rotation_velocity_planner_.reset();
     omega_feedback_sub_.reset();
     omega_feedback_filter_.reset();
     resetRotationState();
@@ -285,6 +290,14 @@ void PidTrackingController::configure(
     if (!std::isfinite(kp_x) || kp_x < 0.0 || !std::isfinite(kp_y) || kp_y < 0.0) {
         throw std::invalid_argument("kp_x and kp_y must be finite and nonnegative");
     }
+    RotationVelocityPlannerConfig rotation_velocity_config;
+    rotation_velocity_config.kp_yaw = parameter("rotation_kp_yaw", 2.5);
+    rotation_velocity_config.response_delay = parameter("rotation_response_delay", 0.20);
+    rotation_velocity_config.max_omega = limiter_config.max_omega;
+    rotation_velocity_config.max_deceleration = limiter_config.max_alpha;
+    rotation_velocity_config.yaw_tolerance = rotation_yaw_tolerance_;
+    auto rotation_velocity_planner =
+            std::make_unique<RotationVelocityPlanner>(rotation_velocity_config);
     auto speed_planner = std::make_unique<HolonomicSpeedPlanner>(speed_config);
     auto command_limiter = std::make_unique<HolonomicCommandLimiter>(limiter_config);
     kp_x_ = kp_x;
@@ -293,6 +306,7 @@ void PidTrackingController::configure(
     control_gap_threshold_ = limiter_config.control_gap_threshold;
     holonomic_speed_planner_ = std::move(speed_planner);
     holonomic_command_limiter_ = std::move(command_limiter);
+    rotation_velocity_planner_ = std::move(rotation_velocity_planner);
     external_speed_limit_.store(std::numeric_limits<double>::infinity(), std::memory_order_relaxed);
     control_time_valid_ = false;
     last_holonomic_mode_ = -1;
@@ -332,14 +346,29 @@ void PidTrackingController::configure(
     raw_cmd_pub_ = node->create_publisher<geometry_msgs::msg::TwistStamped>(
       "tracking_cmd_vel_raw", rclcpp::QoS(rclcpp::KeepLast(1)).reliable());
 
-    if (omega_filter_tau > 0.0) {
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".observe_execution_inputs",
+            rclcpp::ParameterValue(false));
+    if (node->get_parameter(controller_plugin_name + ".observe_execution_inputs").as_bool()) {
+        declare_parameter_if_not_declared(node, controller_plugin_name + ".observed_smoothed_velocity_topic",
+                rclcpp::ParameterValue("cmd_vel_smoothed"));
+        motion_observation_ = std::make_shared<MotionObservation>(base_frame_);
+        execution_safety_adapter_ = std::make_unique<ExecutionSafetyAdapter>(node, costmap_ros_, tf_,
+                motion_observation_, node->get_parameter(
+                controller_plugin_name + ".observed_smoothed_velocity_topic").as_string());
+    }
+    if (omega_filter_tau > 0.0 || motion_observation_) {
         declare_parameter_if_not_declared(node, "odom_topic", rclcpp::ParameterValue("odom"));
         const auto topic = node->get_parameter("odom_topic").as_string();
-        omega_feedback_filter_ = std::make_shared<AngularVelocityFeedbackFilter>(omega_filter_tau);
+        if (omega_filter_tau > 0.0) {
+            omega_feedback_filter_ = std::make_shared<AngularVelocityFeedbackFilter>(omega_filter_tau);
+        }
         omega_feedback_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
                 topic, rclcpp::SensorDataQoS(),
-                [filter = omega_feedback_filter_, frame = base_frame_](
+                [filter = omega_feedback_filter_, frame = base_frame_, motion = motion_observation_](
                     const nav_msgs::msg::Odometry::ConstSharedPtr message) {
+                    if (motion) {motion->record(MotionObservation::Odometry,
+                        message->header, message->twist.twist, message->child_frame_id);}
+                    if (!filter) {return;}
                     if (message->child_frame_id != frame) {
                         filter->reset();
                         return;
@@ -348,6 +377,13 @@ void PidTrackingController::configure(
                             1000000000LL + message->header.stamp.nanosec;
                     filter->update(message->twist.twist.angular.z, stamp_ns);
                 });
+        if (motion_observation_) {
+            RCLCPP_INFO(logger_, "PID_MOTION source=odometry topic=%s type=Odometry "
+                    "velocity_frame=child_frame_id expected_frame=%s subscription=shared_with_omega_filter "
+                    "candidate=post_limiter_before_return receipt_max_age=0.600 future_tolerance=0.100 "
+                    "smoothed_freshness=receipt_only poll_ms=100 heartbeat_s=5 action=none",
+                    omega_feedback_sub_->get_topic_name(), base_frame_.c_str());
+        }
     }
     RCLCPP_INFO(logger_, "PID_LOG omega_feedback_filter tau=%.6f max_age=0.100 "
             "stop_source=raw reseed_source=%s", omega_filter_tau,
@@ -405,6 +441,7 @@ void PidTrackingController::configure(
 
 void PidTrackingController::activate()
 {
+    if (execution_safety_adapter_) {execution_safety_adapter_->start();}
     if (tracking_progress_pub_) {tracking_progress_pub_->activate();}
     control_time_valid_ = false;
     if (omega_feedback_filter_) {
@@ -422,6 +459,7 @@ void PidTrackingController::activate()
 
 void PidTrackingController::deactivate()
 {
+    if (execution_safety_adapter_) {execution_safety_adapter_->stop();}
     if (tracking_progress_pub_) {tracking_progress_pub_->deactivate();}
     control_time_valid_ = false;
     if (omega_feedback_filter_) {
@@ -438,12 +476,15 @@ void PidTrackingController::deactivate()
 
 void PidTrackingController::cleanup()
 {
+    execution_safety_adapter_.reset();
+    motion_observation_.reset();
     tracking_progress_pub_.reset();
     control_time_valid_ = false;
     omega_feedback_sub_.reset();
     omega_feedback_filter_.reset();
     holonomic_speed_planner_.reset();
     holonomic_command_limiter_.reset();
+    rotation_velocity_planner_.reset();
     resetRotationState();
     carrot_pub_.reset();
     raw_cmd_pub_.reset();
@@ -538,7 +579,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
   const rclcpp::Time & now)
 {
     if (!prepared_path_ || !holonomic_speed_planner_ ||
-        !holonomic_command_limiter_ || !rotation_completion_tracker_ || !rotation_entry_gate_) {
+        !holonomic_command_limiter_ || !rotation_completion_tracker_ || !rotation_entry_gate_ ||
+        !rotation_velocity_planner_) {
         throw std::logic_error("holonomic components are unavailable");
     }
     const auto reference = buildHolonomicTrackingReference(
@@ -615,6 +657,13 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     if (yaw_suppressed != was_yaw_suppressed) {
         force_diagnostics_log_ = true;
     }
+    RotationVelocityPlan rotation_plan;
+    if (rotating && !braking) {
+        const auto previous = holonomic_command_limiter_->previousCommand();
+        rotation_plan = rotation_velocity_planner_->plan(raw.yaw_error, measured.omega,
+                previous ? previous->omega : measured.omega, reseed ? 0.0 : dt);
+        raw.omega = raw.omega_fb = rotation_plan.omega;
+    }
     if (braking) {
         raw.vx = raw.vy = raw.omega = 0.0;
     }
@@ -681,11 +730,13 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
             RCLCPP_INFO(logger_,
                     "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.9f "
                     "rotation_index=%zu rotation_phase=%s raw_omega=%.6f limited_omega=%.6f "
-                    "stop_confirmed=%.6f rotation_settled=%.6f ack_candidate=%s",
+                    "stop_confirmed=%.6f rotation_settled=%.6f ack_candidate=%s "
+                    "rotation_speed_cap=%.6f predicted_stop_angle=%.6f",
                     plan_revision_, now_seconds, pending_rotation_segment_index_,
                     braking ? "braking" : "rotating", raw.omega, limited.command.omega,
                     rotation_entry_gate_->stoppedDuration(), completion.settled_duration,
-                    rotation_ack_candidate_ ? "true" : "false");
+                    rotation_ack_candidate_ ? "true" : "false",
+                    rotation_plan.stopping_speed_limit, rotation_plan.predicted_stopping_angle);
         }
         // Temporary TRA-15 capture: restore this gate and log to DEBUG after sampling.
         if (logger_.get_effective_level() <= rclcpp::Logger::Level::Info) {
@@ -885,6 +936,8 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             resetRotationState();
             force_diagnostics_log_ = true;
         }
+        if (motion_observation_) {motion_observation_->record(MotionObservation::Candidate,
+            command.header, command.twist, command.header.frame_id, plan_revision_);}
         return command;
     } catch (const nav2_core::InvalidPath &) {
         if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}

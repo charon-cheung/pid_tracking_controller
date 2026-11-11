@@ -19,6 +19,7 @@ find_package(nav2_costmap_2d REQUIRED)
 find_package(nav2_util REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rbs_mppi_controller REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -39,6 +40,7 @@ set(dependencies
   nav2_util
   nav2_msgs
   nav_msgs
+  sensor_msgs
   pluginlib
   rclcpp
   rclcpp_lifecycle
@@ -53,6 +55,8 @@ add_library(pid_tracking_controller_plugin SHARED
   src/angular_velocity_feedback_filter.cpp
   src/execution_safety.cpp
   src/execution_safety_inputs.cpp
+  src/execution_safety_adapter.cpp
+  src/motion_observation.cpp
   src/holonomic_command_limiter.cpp
   src/holonomic_control_law.cpp
   src/fixed_heading_yaw_gate.cpp
@@ -64,6 +68,7 @@ add_library(pid_tracking_controller_plugin SHARED
   src/prepared_path.cpp
   src/rotation_completion_tracker.cpp
   src/rotation_entry_gate.cpp
+  src/rotation_velocity_planner.cpp
 )
 set_target_properties(pid_tracking_controller_plugin PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
 target_include_directories(pid_tracking_controller_plugin PRIVATE
@@ -154,6 +159,10 @@ if(BUILD_TESTING)
     pid_tracking_controller_plugin
   )
 
+  ament_add_gtest(test_rotation_velocity_planner test/test_rotation_velocity_planner.cpp)
+  target_include_directories(test_rotation_velocity_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_rotation_velocity_planner pid_tracking_controller_plugin)
+
   ament_add_gtest(test_holonomic_control_law
     test/test_holonomic_control_law.cpp
   )
@@ -190,6 +199,16 @@ if(BUILD_TESTING)
   ament_add_gtest(test_translation_tracking_guard test/test_translation_tracking_guard.cpp)
   target_include_directories(test_translation_tracking_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_translation_tracking_guard pid_tracking_controller_plugin)
+
+  ament_add_gtest(test_execution_safety_adapter test/test_execution_safety_adapter.cpp)
+  target_include_directories(test_execution_safety_adapter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_execution_safety_adapter ${dependencies} rcutils)
+  target_link_libraries(test_execution_safety_adapter pid_tracking_controller_plugin)
+
+  ament_add_gtest(test_motion_observation test/test_motion_observation.cpp)
+  target_include_directories(test_motion_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_motion_observation geometry_msgs rclcpp)
+  target_link_libraries(test_motion_observation pid_tracking_controller_plugin)
 
   ament_add_gtest(test_execution_safety_inputs test/test_execution_safety_inputs.cpp)
   target_include_directories(test_execution_safety_inputs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

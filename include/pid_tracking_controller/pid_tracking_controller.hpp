@@ -28,8 +28,11 @@ namespace pid_tracking_controller
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
 class TrackingProgressPublisher;
+class ExecutionSafetyAdapter;
+class MotionObservation;
 class RotationCompletionTracker;
 class RotationEntryGate;
+class RotationVelocityPlanner;
 class FixedHeadingYawGate;
 class HolonomicSpeedPlanner;
 class HolonomicCommandLimiter;
@@ -102,6 +105,7 @@ private:
   double rotation_settle_time_{0.30};
   std::unique_ptr<RotationCompletionTracker> rotation_completion_tracker_;
   std::unique_ptr<RotationEntryGate> rotation_entry_gate_;
+  std::unique_ptr<RotationVelocityPlanner> rotation_velocity_planner_;
   std::unique_ptr<FixedHeadingYawGate> fixed_heading_yaw_gate_;
   bool rotation_pending_{false};
   bool last_rotation_braking_{false};
@@ -115,6 +119,8 @@ private:
   std::string controller_plugin_name;
 
   std::unique_ptr<TrackingProgressPublisher> tracking_progress_pub_;
+  std::unique_ptr<ExecutionSafetyAdapter> execution_safety_adapter_;
+  std::shared_ptr<MotionObservation> motion_observation_;
   std::size_t plan_revision_{0};
   double last_diagnostics_log_time_seconds_{0.0};
   bool force_diagnostics_log_{true};

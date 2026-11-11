@@ -7,6 +7,7 @@
 #include "holonomic_speed_planner.hpp"
 #include "rotation_completion_tracker.hpp"
 #include "rotation_entry_gate.hpp"
+#include "rotation_velocity_planner.hpp"
 
 namespace pid_tracking_controller
 {
@@ -24,6 +25,9 @@ public:
     controller.rotation_completion_tracker_ = std::make_unique<RotationCompletionTracker>(rotation);
     controller.rotation_entry_gate_ = std::make_unique<RotationEntryGate>(RotationEntryGateConfig{
       rotation.rotation_xy_speed_tolerance, rotation.rotation_omega_tolerance, 0.2, 8.0});
+    controller.rotation_velocity_planner_ = std::make_unique<RotationVelocityPlanner>(
+      RotationVelocityPlannerConfig{2.5, 0.20, limits.max_omega, limits.max_alpha,
+        rotation.rotation_yaw_tolerance});
     controller.max_xy_speed_ = speed.max_xy_speed;
     controller.control_gap_threshold_ = limits.control_gap_threshold;
     controller.control_time_valid_ = false;
@@ -60,6 +64,11 @@ public:
     PidTrackingController & controller, const std::shared_ptr<tf2_ros::Buffer> & tf)
   {
     controller.tf_ = tf;
+  }
+
+  static std::shared_ptr<MotionObservation> motionObservation(const PidTrackingController & controller)
+  {
+    return controller.motion_observation_;
   }
 
   static bool hasPreparedPath(const PidTrackingController & controller)

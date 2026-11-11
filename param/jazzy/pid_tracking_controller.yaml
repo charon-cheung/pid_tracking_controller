@@ -11,6 +11,9 @@ controller_server:
       min_lookahead_dist: 0.5
       max_lookahead_dist: 0.9
       kp_yaw: 1.0
+      # Independent in-place turn gain and response-delay allowance (seconds).
+      rotation_kp_yaw: 3.0
+      rotation_response_delay: 0.20
       # Odom-rate angular feedback low-pass (seconds); 0 disables. Stop checks stay raw.
       omega_feedback_filter_tau: 0.05
       # Fixed-heading translation only; thresholds are yaw errors in radians (2 / 1 degrees).
