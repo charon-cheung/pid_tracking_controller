@@ -11,9 +11,10 @@ namespace pid_tracking_controller
 ExecutionSafetyAdapter::ExecutionSafetyAdapter(
   rclcpp_lifecycle::LifecycleNode::WeakPtr node,
   rclcpp_lifecycle::LifecycleNode::SharedPtr costmap, std::shared_ptr<tf2_ros::Buffer> tf,
-  std::shared_ptr<MotionObservation> motion, std::string smoothed_topic)
+  std::shared_ptr<MotionObservation> motion, std::string smoothed_topic,
+  std::optional<NominalTransitionAssumptions> nominal)
 : node_(node), costmap_(std::move(costmap)), tf_(std::move(tf)),
-  motion_(std::move(motion)), smoothed_topic_(std::move(smoothed_topic)),
+  motion_(std::move(motion)), smoothed_topic_(std::move(smoothed_topic)), nominal_(std::move(nominal)),
   logger_(rclcpp::get_logger("PidTrackingController")) {}
 
 ExecutionSafetyAdapter::~ExecutionSafetyAdapter() {stop();}
@@ -32,6 +33,20 @@ void ExecutionSafetyAdapter::start()
     group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
     connect(node);
     if (motion_) {motion_->activate();}
+    transition_observer_.reset();
+    RCLCPP_INFO(logger_, "PID_TRANSITION started mode=observe_only action=none history_capacity=%zu "
+      "pose_odom_alignment=exact execution_evidence=missing physical_response=unverified "
+      "poll_ms=100 heartbeat_s=5", MotionObservation::kHistoryCapacity);
+    if (nominal_) {
+      const auto & n = *nominal_;
+      RCLCPP_INFO(logger_, "PID_TRANSITION model basis=nominal source=controller_parameters "
+        "delay=%.6f duration=%.6f acceleration=(%.6f,%.6f,%.6f) deceleration=(%.6f,%.6f,%.6f) "
+        "braking=(%.6f,%.6f,%.6f) delay_motion=hold_measured queued_commands=unmodeled "
+        "steering=unmodeled physical_response=unverified action=none control_authorized=0",
+        n.delay, n.duration, n.acceleration.vx, n.acceleration.vy, n.acceleration.omega,
+        n.deceleration.vx, n.deceleration.vy, n.deceleration.omega,
+        n.braking_deceleration.vx, n.braking_deceleration.vy, n.braking_deceleration.omega);
+    }
     last_status_.clear(); last_report_ = {}; ready_count_ = unavailable_count_ = 0;
     timer_ = node->create_wall_timer(std::chrono::milliseconds(100), [this]() {observe();}, group_);
     rclcpp::ExecutorOptions executor_options;
@@ -59,6 +74,7 @@ void ExecutionSafetyAdapter::stop()
   if (executor_) {executor_->cancel();}
   if (worker_.joinable()) {
     worker_.join();
+    transition_observer_.stopped(logger_);
     RCLCPP_INFO(logger_, "PID_OBSERVE stopped ready_checks=%lu unavailable_checks=%lu action=none",
       ready_count_, unavailable_count_);
   }
@@ -199,6 +215,7 @@ void ExecutionSafetyAdapter::observe()
   if (motion_) {motion_->report(logger_, clock_->now().nanoseconds());}
   const auto started = Wall::now();
   SafetyInputResult result;
+  int64_t pose_stamp_ns = 0;
   if (config_changed_->load()) {
     result.reason = "configuration_changed_reactivate";
   } else {
@@ -209,6 +226,7 @@ void ExecutionSafetyAdapter::observe()
       try {
         const auto transform = tf_->lookupTransform(options_.map_frame, options_.base_frame,
             rclcpp::Time(footprint_->header.stamp));
+        pose_stamp_ns = rclcpp::Time(footprint_->header.stamp).nanoseconds();
         pose.header = footprint_->header; pose.header.frame_id = options_.map_frame;
         pose.pose.position.x = transform.transform.translation.x;
         pose.pose.position.y = transform.transform.translation.y;
@@ -223,7 +241,18 @@ void ExecutionSafetyAdapter::observe()
   if (config_changed_->load()) {
     result.snapshot.reset(); result.source.clear(); result.reason = "configuration_changed_reactivate";
   }
-  report(result, std::chrono::duration<double, std::milli>(Wall::now() - started).count());
+  const auto captured = Wall::now();
+  const auto history = motion_ ? motion_->history() : MotionObservation::History{};
+  const auto copied = Wall::now();
+  const auto ros_now = clock_->now().nanoseconds();
+  // Execution evidence remains absent. Nominal prediction is a separately labeled
+  // hypothesis and cannot replace the unavailable execution-evidence result.
+  const auto transition = transition_observer_.evaluate(result, history, pose_stamp_ns, ros_now, started,
+      nullptr, nominal_ ? &*nominal_ : nullptr);
+  const double capture_ms = std::chrono::duration<double, std::milli>(captured - started).count();
+  transition_observer_.report(logger_, transition, history, ros_now, capture_ms,
+    std::chrono::duration<double, std::milli>(copied - captured).count());
+  report(result, capture_ms);
 }
 
 void ExecutionSafetyAdapter::report(const SafetyInputResult & result, double elapsed_ms)

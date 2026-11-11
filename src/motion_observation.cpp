@@ -6,26 +6,39 @@
 
 namespace pid_tracking_controller
 {
+void MotionObservation::resetHistory(uint64_t revision)
+{
+  history_.stages = {}; ++history_.epoch; history_.revision = revision;
+}
+
 void MotionObservation::activate()
 {
   std::lock_guard<std::mutex> lock(mutex_);
   samples_ = {}; last_report_ = {}; reported_at_ = {}; last_ros_now_ = 0;
-  report_id_ = reported_drops_ = 0; dropped_ = 0;
+  report_id_ = reported_drops_ = 0; dropped_ = 0; last_drop_ns_ = 0;
+  for (size_t i = 0; i < attempts_.size(); ++i) {attempts_[i] = 0; drops_[i] = 0;}
+  resetHistory(0);
   activated_at_ = Wall::now(); active_ = true;
 }
 
 void MotionObservation::deactivate()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  active_ = false; samples_ = {};
+  active_ = false; samples_ = {}; resetHistory(0);
 }
 
 void MotionObservation::record(Stage stage, const std_msgs::msg::Header & header,
   const geometry_msgs::msg::Twist & twist, const std::string & velocity_frame,
   uint64_t revision, Wall::time_point received)
 {
+  ++attempts_[stage];
   std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-  if (!lock.owns_lock()) {++dropped_; return;}
+  if (!lock.owns_lock()) {
+    ++drops_[stage]; ++dropped_;
+    last_drop_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Wall::now().time_since_epoch()).count());
+    return;
+  }
   if (!active_ || received < activated_at_) {return;}
   auto & s = samples_[stage];
   const int64_t stamp = int64_t(header.stamp.sec) * 1000000000LL + header.stamp.nanosec;
@@ -38,20 +51,48 @@ void MotionObservation::record(Stage stage, const std_msgs::msg::Header & header
     !std::isfinite(twist.angular.z) ? "nonfinite_velocity" :
     std::strcmp(s.frame, "mismatch") == 0 ? "frame_mismatch" :
     stamp <= 0 || header.stamp.nanosec >= 1000000000U ? "invalid_stamp" :
-    backwards ? "header_regressed" : "valid";
+    backwards ? "header_regressed" :
+    stage == Candidate && revision < history_.revision ? "plan_revision_regressed" : "valid";
   if (std::strcmp(s.payload, "valid") != 0) {++s.invalid;}
   s.vx = twist.linear.x; s.vy = twist.linear.y; s.omega = twist.angular.z;
   s.stamp_ns = stamp; s.received = received; s.revision = revision; ++s.count;
+  if (stage == Candidate && revision > history_.revision && std::strcmp(s.payload, "valid") == 0) {
+    resetHistory(revision);
+  }
+  auto & series = history_.stages[stage];
+  series.samples[series.next] = s;
+  series.next = (series.next + 1) % kHistoryCapacity;
+  if (series.size < kHistoryCapacity) {++series.size;} else {++series.overwritten;}
+}
+
+MotionObservation::History MotionObservation::history()
+{
+  History out;  // Initialize the fixed buffers before holding the writer's lock.
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {out.state = "history_busy"; return out;}
+  out = history_; out.state = active_ ? "ready" : "inactive";
+  out.dropped = dropped_.load();
+  for (size_t i = 0; i < attempts_.size(); ++i) {
+    out.attempts[i] = attempts_[i].load(); out.drops[i] = drops_[i].load();
+  }
+  out.last_drop = Wall::time_point(std::chrono::nanoseconds(last_drop_ns_.load()));
+  out.captured = Wall::now();
+  lock.unlock();
+  return out;
 }
 
 std::array<MotionObservation::View, 4> MotionObservation::snapshot(int64_t ros_now, Wall::time_point now)
 {
   std::array<View, 4> result;
-  std::lock_guard<std::mutex> lock(mutex_);
-  // Evaluate after acquiring the cache: a concurrent receipt must not look future-dated.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < samples_.size(); ++i) {result[i].sample = samples_[i];}
+  }
+  // Evaluate after copying: concurrent receipts cannot look future-dated and
+  // diagnostic validation holds no lock needed by the control/odometry writers.
   if (now == Wall::time_point{}) {now = Wall::now();}
-  for (size_t i = 0; i < samples_.size(); ++i) {
-    auto & v = result[i]; v.sample = samples_[i];
+  for (size_t i = 0; i < result.size(); ++i) {
+    auto & v = result[i];
     if (!v.sample.count) {continue;}
     v.header_age = (ros_now - v.sample.stamp_ns) * 1e-9;
     v.receipt_age = std::chrono::duration<double>(now - v.sample.received).count();
@@ -70,7 +111,10 @@ void MotionObservation::report(const rclcpp::Logger & logger, int64_t ros_now)
   const auto now = Wall::now();
   const bool clock_reset = last_ros_now_ && ros_now < last_ros_now_;
   // Only the worker advances the clock epoch; snapshot readers never mutate it.
-  if (clock_reset) {std::lock_guard<std::mutex> lock(mutex_); samples_ = {};}
+  if (clock_reset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples_ = {}; resetHistory(0); activated_at_ = Wall::now();
+  }
   last_ros_now_ = ros_now;
   const auto views = snapshot(ros_now);
   const auto drops = dropped_.load();

@@ -351,10 +351,22 @@ void PidTrackingController::configure(
     if (node->get_parameter(controller_plugin_name + ".observe_execution_inputs").as_bool()) {
         declare_parameter_if_not_declared(node, controller_plugin_name + ".observed_smoothed_velocity_topic",
                 rclcpp::ParameterValue("cmd_vel_smoothed"));
+        // Controller limits define an observation hypothesis, not actuator guarantees.
+        double controller_frequency = 0.;
+        node->get_parameter("controller_frequency", controller_frequency);
+        NominalTransitionAssumptions nominal;
+        nominal.delay = std::max(speed_config.stopping_delay, rotation_velocity_config.response_delay);
+        if (std::isfinite(controller_frequency) && controller_frequency > 0.) {
+            nominal.duration = 1. / controller_frequency;
+        }
+        nominal.acceleration = {speed_config.max_ax, speed_config.max_ay, limiter_config.max_alpha};
+        nominal.deceleration = {limiter_config.max_decel_x, limiter_config.max_decel_y, limiter_config.max_alpha};
+        nominal.braking_deceleration = {speed_config.stopping_deceleration,
+                speed_config.stopping_deceleration, limiter_config.max_alpha};
         motion_observation_ = std::make_shared<MotionObservation>(base_frame_);
         execution_safety_adapter_ = std::make_unique<ExecutionSafetyAdapter>(node, costmap_ros_, tf_,
                 motion_observation_, node->get_parameter(
-                controller_plugin_name + ".observed_smoothed_velocity_topic").as_string());
+                controller_plugin_name + ".observed_smoothed_velocity_topic").as_string(), nominal);
     }
     if (omega_filter_tau > 0.0 || motion_observation_) {
         declare_parameter_if_not_declared(node, "odom_topic", rclcpp::ParameterValue("odom"));

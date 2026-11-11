@@ -80,7 +80,18 @@ protected:
       transform.transform.rotation.w = 1.; tf->setTransform(transform, "test", false);
     }
     map.metadata.size_x = map.metadata.size_y = 120; map.metadata.resolution = .05;
-    map.metadata.origin.orientation.w = 1.; map.data.assign(14400, 254); map_pub->publish(map);
+    map.metadata.origin.orientation.w = 1.;
+    if (live_motion) {
+      map.metadata.origin.position.x = map.metadata.origin.position.y = -3.;
+      geometry_msgs::msg::TwistStamped cmd; cmd.header = map.header; cmd.header.frame_id = "base";
+      cmd.twist.linear.x = -.5;
+      live_motion->record(MotionObservation::Candidate, cmd.header, cmd.twist, "base", 3);
+      command_pub->publish(cmd);
+      cmd.twist.linear.x = .6; smoothed_pub->publish(cmd);
+      cmd.twist.linear.x = .8;
+      live_motion->record(MotionObservation::Odometry, cmd.header, cmd.twist, "base");
+    }
+    map.data.assign(14400, map_cost); map_pub->publish(map);
     geometry_msgs::msg::PolygonStamped footprint; footprint.header = map.header;
     for (auto xy : {std::pair<float, float>{-.2, -.2}, {.2, -.2}, {.2, .2}, {-.2, .2}}) {
       geometry_msgs::msg::Point32 p; p.x = xy.first; p.y = xy.second;
@@ -113,6 +124,9 @@ protected:
     }
     return contains(text);
   }
+  std::shared_ptr<MotionObservation> live_motion;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr command_pub, smoothed_pub;
+  unsigned char map_cost{254};
   bool publish_tf{true};
   int scan_fault{0};
   size_t log_start{0};
@@ -133,6 +147,9 @@ TEST_F(AdapterTest, RequiresEverySourceAndRecoversWithoutDeclaringCollisionSafet
   EXPECT_EQ(scan_pub->get_subscription_count(), 1u);  // Duplicate logical source, one wire.
   ASSERT_TRUE(waitFor("mode=observe_only ready=true reason=ready"));
   EXPECT_TRUE(contains("action=none")); EXPECT_TRUE(contains("ros_age="));
+  ASSERT_TRUE(waitFor("PID_TRANSITION status mode=observe_only state=unavailable"));
+  EXPECT_TRUE(contains("execution_evidence=missing"));
+  EXPECT_TRUE(contains("PID_TRANSITION timing"));
   clearLogs();
   ASSERT_TRUE(waitFor("reason=observation_missing_or_stale source=obstacle.scan", true, false));
   ASSERT_TRUE(waitFor("mode=observe_only ready=true reason=ready"));
@@ -181,8 +198,35 @@ TEST_F(AdapterTest, ReportsFourIndependentMotionStagesAndMissingStreams)
   EXPECT_TRUE(contains("alignment=asynchronous")); EXPECT_TRUE(contains("plan_revision=3"));
   EXPECT_TRUE(contains("vx=0.300000 vy=-0.200000 omega=0.100000"));
   clearLogs(); EXPECT_TRUE(waitFor("stage=smoothed state=receipt_stale"));
-  adapter->stop(); clearLogs(); adapter->start();
+  EXPECT_TRUE(contains("motion_reason=odometry:missing"));
+  EXPECT_FALSE(contains("model_evaluated=1"));
+  adapter->stop(); EXPECT_TRUE(contains("PID_TRANSITION stopped"));
+  clearLogs(); adapter->start();
   EXPECT_TRUE(waitFor("stage=candidate state=missing"));
+  EXPECT_TRUE(contains("motion_reason=candidate:missing"));
+  EXPECT_FALSE(contains("PID_TRANSITION status mode=observe_only state=clear"));
+}
+
+TEST_F(AdapterTest, OnlineNominalPredictionReportsClearAndCollisionWithoutExecutionAuthorization)
+{
+  adapter->stop();
+  live_motion = std::make_shared<MotionObservation>("base");
+  command_pub = publisher->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 1);
+  smoothed_pub = publisher->create_publisher<geometry_msgs::msg::TwistStamped>("/nominal_smoothed", 1);
+  NominalTransitionAssumptions nominal{.2, .5, {.8, .8, .8}, {.8, .8, .8}, {.8, .8, .8}};
+  adapter = std::make_unique<ExecutionSafetyAdapter>(node, map_node, tf, live_motion,
+      "/nominal_smoothed", nominal);
+  map_cost = 0; clearLogs(); adapter->start();
+  ASSERT_TRUE(waitFor("model_basis=nominal model_state=clear"));
+  EXPECT_TRUE(contains("state=unavailable reason=execution_evidence_missing"));
+  EXPECT_TRUE(contains("execution_evidence=missing queue_complete=0 model_evaluated=1"));
+  EXPECT_TRUE(contains("action=none control_authorized=0"));
+  clearLogs(); map_cost = 254;
+  ASSERT_TRUE(waitFor("model_basis=nominal model_state=collision"));
+  EXPECT_FALSE(contains("PID_TRANSITION status mode=observe_only state=clear"));
+  adapter->stop(); clearLogs(); adapter->start();
+  ASSERT_TRUE(waitFor("motion_reason=candidate:missing", true, true, false));
+  EXPECT_FALSE(contains("model_evaluated=1"));
 }
 
 TEST_F(AdapterTest, ReactivationDiscardsCachedInputsAndConfigurationChangesInvalidate)

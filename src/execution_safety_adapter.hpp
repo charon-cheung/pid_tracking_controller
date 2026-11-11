@@ -5,7 +5,7 @@
 #include <thread>
 #include "rclcpp/executors/single_threaded_executor.hpp"
 #include "execution_safety_inputs.hpp"
-#include "motion_observation.hpp"
+#include "motion_transition_observer.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 
 namespace pid_tracking_controller
@@ -19,7 +19,8 @@ public:
     rclcpp_lifecycle::LifecycleNode::WeakPtr node,
     rclcpp_lifecycle::LifecycleNode::SharedPtr costmap, std::shared_ptr<tf2_ros::Buffer> tf,
     std::shared_ptr<MotionObservation> motion = nullptr,
-    std::string smoothed_topic = "cmd_vel_smoothed");
+    std::string smoothed_topic = "cmd_vel_smoothed",
+    std::optional<NominalTransitionAssumptions> nominal = std::nullopt);
   ~ExecutionSafetyAdapter();
   void start();
   void stop();
@@ -44,6 +45,8 @@ private:
   std::shared_ptr<tf2_ros::Buffer> tf_;
   std::shared_ptr<MotionObservation> motion_;
   std::string smoothed_topic_;
+  std::optional<NominalTransitionAssumptions> nominal_;
+  MotionTransitionObserver transition_observer_;
   rclcpp::Logger logger_;
   rclcpp::Clock::SharedPtr clock_;
   SafetyInputOptions options_;

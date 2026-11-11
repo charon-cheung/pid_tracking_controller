@@ -92,6 +92,41 @@ TEST(MotionObservation, ReactivationAndClockRollbackDiscardPreviousEvidence)
   EXPECT_STREQ(m.snapshot(10000000000LL)[0].state, "valid");
 }
 
+TEST(MotionObservation, BoundedHistoryRetainsChronologicalIndependentSamples)
+{
+  M m("base"); m.activate();
+  for (size_t i = 0; i < M::kHistoryCapacity + 7; ++i) {
+    auto h = header(); h.stamp.nanosec = i;
+    m.record(M::Candidate, h, velocity(i), "base", 7);
+  }
+  const auto history = m.history(); const auto & c = history.stages[M::Candidate];
+  EXPECT_STREQ(history.state, "ready"); EXPECT_EQ(history.revision, 7u);
+  ASSERT_EQ(c.size, M::kHistoryCapacity); EXPECT_EQ(c.overwritten, 7u);
+  EXPECT_EQ(history.stages[M::Published].size, 0u);
+  for (size_t i = 0; i < c.size; ++i) {
+    EXPECT_EQ(c.at(i).count, i + 8); EXPECT_DOUBLE_EQ(c.at(i).vx, i + 7);
+  }
+}
+
+TEST(MotionObservation, HistoryIsIsolatedByPlanLifecycleAndRosClockEpoch)
+{
+  M m("base"); m.activate(); m.record(M::Candidate, header(), velocity(), "base", 7);
+  m.record(M::Published, header(), velocity(), "base");
+  const auto old = m.history();
+  m.record(M::Candidate, header(), velocity(), "base", 8);
+  auto h = m.history(); EXPECT_GT(h.epoch, old.epoch); EXPECT_EQ(h.stages[1].size, 0u);
+  EXPECT_EQ(h.stages[0].size, 1u);
+  m.record(M::Candidate, header(), velocity(), "base", 7);
+  h = m.history(); EXPECT_EQ(h.revision, 8u);
+  EXPECT_STREQ(h.stages[0].at(1).payload, "plan_revision_regressed");
+  m.report(rclcpp::get_logger("motion_test"), 10000000000LL);
+  m.report(rclcpp::get_logger("motion_test"), 9000000000LL);
+  const auto reset = m.history(); EXPECT_GT(reset.epoch, h.epoch);
+  for (const auto & stage : reset.stages) {EXPECT_EQ(stage.size, 0u);}
+  m.deactivate(); EXPECT_STREQ(m.history().state, "inactive");
+  m.activate(); EXPECT_GT(m.history().epoch, reset.epoch);
+}
+
 TEST(MotionObservation, ConcurrentCopiesNeverMixVelocityComponents)
 {
   M m("base"); m.activate();
@@ -106,6 +141,13 @@ TEST(MotionObservation, ConcurrentCopiesNeverMixVelocityComponents)
     const auto view = m.snapshot(10000000000LL)[0]; const auto & s = view.sample;
     receipt_clock_invalid |= std::string(view.state) == "receipt_clock_invalid";
     EXPECT_EQ(s.vy, -s.vx); EXPECT_EQ(s.omega, s.vx * 2.);
+    const auto history = m.history();
+    if (std::string(history.state) == "ready") {
+      for (size_t j = 0; j < history.stages[0].size; ++j) {
+        const auto & old = history.stages[0].at(j);
+        EXPECT_EQ(old.vy, -old.vx); EXPECT_EQ(old.omega, old.vx * 2.);
+      }
+    }
   }
   writer.join();
   EXPECT_FALSE(receipt_clock_invalid);
