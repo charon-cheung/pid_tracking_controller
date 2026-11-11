@@ -260,5 +260,161 @@ TEST(ExecutionSafety, independentAxesStopWithoutReversal)
   EXPECT_NEAR(result.pose.y, .075, 1e-9);
   EXPECT_NEAR(result.time, 2., 1e-9);
 }
+
+MotionTransitionInput transition(HolonomicBodyCommand measured = {1., 0., 0.},
+  HolonomicBodyCommand candidate = {0., 1., 0.})
+{
+  MotionTransitionInput in;
+  in.measured = measured;
+  in.candidate = candidate;
+  in.candidate_execution = {0., 0.};
+  in.candidate_duration = 1.;
+  in.acceleration = in.deceleration = in.braking_deceleration = {1., 1., 1.};
+  return in;
+}
+
+TEST(ExecutionSafety, individuallySafeCommandsCanCollideDuringTheirTransition)
+{
+  nav2_costmap_2d::Costmap2D map(400, 400, .01, -2, -2, 0);
+  ExecutionSafety safety(options());
+  const auto body = rectangle(.015, .015);
+  obstacle(map, .375, .125);  // At t=0.5 on x=t-t^2/2, y=t^2/2.
+  auto old_command = input({1., 0., 0.});
+  old_command.deceleration = {1., 1., 1.};
+  auto new_command = old_command;
+  new_command.velocity = {0., 1., 0.};
+  ASSERT_EQ(safety.checkCommand(old_command, map, body).status, SweepStatus::kClear);
+  ASSERT_EQ(safety.checkCommand(new_command, map, body).status, SweepStatus::kClear);
+  const auto result = safety.checkTransition({0., 0., 0.}, transition(), map, body);
+  EXPECT_EQ(result.status, SweepStatus::kCollision);
+  EXPECT_EQ(result.phase, SweepPhase::kTransition);
+  EXPECT_GT(result.time, .2);
+  EXPECT_LT(result.time, .6);
+}
+
+TEST(ExecutionSafety, transitionIntegratesBothAxesAndTheirBrakingInBodyFrame)
+{
+  nav2_costmap_2d::Costmap2D map(400, 400, .02, -4, -4, 0);
+  ExecutionSafety safety(options());
+  for (double yaw : {0., M_PI / 2}) {
+    const auto result = safety.checkTransition({0., 0., yaw}, transition(), map, rectangle());
+    ASSERT_EQ(result.status, SweepStatus::kClear) << result.reason;
+    EXPECT_NEAR(result.pose.x, .5 * std::cos(yaw) - std::sin(yaw), 1e-9);
+    EXPECT_NEAR(result.pose.y, .5 * std::sin(yaw) + std::cos(yaw), 1e-9);
+    EXPECT_NEAR(result.time, 2., 1e-9);
+  }
+}
+
+TEST(ExecutionSafety, rotationCandidateRetainsResidualTranslation)
+{
+  nav2_costmap_2d::Costmap2D map(400, 400, .02, -4, -4, 0);
+  auto opts = options();
+  opts.step = .01;
+  ExecutionSafety safety(opts);
+  const auto in = transition({1., 0., 0.}, {0., 0., 1.});
+  const auto body = rectangle(.02, .02);
+  const auto result = safety.checkTransition({0., 0., 0.}, in, map, body);
+  ASSERT_EQ(result.status, SweepStatus::kClear) << result.reason;
+  // Independent Simpson quadrature of analytic v=1-t and theta=t^2/2.
+  // No motion-model segments or production integrator are used as an oracle.
+  double x = 0., y = 0.;
+  constexpr int n = 10000;
+  for (int i = 0; i <= n; ++i) {
+    const double t = static_cast<double>(i) / n;
+    const double weight = i == 0 || i == n ? 1. : (i % 2 ? 4. : 2.);
+    x += weight * (1 - t) * std::cos(t * t / 2) / (3 * n);
+    y += weight * (1 - t) * std::sin(t * t / 2) / (3 * n);
+  }
+  EXPECT_NEAR(result.pose.x, x, .0001);
+  EXPECT_NEAR(result.pose.y, y, .0001);
+  EXPECT_NEAR(result.pose.yaw, 1., 1e-9);  // +0.5 accelerating, +0.5 braking.
+  EXPECT_NEAR(result.time, 2., 1e-9);
+  obstacle(map, x, y);
+  EXPECT_EQ(safety.checkTransition({0., 0., 0.}, in, map, body).status,
+    SweepStatus::kCollision);
+}
+
+TEST(ExecutionSafety, issuedOldCommandAndFinalBrakingRemainInSweep)
+{
+  const auto body = rectangle(.015, .015);
+  nav2_costmap_2d::Costmap2D map(400, 400, .02, -4, -4, 0);
+  ExecutionSafety safety(options());
+  auto in = transition({1., 0., 0.}, {});
+  in.candidate_execution = {.5, .5};
+  in.active_command = in.measured;
+  in.active_valid_for = 1.;
+  in.candidate_duration = 0.;
+  obstacle(map, .3, 0.);
+  const auto delayed = safety.checkTransition({0., 0., 0.}, in, map, body);
+  EXPECT_EQ(delayed.status, SweepStatus::kCollision);
+  EXPECT_EQ(delayed.phase, SweepPhase::kDelay);
+  map.resetMap(0, 0, 400, 400);
+  obstacle(map, .9, 0.);
+  const auto braking = safety.checkTransition({0., 0., 0.}, in, map, body);
+  EXPECT_EQ(braking.status, SweepStatus::kCollision);
+  EXPECT_EQ(braking.phase, SweepPhase::kBraking);
+}
+
+TEST(ExecutionSafety, acceleratingFromRestCannotSkipThinObstacle)
+{
+  nav2_costmap_2d::Costmap2D map(400, 400, .01, -2, -2, 0);
+  auto opts = options();
+  opts.step = .5;
+  ExecutionSafety safety(opts);
+  obstacle(map, .125, 0.);
+  const auto result = safety.checkTransition({0., 0., 0.}, transition({}, {1., 0., 0.}),
+    map, rectangle(.01, .01));
+  EXPECT_EQ(result.status, SweepStatus::kCollision);
+  EXPECT_EQ(result.phase, SweepPhase::kTransition);
+}
+
+TEST(ExecutionSafety, longLegacyBrakingStillFitsDefaultSampleBudget)
+{
+  nav2_costmap_2d::Costmap2D map(200, 200, .1, -10, -10, 0);
+  ExecutionSafety safety(options());
+  auto in = input({.8, 0., 0.});
+  in.deceleration.vx = .05;
+  const auto result = safety.checkCommand(in, map, rectangle(.01, .01));
+  ASSERT_EQ(result.status, SweepStatus::kClear) << result.reason;
+  EXPECT_NEAR(result.pose.x, 6.4, 1e-9);
+  EXPECT_NEAR(result.time, 16., 1e-9);
+}
+
+TEST(ExecutionSafety, transitionBudgetsAreSharedAcrossAllPhases)
+{
+  nav2_costmap_2d::Costmap2D map(400, 400, .02, -4, -4, 0);
+  const auto body = rectangle(.01, .01);
+  for (int budget = 0; budget < 3; ++budget) {
+    auto opts = options();
+    opts.step = .25;
+    if (budget == 0) {opts.max_samples = 6;}
+    if (budget == 1) {opts.max_cell_checks = 1;}
+    if (budget == 2) {opts.budget_seconds = std::numeric_limits<double>::min();}
+    ExecutionSafety safety(opts);
+    const auto result = safety.checkTransition({0., 0., 0.}, transition(), map, body);
+    EXPECT_EQ(result.status, SweepStatus::kUnavailable) << budget;
+    EXPECT_STREQ(result.reason, "evaluation_budget");
+  }
+}
+
+TEST(ExecutionSafety, transitionUnknownSpaceMapExitAndTimingFailClosed)
+{
+  nav2_costmap_2d::Costmap2D map(100, 100, .02, -1, -1, 0);
+  ExecutionSafety safety(options());
+  const auto body = rectangle(.015, .015);
+  obstacle(map, .375, .125, nav2_costmap_2d::NO_INFORMATION);
+  const auto unknown = safety.checkTransition({0., 0., 0.}, transition(), map, body);
+  EXPECT_EQ(unknown.status, SweepStatus::kUnavailable);
+  EXPECT_STREQ(unknown.reason, "unknown_space");
+  map.resetMap(0, 0, 100, 100);
+  const auto outside = safety.checkTransition({0., 0., 0.}, transition(), map, body);
+  EXPECT_EQ(outside.status, SweepStatus::kUnavailable);
+  EXPECT_STREQ(outside.reason, "outside_map");
+  auto in = transition();
+  in.candidate_execution = {0., .1};
+  const auto uncertain = safety.checkTransition({0., 0., 0.}, in, map, body);
+  EXPECT_EQ(uncertain.status, SweepStatus::kUnavailable);
+  EXPECT_STREQ(uncertain.reason, "execution_timing_unknown");
+}
 }  // namespace
 }  // namespace pid_tracking_controller

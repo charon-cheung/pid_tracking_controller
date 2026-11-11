@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "holonomic_command_limiter.hpp"
+#include "motion_transition.hpp"
 #include "nav2_costmap_2d/footprint_collision_checker.hpp"
 
 namespace pid_tracking_controller
@@ -35,7 +35,6 @@ struct ExecutionSafetyOptions
 };
 
 enum class SweepStatus {kClear, kCollision, kUnavailable};
-enum class SweepPhase {kInitial, kHold, kBraking};
 
 struct CommandSweepResult
 {
@@ -50,11 +49,11 @@ struct CommandSweepResult
   std::optional<geometry_msgs::msg::Point> collision_cell;
 };
 
-// Geometric prediction only: constant body velocity, then independent linear
-// braking to zero without reversal. A body AABB encloses the entire footprint;
-// padding covers continuous motion AND numerical integration error.
-// Clear does not certify observation freshness, command reachability, physical
-// stopping, or a transition from some other measured/issued velocity (1D/1E).
+// Geometric prediction only. A body AABB encloses the entire footprint; padding
+// covers continuous motion AND numerical integration error. Clear does not certify
+// observation freshness, command reachability or physical stopping. checkCommand
+// retains the constant-velocity hold/brake model; checkTransition includes the
+// explicitly supplied measured/issued-to-candidate response assumptions.
 class ExecutionSafety
 {
 public:
@@ -64,6 +63,11 @@ public:
   // stable map for the whole call. Map is read only; non-const reference is
   // required by the existing Nav2/shared footprint-checker interface.
   CommandSweepResult checkCommand(const CommandSweepInput & input,
+    nav2_costmap_2d::Costmap2D & map, const nav2_costmap_2d::Footprint & footprint);
+
+  // Offline transition check under explicit response/timing assumptions. A clear
+  // geometric sweep is NOT certification that a physical base follows this model.
+  CommandSweepResult checkTransition(const SweepPose & pose, const MotionTransitionInput & input,
     nav2_costmap_2d::Costmap2D & map, const nav2_costmap_2d::Footprint & footprint);
 
 private:

@@ -54,6 +54,7 @@ add_library(pid_tracking_controller_plugin SHARED
   src/tracking_progress_publisher.cpp
   src/angular_velocity_feedback_filter.cpp
   src/execution_safety.cpp
+  src/motion_transition.cpp
   src/execution_safety_inputs.cpp
   src/execution_safety_adapter.cpp
   src/motion_observation.cpp
@@ -215,6 +216,10 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_execution_safety_inputs
     nav2_costmap_2d nav2_msgs geometry_msgs rclcpp tf2_ros tf2_geometry_msgs)
   target_link_libraries(test_execution_safety_inputs pid_tracking_controller_plugin)
+
+  ament_add_gtest(test_motion_transition test/test_motion_transition.cpp)
+  target_include_directories(test_motion_transition PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(test_motion_transition pid_tracking_controller_plugin)
 
   ament_add_gtest(test_execution_safety test/test_execution_safety.cpp)
   target_include_directories(test_execution_safety PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
