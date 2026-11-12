@@ -22,7 +22,7 @@ const char * alignedOdometry(const M::History & h, int64_t pose, int64_t now,
 {
   if (std::strcmp(h.state, "ready") != 0) {return h.state;}
   if (pose <= 0 || now < pose || now - pose > 300000000LL) {return "pose_time_invalid";}
-  const auto & series = h.stages[M::Odometry];
+  const auto & series = h.odometry;
   const M::Sample * anchor = nullptr;
   for (size_t i = 0; i < series.size; ++i) {
     const auto & s = series.at(i);
@@ -80,9 +80,10 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
   HolonomicBodyCommand aligned;
   out.reason = alignedOdometry(history, pose_stamp_ns, now_ns, Wall::now(), aligned);
   if (std::strcmp(history.state, "ready") == 0) {
-    if (history.drops[M::Odometry] != odom_drops_) {out.reason = "odometry_history_gap";}
-    odom_drops_ = history.drops[M::Odometry];
+    if (history.dropped != odom_drops_) {out.reason = "odometry_history_gap";}
+    odom_drops_ = history.dropped;
   }
+  out.motion_reason = out.reason;
   if (!geometry.snapshot || !geometry.snapshot->map) {
     out.reason = geometry.reason.empty() ? "geometry_missing" : geometry.reason;
   }
@@ -128,6 +129,7 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
           rampTime(aligned.omega, target.omega, nominal_.acceleration.omega, nominal_.deceleration.omega)});
         model.candidate_duration += ramp;
       }
+      ++out.evaluations;
       return ExecutionSafety(limits).checkTransition(geometry.snapshot->pose, model,
         *geometry.snapshot->map, geometry.snapshot->footprint);
     };
@@ -177,19 +179,40 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
 
 void ExecutionSafetyGate::report(const rclcpp::Logger & logger, const SafetyGateDecision & d,
   const HolonomicBodyCommand & candidate, uint64_t revision, int64_t now_ns,
-  int64_t pose_stamp_ns, int64_t map_stamp_ns, double elapsed_ms)
+  int64_t pose_stamp_ns, int64_t map_stamp_ns, double elapsed_ms, const M::History & history)
 {
   const auto wall = Wall::now();
-  const auto key = std::to_string(revision) + ':' + pathRiskName(d.path_risk) + ':' + d.action + ':' + d.reason;
+  const auto key = std::to_string(revision) + ':' + pathRiskName(d.path_risk) + ':' + d.action +
+    ':' + d.reason + ':' + d.motion_reason + ':' + std::to_string(history.epoch) +
+    ':' + std::to_string(history.dropped);
   if (key == last_report_ && wall - reported_at_ < std::chrono::seconds(1)) {return;}
   last_report_ = key; reported_at_ = wall;
-  RCLCPP_INFO(logger, "PID_GATE basis=nominal revision=%lu now=%.9f pose_age=%.6f map_age=%.6f "
-    "path_risk=%s sweep_requested=%d candidate=(%.6f,%.6f,%.6f) candidate_state=%s candidate_reason=%s phase=%d hit_t=%.6f "
+  const auto & series = history.odometry;
+  const M::Sample missing;
+  const auto & latest = series.size ? series.at(series.size - 1) : missing;
+  const M::Sample * anchor = nullptr;
+  for (size_t i = 0; i < series.size; ++i) {
+    if (series.at(i).stamp_ns == pose_stamp_ns) {anchor = &series.at(i);}
+  }
+  const auto & sample = anchor ? *anchor : missing;
+  RCLCPP_INFO(logger, "PID_MOTION stage=2-A revision=%lu history_revision=%lu epoch=%lu last_reset=%s "
+    "history_state=%s alignment=%s samples=%zu dropped=%lu overwritten=%lu "
+    "now=%.9f pose_stamp=%.9f latest_stamp=%.9f latest_payload=%s anchor_found=%d "
+    "anchor_count=%lu anchor_age=%.6f measured=(%.6f,%.6f,%.6f) "
+    "candidate=(%.6f,%.6f,%.6f) effective_delay=%.6f prediction_requested=%d",
+    revision, history.revision, history.epoch, history.reset_reason, history.state,
+    d.motion_reason.c_str(), series.size, history.dropped, series.overwritten,
+    now_ns * 1e-9, pose_stamp_ns * 1e-9, latest.stamp_ns * 1e-9, latest.payload, anchor != nullptr,
+    sample.count, anchor ? std::chrono::duration<double>(wall - sample.received).count() : -1.,
+    sample.vx, sample.vy, sample.omega, candidate.vx, candidate.vy, candidate.omega,
+    (now_ns - pose_stamp_ns) * 1e-9 + nominal_.delay, d.sweep_requested);
+  RCLCPP_INFO(logger, "PID_GATE stage=2-C evaluation=2-B basis=nominal revision=%lu now=%.9f pose_age=%.6f map_age=%.6f "
+    "path_risk=%s sweep_requested=%d evaluations=%u candidate=(%.6f,%.6f,%.6f) candidate_state=%s candidate_reason=%s phase=%d hit_t=%.6f "
     "resume_state=%s resume_reason=%s action=%s reason=%s clear_cycles=%u "
     "output=(%.6f,%.6f,%.6f) output_state=%s output_reason=%s total_ms=%.3f "
     "physical_response=unverified queued_commands=unmodeled steering=unmodeled",
     revision, now_ns * 1e-9, (now_ns - pose_stamp_ns) * 1e-9,
-    map_stamp_ns ? (now_ns - map_stamp_ns) * 1e-9 : -1., pathRiskName(d.path_risk), d.sweep_requested,
+    map_stamp_ns ? (now_ns - map_stamp_ns) * 1e-9 : -1., pathRiskName(d.path_risk), d.sweep_requested, d.evaluations,
     candidate.vx, candidate.vy, candidate.omega,
     statusName(d.candidate.status), d.candidate.reason, static_cast<int>(d.candidate.phase), d.candidate.time,
     statusName(d.resume.status), d.resume.reason, d.action, d.reason.c_str(), d.clear_cycles,

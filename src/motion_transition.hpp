@@ -11,6 +11,15 @@ namespace pid_tracking_controller
 {
 enum class SweepPhase {kInitial, kHold, kBraking, kDelay, kTransition};
 
+// Nominal response assumptions shared by 2-A prediction and the online gate.
+// Not actuator evidence: pending commands and steering dynamics remain unmodeled.
+struct NominalTransitionAssumptions
+{
+  double delay{std::numeric_limits<double>::quiet_NaN()};
+  double duration{std::numeric_limits<double>::quiet_NaN()};
+  HolonomicBodyCommand acceleration, deceleration, braking_deceleration;
+};
+
 struct ExecutionWindow
 {
   double earliest{std::numeric_limits<double>::quiet_NaN()};
@@ -58,7 +67,7 @@ struct MotionTransition
   std::vector<MotionSegment> segments;
 };
 
-// Offline only. Exact execution times are required: uncertain intervals are NOT
+// Explicit model times are required: uncertain intervals are NOT
 // approximated by endpoints. No asynchronous MotionObservation snapshot conversion.
 // Issued entries are ordered by execution time; expired/unissued entries are ignored.
 // Limits: 16 pending entries / 128 segments. Unavailable results are never a safe path.

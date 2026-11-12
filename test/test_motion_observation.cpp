@@ -8,149 +8,110 @@ namespace pid_tracking_controller
 namespace
 {
 using M = MotionObservation;
-using namespace std::chrono_literals;
 std_msgs::msg::Header header(int sec = 10)
 {
-  std_msgs::msg::Header h; h.stamp.sec = sec; h.frame_id = "base"; return h;
+  std_msgs::msg::Header h; h.stamp.sec = sec; h.frame_id = "odom"; return h;
 }
 geometry_msgs::msg::Twist velocity(double x = .4)
 {
   geometry_msgs::msg::Twist t; t.linear.x = x; t.linear.y = -.2; t.angular.z = .1; return t;
 }
 
-TEST(MotionObservation, IndependentSamplesKeepAllAxesAndOriginalTimes)
+TEST(MotionObservation, RetainsOriginalTimesAndAllBodyVelocityAxes)
 {
-  M m("base"); m.activate(); const auto now = M::Wall::now();
-  m.record(M::Candidate, header(), velocity(), "base", 7, now);
-  m.record(M::Published, header(), velocity(.3), "", 0, now + 10ms);
-  m.record(M::Smoothed, header(9), velocity(.2), "base", 0, now + 20ms);
-  m.record(M::Odometry, header(), velocity(.1), "base", 0, now + 30ms);
-  auto v = m.snapshot(10200000000LL, now + 50ms);
-  for (const auto & sample : v) {EXPECT_STREQ(sample.state, "valid");}
-  EXPECT_EQ(v[0].sample.revision, 7u);
-  EXPECT_EQ(v[0].sample.stamp_ns, 10000000000LL);
-  EXPECT_EQ(v[2].sample.stamp_ns, 9000000000LL);
-  EXPECT_DOUBLE_EQ(v[2].sample.vx, .2); EXPECT_DOUBLE_EQ(v[2].sample.vy, -.2);
-  EXPECT_DOUBLE_EQ(v[2].sample.omega, .1); EXPECT_NEAR(v[2].header_age, 1.2, 1e-9);
-  EXPECT_NEAR(v[2].receipt_age, .03, 1e-9);
-  EXPECT_STREQ(v[1].sample.frame, "empty_assumed_base");
+  M m("base"); m.activate(); m.history(10000000000LL, 7);
+  const auto receipt = M::Wall::now();
+  m.record(header(), velocity(), "base", receipt);
+  const auto h = m.history(10200000000LL, 7);
+  ASSERT_EQ(h.odometry.size, 1u);
+  const auto & s = h.odometry.at(0);
+  EXPECT_STREQ(h.state, "ready"); EXPECT_EQ(h.revision, 7u);
+  EXPECT_EQ(s.stamp_ns, 10000000000LL); EXPECT_EQ(s.received, receipt);
+  EXPECT_DOUBLE_EQ(s.vx, .4); EXPECT_DOUBLE_EQ(s.vy, -.2); EXPECT_DOUBLE_EQ(s.omega, .1);
+  EXPECT_STREQ(s.payload, "valid"); EXPECT_STREQ(s.frame, "base");
 }
 
-TEST(MotionObservation, RepeatedSmootherStampDoesNotRefreshUpstreamHeaderAge)
+TEST(MotionObservation, InvalidSamplesRemainVisibleAfterRecovery)
 {
-  M m("base"); m.activate(); const auto now = M::Wall::now();
-  m.record(M::Smoothed, header(), velocity(), "base", 0, now);
-  m.record(M::Smoothed, header(), velocity(), "base", 0, now + 900ms);
-  m.record(M::Published, header(), velocity(), "base", 0, now + 900ms);
-  auto v = m.snapshot(11000000000LL, now + 1s);
-  EXPECT_STREQ(v[2].state, "valid"); EXPECT_NEAR(v[2].header_age, 1., 1e-9);
-  EXPECT_NEAR(v[2].receipt_age, .1, 1e-9); EXPECT_EQ(v[2].sample.repeated, 1u);
-  EXPECT_STREQ(v[1].state, "header_stale");
-  EXPECT_STREQ(m.snapshot(12000000000LL, now + 2s)[2].state, "receipt_stale");
-}
-
-TEST(MotionObservation, InvalidEvidenceStaysLocalAndRecovers)
-{
-  M m("base"); m.activate(); auto now = M::Wall::now();
-  m.record(M::Candidate, header(), velocity(), "base");
-  m.record(M::Odometry, header(), velocity(), "map");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[3].state, "frame_mismatch");
+  M m("base"); m.activate(); m.history(10000000000LL, 1);
+  m.record(header(), velocity(), "map");
   auto bad = velocity(); bad.linear.y = std::numeric_limits<double>::quiet_NaN();
-  m.record(M::Odometry, header(), bad, "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[3].state, "nonfinite_velocity");
-  m.record(M::Odometry, header(11), velocity(), "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[3].state, "header_future");
-  m.record(M::Odometry, header(), velocity(), "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[3].state, "header_regressed");
-  m.record(M::Odometry, header(), velocity(), "base");
-  auto v = m.snapshot(10000000000LL);
-  EXPECT_STREQ(v[3].state, "valid"); EXPECT_EQ(v[3].sample.regressed, 1u);
-  EXPECT_STREQ(v[0].state, "valid"); EXPECT_STREQ(v[1].state, "missing");
-  EXPECT_EQ(v[0].sample.count, 1u);
+  m.record(header(), bad, "base");
+  m.record(header(11), velocity(), "base");
+  m.record(header(), velocity(), "base");
+  m.record(header(), velocity(), "base");
   auto malformed = header(); malformed.stamp.nanosec = 1000000000U;
-  m.record(M::Odometry, malformed, velocity(), "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[3].state, "invalid_stamp");
-  m.record(M::Odometry, header(0), velocity(), "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[3].state, "invalid_stamp");
-  EXPECT_STREQ(m.snapshot(11000000000LL, now + 1s)[0].state, "receipt_stale");
+  m.record(malformed, velocity(), "base");
+  m.record(header(0), velocity(), "base");
+  m.record(header(), velocity(), "");
+  const auto h = m.history(10000000000LL, 1);
+  ASSERT_EQ(h.odometry.size, 8u);
+  const char * reasons[] = {"frame_mismatch", "nonfinite_velocity", "valid", "header_regressed",
+    "valid", "invalid_stamp", "invalid_stamp", "frame_mismatch"};
+  for (size_t i = 0; i < h.odometry.size; ++i) {
+    EXPECT_STREQ(h.odometry.at(i).payload, reasons[i]);
+  }
+  EXPECT_EQ(h.odometry.at(2).stamp_ns, 11000000000LL);  // Do not rewrite future odometry.
 }
 
-TEST(MotionObservation, ReactivationAndClockRollbackDiscardPreviousEvidence)
+TEST(MotionObservation, BoundedHistoryRetainsChronologicalSamples)
 {
-  M m("base"); m.activate(); const auto before = M::Wall::now();
-  m.record(M::Candidate, header(), velocity(), "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[0].state, "valid");
-  m.report(rclcpp::get_logger("motion_test"), 10000000000LL);
-  m.report(rclcpp::get_logger("motion_test"), 9000000000LL);
-  EXPECT_STREQ(m.snapshot(9000000000LL)[0].state, "missing");
-  m.record(M::Candidate, header(9), velocity(), "base");
-  EXPECT_STREQ(m.snapshot(9000000000LL)[0].state, "valid");
-  m.deactivate(); m.record(M::Candidate, header(), velocity(), "base");
-  m.activate(); m.record(M::Candidate, header(), velocity(), "base", 0, before);
-  EXPECT_STREQ(m.snapshot(10000000000LL)[0].state, "missing");
-  m.record(M::Candidate, header(), velocity(), "base");
-  EXPECT_STREQ(m.snapshot(10000000000LL)[0].state, "valid");
-}
-
-TEST(MotionObservation, BoundedHistoryRetainsChronologicalIndependentSamples)
-{
-  M m("base"); m.activate();
+  M m("base"); m.activate(); m.history(10000000000LL, 7);
   for (size_t i = 0; i < M::kHistoryCapacity + 7; ++i) {
     auto h = header(); h.stamp.nanosec = i;
-    m.record(M::Candidate, h, velocity(i), "base", 7);
+    m.record(h, velocity(i), "base");
   }
-  const auto history = m.history(); const auto & c = history.stages[M::Candidate];
-  EXPECT_STREQ(history.state, "ready"); EXPECT_EQ(history.revision, 7u);
-  ASSERT_EQ(c.size, M::kHistoryCapacity); EXPECT_EQ(c.overwritten, 7u);
-  EXPECT_EQ(history.stages[M::Published].size, 0u);
-  for (size_t i = 0; i < c.size; ++i) {
-    EXPECT_EQ(c.at(i).count, i + 8); EXPECT_DOUBLE_EQ(c.at(i).vx, i + 7);
+  const auto h = m.history(10100000000LL, 7);
+  ASSERT_EQ(h.odometry.size, M::kHistoryCapacity); EXPECT_EQ(h.odometry.overwritten, 7u);
+  for (size_t i = 0; i < h.odometry.size; ++i) {
+    EXPECT_EQ(h.odometry.at(i).count, i + 8); EXPECT_DOUBLE_EQ(h.odometry.at(i).vx, i + 7);
   }
 }
 
-TEST(MotionObservation, HistoryIsIsolatedByPlanLifecycleAndRosClockEpoch)
+TEST(MotionObservation, PlanAndClockResetDoNotDependOnCandidateRecordingOrLogging)
 {
-  M m("base"); m.activate(); m.record(M::Candidate, header(), velocity(), "base", 7);
-  m.record(M::Published, header(), velocity(), "base");
-  const auto old = m.history();
-  m.record(M::Candidate, header(), velocity(), "base", 8);
-  auto h = m.history(); EXPECT_GT(h.epoch, old.epoch); EXPECT_EQ(h.stages[1].size, 0u);
-  EXPECT_EQ(h.stages[0].size, 1u);
-  m.record(M::Candidate, header(), velocity(), "base", 7);
-  h = m.history(); EXPECT_EQ(h.revision, 8u);
-  EXPECT_STREQ(h.stages[0].at(1).payload, "plan_revision_regressed");
-  m.report(rclcpp::get_logger("motion_test"), 10000000000LL);
-  m.report(rclcpp::get_logger("motion_test"), 9000000000LL);
-  const auto reset = m.history(); EXPECT_GT(reset.epoch, h.epoch);
-  for (const auto & stage : reset.stages) {EXPECT_EQ(stage.size, 0u);}
-  m.deactivate(); EXPECT_STREQ(m.history().state, "inactive");
-  m.activate(); EXPECT_GT(m.history().epoch, reset.epoch);
+  M m("base"); m.activate(); const auto before = M::Wall::now();
+  auto old = m.history(10000000000LL, 7);
+  m.record(header(), velocity(), "base");
+  auto next = m.history(10000000000LL, 8);
+  EXPECT_GT(next.epoch, old.epoch); EXPECT_EQ(next.revision, 8u);
+  EXPECT_EQ(next.odometry.size, 0u);
+  EXPECT_STREQ(m.history(10000000000LL, 7).state, "plan_revision_regressed");
+  m.record(header(), velocity(), "base");
+  auto reset = m.history(9000000000LL, 8);
+  EXPECT_GT(reset.epoch, next.epoch); EXPECT_EQ(reset.odometry.size, 0u);
+  m.record(header(9), velocity(), "base");
+  reset = m.history(9000000000LL, 8);
+  ASSERT_EQ(reset.odometry.size, 1u); EXPECT_STREQ(reset.odometry.at(0).payload, "valid");
+  m.deactivate(); m.record(header(), velocity(), "base");
+  EXPECT_STREQ(m.history(10000000000LL, 8).state, "inactive");
+  m.activate(); m.history(10000000000LL, 9);
+  m.record(header(), velocity(), "base", before);
+  auto active = m.history(10000000000LL, 9);
+  EXPECT_GT(active.epoch, reset.epoch); EXPECT_EQ(active.odometry.size, 0u);
+  m.record(header(), velocity(), "base");
+  EXPECT_EQ(m.history(10000000000LL, 9).odometry.size, 1u);
 }
 
 TEST(MotionObservation, ConcurrentCopiesNeverMixVelocityComponents)
 {
-  M m("base"); m.activate();
+  M m("base"); m.activate(); m.history(10000000000LL, 1);
   std::thread writer([&]() {
     for (int i = 1; i < 10000; ++i) {
       auto t = velocity(i); t.linear.y = -i; t.angular.z = i * 2.;
-      m.record(M::Candidate, header(), t, "base");
+      m.record(header(), t, "base");
     }
   });
-  bool receipt_clock_invalid = false;
   for (int i = 0; i < 10000; ++i) {
-    const auto view = m.snapshot(10000000000LL)[0]; const auto & s = view.sample;
-    receipt_clock_invalid |= std::string(view.state) == "receipt_clock_invalid";
-    EXPECT_EQ(s.vy, -s.vx); EXPECT_EQ(s.omega, s.vx * 2.);
-    const auto history = m.history();
-    if (std::string(history.state) == "ready") {
-      for (size_t j = 0; j < history.stages[0].size; ++j) {
-        const auto & old = history.stages[0].at(j);
-        EXPECT_EQ(old.vy, -old.vx); EXPECT_EQ(old.omega, old.vx * 2.);
-      }
+    const auto h = m.history(10000000000LL, 1);
+    if (std::string(h.state) != "ready") {continue;}
+    for (size_t j = 0; j < h.odometry.size; ++j) {
+      const auto & s = h.odometry.at(j);
+      EXPECT_EQ(s.vy, -s.vx); EXPECT_EQ(s.omega, s.vx * 2.);
+      EXPECT_LE(s.received, h.captured);
     }
   }
   writer.join();
-  EXPECT_FALSE(receipt_clock_invalid);
 }
 }  // namespace
 }  // namespace pid_tracking_controller

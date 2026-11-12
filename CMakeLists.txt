@@ -59,7 +59,6 @@ add_library(pid_tracking_controller_plugin SHARED
   src/execution_safety_inputs.cpp
   src/pid_execution_safety.cpp
   src/motion_observation.cpp
-  src/motion_transition_observer.cpp
   src/holonomic_command_limiter.cpp
   src/holonomic_control_law.cpp
   src/fixed_heading_yaw_gate.cpp
@@ -207,11 +206,6 @@ if(BUILD_TESTING)
   target_include_directories(test_execution_safety_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   ament_target_dependencies(test_execution_safety_gate ${dependencies})
   target_link_libraries(test_execution_safety_gate pid_tracking_controller_plugin)
-
-  ament_add_gtest(test_motion_transition_observer test/test_motion_transition_observer.cpp)
-  target_include_directories(test_motion_transition_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_motion_transition_observer ${dependencies})
-  target_link_libraries(test_motion_transition_observer pid_tracking_controller_plugin)
 
   ament_add_gtest(test_motion_observation test/test_motion_observation.cpp)
   target_include_directories(test_motion_observation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

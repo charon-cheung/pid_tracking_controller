@@ -92,8 +92,6 @@ public:
     Wall::time_point pose_received,
     Wall::time_point wall_now = Wall::now());
 
-  SafetyInputResult captureObserved(const rclcpp::Time & now, tf2_ros::Buffer & tf,
-    nav2_costmap_2d::LayeredCostmap & costmap);
 
 private:
   struct Observation

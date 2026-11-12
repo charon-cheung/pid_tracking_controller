@@ -422,27 +422,4 @@ PathRiskTrigger ExecutionSafetyInputs::pathRisk(
   return validatePathRisk(path_risk_.get(), risk_received_, current, now.nanoseconds(), Wall::now());
 }
 
-SafetyInputResult ExecutionSafetyInputs::captureObserved(
-  const rclcpp::Time & now, tf2_ros::Buffer & tf, nav2_costmap_2d::LayeredCostmap & costmap)
-{
-  std_msgs::msg::Header header;
-  Wall::time_point received;
-  {
-    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {return {std::nullopt, "inputs_busy", ""};}
-    if (!footprint_) {return {std::nullopt, "footprint_missing_or_stale", ""};}
-    header = footprint_->header; received = footprint_received_;
-  }
-  geometry_msgs::msg::PoseStamped pose;
-  try {
-    const auto transform = tf.lookupTransform(options_.map_frame, options_.base_frame,
-        rclcpp::Time(header.stamp));
-    pose.header = header; pose.header.frame_id = options_.map_frame;
-    pose.pose.position.x = transform.transform.translation.x;
-    pose.pose.position.y = transform.transform.translation.y;
-    pose.pose.position.z = transform.transform.translation.z;
-    pose.pose.orientation = transform.transform.rotation;
-  } catch (const tf2::TransformException &) {return {std::nullopt, "robot_tf_unavailable", ""};}
-  return capture(pose, now, tf, costmap, received);
-}
 }  // namespace pid_tracking_controller

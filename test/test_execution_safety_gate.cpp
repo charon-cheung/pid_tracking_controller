@@ -35,7 +35,7 @@ protected:
     double dt = .1, Wall::time_point started = Wall::now())
   {
     now += 100000000LL;
-    auto & series = h.stages[MotionObservation::Odometry]; series = {};
+    auto & series = h.odometry; series = {};
     auto & s = series.samples[0];
     s.vx = measured.vx; s.vy = measured.vy; s.omega = measured.omega;
     s.stamp_ns = now; s.received = Wall::now(); s.count = 1;
@@ -231,7 +231,7 @@ TEST_F(GateTest, PathRevisionAndInputGapResetResumeConfirmation)
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
   ++revision;
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
-  ++h.drops[MotionObservation::Odometry];
+  ++h.dropped;
   const auto gap = step({.05, 0., 0.});
   EXPECT_TRUE(gap.inhibited); EXPECT_EQ(gap.reason, "odometry_history_gap");
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
@@ -247,7 +247,7 @@ TEST_F(GateTest, RequiresExactFreshPoseOdometryAndRejectsInvalidNewerEvidence)
         limiter.previousCommand(), limiter, Wall::now(), risk);
     };
   EXPECT_TRUE(run(now - 10000000LL, now + 100000000LL).inhibited);
-  auto & series = h.stages[MotionObservation::Odometry];
+  auto & series = h.odometry;
   series.samples[0].received = Wall::now() - std::chrono::seconds(1);
   auto stale = run(now, now + 200000000LL);
   EXPECT_EQ(stale.reason, "odometry_receipt_stale"); EXPECT_TRUE(stale.inhibited);
@@ -259,10 +259,44 @@ TEST_F(GateTest, RequiresExactFreshPoseOdometryAndRejectsInvalidNewerEvidence)
   EXPECT_EQ(invalid.reason, "odometry_invalid"); EXPECT_TRUE(invalid.inhibited);
 }
 
+TEST_F(GateTest, RealHistoryResetsCannotReuseOldClearAuthorizationWithoutLogging)
+{
+  MotionObservation motion("base"); motion.activate();
+  now = 10000000000LL; motion.history(now, revision);
+  risk.state = msg::PathRiskState::CLEAR;
+  const auto record = [&](double vx = 0.) {
+      std_msgs::msg::Header header;
+      header.stamp = rclcpp::Time(now);
+      geometry_msgs::msg::Twist twist; twist.linear.x = vx;
+      motion.record(header, twist, "base");
+    };
+  const auto run = [&]() {
+      const auto history = motion.history(now, revision);
+      return gate.apply(geometry, history, now, now, revision, {.2, 0., 0.}, {}, .1,
+        limiter.previousCommand(), limiter, Wall::now(), risk);
+    };
+  record(); EXPECT_FALSE(run().inhibited);
+  // A new plan discards even a just-received old-plan velocity sample.
+  now += 100000000LL; record(); ++revision;
+  EXPECT_TRUE(run().inhibited);
+  now += 100000000LL; record(); EXPECT_FALSE(run().inhibited);
+  // Clock rollback must be fenced without any timer or logger call.
+  now -= 1000000000LL;
+  EXPECT_TRUE(run().inhibited);
+  now += 100000000LL; record(); EXPECT_FALSE(run().inhibited);
+  // Same-stamp conflicting velocities cannot be silently resolved by picking latest.
+  now += 100000000LL; record(0.); record(.3);
+  const auto ambiguous = run();
+  EXPECT_TRUE(ambiguous.inhibited); EXPECT_EQ(ambiguous.reason, "odometry_anchor_ambiguous");
+  motion.deactivate(); motion.activate(); now += 100000000LL;
+  EXPECT_TRUE(run().inhibited);
+  now += 100000000LL; record(); EXPECT_FALSE(run().inhibited);
+}
+
 TEST_F(GateTest, ValidTenMillisecondFutureOdometryDoesNotHideExactPoseAnchor)
 {
   auto result = step({.2, 0., 0.}); ASSERT_FALSE(result.inhibited);
-  auto & series = h.stages[MotionObservation::Odometry];
+  auto & series = h.odometry;
   series.samples[1] = series.samples[0]; series.samples[1].count = 2;
   series.samples[1].stamp_ns = now + 110000000LL;
   series.size = series.next = 2;

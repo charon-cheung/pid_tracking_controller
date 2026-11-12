@@ -1,7 +1,8 @@
 #ifndef PID_TRACKING_CONTROLLER__EXECUTION_SAFETY_GATE_HPP_
 #define PID_TRACKING_CONTROLLER__EXECUTION_SAFETY_GATE_HPP_
 
-#include "motion_transition_observer.hpp"
+#include "execution_safety_inputs.hpp"
+#include "motion_observation.hpp"
 #include "path_risk_trigger.hpp"
 
 namespace pid_tracking_controller
@@ -11,11 +12,12 @@ struct SafetyGateDecision
   HolonomicBodyCommand command;
   CommandSweepResult candidate, resume, output;
   std::string reason;
+  std::string motion_reason{"unavailable"};
   const char * action{"pass"};
   uint8_t path_risk{msg::PathRiskState::UNAVAILABLE};
   bool sweep_requested{false};
   bool inhibited{false};
-  unsigned clear_cycles{0};
+  unsigned clear_cycles{0}, evaluations{0};
 };
 
 // Single control-thread owner. A synchronous nominal gate, never a consumer of
@@ -35,7 +37,8 @@ public:
     HolonomicCommandLimiter & limiter, Wall::time_point cycle_started, const PathRiskTrigger & risk);
   void report(const rclcpp::Logger & logger, const SafetyGateDecision & decision,
     const HolonomicBodyCommand & candidate, uint64_t revision, int64_t now_ns,
-    int64_t pose_stamp_ns, int64_t map_stamp_ns, double elapsed_ms);
+    int64_t pose_stamp_ns, int64_t map_stamp_ns, double elapsed_ms,
+    const MotionObservation::History & history);
 
 private:
   NominalTransitionAssumptions nominal_;
