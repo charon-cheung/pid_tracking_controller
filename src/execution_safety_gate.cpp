@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include "rclcpp/logging.hpp"
 
 namespace pid_tracking_controller
@@ -43,8 +44,8 @@ const char * alignedOdometry(const M::History & h, int64_t pose, int64_t now,
   measured = {anchor->vx, anchor->vy, anchor->omega};
   return "ready";
 }
-// Reach the retained rejected target before braking when testing release. Testing
-// only one tiny acceleration step at standstill would repeatedly reopen the gate.
+// Reach the current target before braking when testing release. Testing only one
+// tiny acceleration step at standstill would repeatedly reopen the gate.
 double rampTime(double from, double to, double acceleration, double deceleration)
 {
   if (from * to < 0.) {return std::abs(from) / deceleration + std::abs(to) / acceleration;}
@@ -58,7 +59,7 @@ ExecutionSafetyGate::ExecutionSafetyGate(const NominalTransitionAssumptions & no
 void ExecutionSafetyGate::reset()
 {
   inhibited_ = false; clear_cycles_ = 0; revision_ = epoch_ = odom_drops_ = 0;
-  last_now_ = 0; resume_probe_.reset(); last_report_.clear(); reported_at_ = {};
+  last_now_ = 0; last_report_.clear(); reported_at_ = {};
 }
 
 SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, const M::History & history,
@@ -73,7 +74,7 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
     risk.state == msg::PathRiskState::COLLISION_AHEAD;
   out.resume.reason = "not_required";
   if (revision != revision_ || (history.epoch && history.epoch != epoch_)) {
-    clear_cycles_ = 0; resume_probe_.reset();
+    clear_cycles_ = 0;
     revision_ = revision;
     if (history.epoch) {epoch_ = history.epoch;}
   }
@@ -97,7 +98,7 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
   }
   if (out.reason == "ready" && risk.state == msg::PathRiskState::CLEAR) {
     // Path CLEAR is only the trigger policy, not an evaluated motion-sweep result.
-    inhibited_ = false; clear_cycles_ = 0; resume_probe_.reset();
+    inhibited_ = false; clear_cycles_ = 0;
     out.command = candidate; out.action = "path_clear_bypass"; out.reason = "path_clear";
     out.candidate.reason = out.output.reason = "not_checked_path_clear";
     limiter.commitSafetyOutput(out.command);
@@ -127,7 +128,10 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
           rampTime(aligned.vx, target.vx, nominal_.acceleration.vx, nominal_.deceleration.vx),
           rampTime(aligned.vy, target.vy, nominal_.acceleration.vy, nominal_.deceleration.vy),
           rampTime(aligned.omega, target.omega, nominal_.acceleration.omega, nominal_.deceleration.omega)});
-        model.candidate_duration += ramp;
+        // Rolling release probe: use today's PID direction/speed, not the old
+        // rejected command. Include a short hold plus full braking, so a tiny
+        // acceleration-only sweep is not sufficient evidence for restart.
+        model.candidate_duration = std::max(nominal_.duration, .2) + ramp;
       }
       ++out.evaluations;
       return ExecutionSafety(limits).checkTransition(geometry.snapshot->pose, model,
@@ -137,12 +141,10 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
   if (inputs_ready) {out.reason = out.candidate.reason;}
   bool clear = out.candidate.status == SweepStatus::kClear;
   if (!clear) {
-    if (!inhibited_ && moving(candidate)) {resume_probe_ = candidate;}
     inhibited_ = true; clear_cycles_ = 0;
   } else if (inhibited_) {
-    if (!resume_probe_ && moving(candidate)) {resume_probe_ = candidate;}
-    if (resume_probe_ && moving(candidate)) {
-      out.resume = evaluate(*resume_probe_, true);
+    if (moving(candidate)) {
+      out.resume = evaluate(candidate, true);
       clear = out.resume.status == SweepStatus::kClear;
       if (!clear) {out.reason = out.resume.reason;}
     } else {
@@ -151,7 +153,7 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
     // Duplicate ROS-time cycles never accumulate confirmations (inputs_ready=false).
     clear_cycles_ = clear ? clear_cycles_ + 1 : 0;
     if (clear_cycles_ >= 3) {
-      inhibited_ = false; resume_probe_.reset(); out.action = "released";
+      inhibited_ = false; out.action = "released";
     } else if (clear) {out.reason = "resume_confirming";}
   }
   out.command = candidate;
@@ -206,9 +208,13 @@ void ExecutionSafetyGate::report(const rclcpp::Logger & logger, const SafetyGate
     sample.count, anchor ? std::chrono::duration<double>(wall - sample.received).count() : -1.,
     sample.vx, sample.vy, sample.omega, candidate.vx, candidate.vy, candidate.omega,
     (now_ns - pose_stamp_ns) * 1e-9 + nominal_.delay, d.sweep_requested);
+  const double unknown = std::numeric_limits<double>::quiet_NaN();
   RCLCPP_INFO(logger, "PID_GATE stage=2-C evaluation=2-B basis=nominal revision=%lu now=%.9f pose_age=%.6f map_age=%.6f "
     "path_risk=%s sweep_requested=%d evaluations=%u candidate=(%.6f,%.6f,%.6f) candidate_state=%s candidate_reason=%s phase=%d hit_t=%.6f "
     "resume_state=%s resume_reason=%s action=%s reason=%s clear_cycles=%u "
+    "resume_policy=current_candidate resume_hold=%.6f resume_t=%.6f resume_distance=%.6f "
+    "candidate_hit_pose=(%.6f,%.6f,%.6f) candidate_cell=(%.6f,%.6f) "
+    "resume_hit_pose=(%.6f,%.6f,%.6f) resume_cell=(%.6f,%.6f) "
     "output=(%.6f,%.6f,%.6f) output_state=%s output_reason=%s total_ms=%.3f "
     "physical_response=unverified queued_commands=unmodeled steering=unmodeled",
     revision, now_ns * 1e-9, (now_ns - pose_stamp_ns) * 1e-9,
@@ -216,6 +222,13 @@ void ExecutionSafetyGate::report(const rclcpp::Logger & logger, const SafetyGate
     candidate.vx, candidate.vy, candidate.omega,
     statusName(d.candidate.status), d.candidate.reason, static_cast<int>(d.candidate.phase), d.candidate.time,
     statusName(d.resume.status), d.resume.reason, d.action, d.reason.c_str(), d.clear_cycles,
+    std::max(nominal_.duration, .2), d.resume.time, d.resume.distance,
+    d.candidate.pose.x, d.candidate.pose.y, d.candidate.pose.yaw,
+    d.candidate.collision_cell ? d.candidate.collision_cell->x : unknown,
+    d.candidate.collision_cell ? d.candidate.collision_cell->y : unknown,
+    d.resume.pose.x, d.resume.pose.y, d.resume.pose.yaw,
+    d.resume.collision_cell ? d.resume.collision_cell->x : unknown,
+    d.resume.collision_cell ? d.resume.collision_cell->y : unknown,
     d.command.vx, d.command.vy, d.command.omega, statusName(d.output.status), d.output.reason, elapsed_ms);
 }
 }  // namespace pid_tracking_controller

@@ -47,7 +47,6 @@ private:
   unsigned clear_cycles_{0};
   uint64_t revision_{0}, epoch_{0}, odom_drops_{0};
   int64_t last_now_{0};
-  std::optional<HolonomicBodyCommand> resume_probe_;
   std::string last_report_;
   Wall::time_point reported_at_{};
 };

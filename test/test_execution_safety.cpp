@@ -172,6 +172,26 @@ TEST(ExecutionSafety, coupledBrakingMatchesAnalyticArcAndChecksItsTail)
   }
 }
 
+TEST(ExecutionSafety, narrowPassageDoesNotTreatSamplingEnvelopeAsBodyCollision)
+{
+  // 10 mm side clearance. Old isotropic 25 mm sampling padding blocks a straight
+  // passage even though the complete body and braking path remain inside it.
+  nav2_costmap_2d::Costmap2D map(400, 200, .005, -1., -.5, 0);
+  for (unsigned int x = 0; x < map.getSizeInCellsX(); ++x) {
+    unsigned int mx, my;
+    ASSERT_TRUE(map.worldToMap(-.99, .11, mx, my));
+    map.setCost(x, my, 254);
+  }
+  auto request = input({.4, 0., 0.}); request.hold_time = .2;
+  const auto result = ExecutionSafety(options()).checkCommand(request, map, rectangle(.1, .1));
+  EXPECT_EQ(result.status, SweepStatus::kClear);
+  EXPECT_FALSE(result.collision_cell);
+  EXPECT_NEAR(result.pose.x, .24, 1e-9);
+  obstacle(map, .2, 0.);
+  EXPECT_EQ(ExecutionSafety(options()).checkCommand(request, map, rectangle(.1, .1)).status,
+    SweepStatus::kCollision);
+}
+
 TEST(ExecutionSafety, thinObstacleCannotHideBetweenSamples)
 {
   nav2_costmap_2d::Costmap2D map(400, 200, .005, -1, -.5, 0);

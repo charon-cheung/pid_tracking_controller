@@ -56,6 +56,7 @@ CommandSweepResult evaluate(const SweepPose & pose, const MotionTransition & mot
   std::size_t samples = 0, cell_checks = 0;
   const auto inspect = [&](double padding) {
       result.status = SweepStatus::kUnavailable;
+      result.collision_cell.reset();
       result.reason = "evaluation_budget";
       if (samples >= options.max_samples || expired()) {return false;}
       ++samples;
@@ -131,8 +132,16 @@ CommandSweepResult evaluate(const SweepPose & pose, const MotionTransition & mot
         result.status = SweepStatus::kUnavailable;
         result.reason = "integration_limit"; return result;
       }
-      // One expanded footprint encloses the complete interval, not just samples.
-      if (!inspect(position_error + h * point_speed)) {return result;}
+      // A coarse enclosure can touch a nearby wall while the motion is clear.
+      // Refine only that interval, retaining full coverage and shared work limits.
+      // Never turn a budget/unknown-space failure into a clear result.
+      const double minimum_step = std::min(options.step, resolution) / 16.;
+      while (!inspect(position_error + h * point_speed)) {
+        if (result.status != SweepStatus::kCollision || h * point_speed <= minimum_step) {
+          return result;
+        }
+        h *= .5;
+      }
       const auto middle = velocity_at(t + h / 2);
       const auto end = velocity_at(t + h);
       const double middle_yaw = result.pose.yaw + (start.omega + middle.omega) * h / 4;
@@ -140,8 +149,9 @@ CommandSweepResult evaluate(const SweepPose & pose, const MotionTransition & mot
       double scale = h;
       if (constant && yaw_step != 0) {
         scale *= std::sin(yaw_step / 2) / (yaw_step / 2);
-      } else if (!constant) {
-        // Midpoint integration error <= L*h^2/4, L bounds |a_xy| + |v|*|omega|.
+      } else if (!constant && omega != 0.) {
+        // With fixed yaw, affine translation integrates exactly at the midpoint.
+        // Otherwise error <= L*h^2/4, L bounds |a_xy| + |v|*|omega|.
         position_error += h * h / 4 * (acceleration + speed * omega);
       }
       const double c = std::cos(middle_yaw), sn = std::sin(middle_yaw);

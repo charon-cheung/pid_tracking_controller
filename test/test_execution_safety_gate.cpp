@@ -158,7 +158,7 @@ TEST_F(GateTest, ClearCurrentCandidatePassesAllAxesWithoutModification)
   }
 }
 
-TEST_F(GateTest, CollisionBrakesThenHoldsUntilRejectedMotionAndCurrentCandidateAreClear)
+TEST_F(GateTest, CollisionBrakesThenHoldsUntilCurrentRestartIsClear)
 {
   limiter.seed({.4, 0., 0.}); wall(.30);
   auto first = step({.5, 0., 0.}, {.4, 0., 0.});
@@ -168,7 +168,7 @@ TEST_F(GateTest, CollisionBrakesThenHoldsUntilRejectedMotionAndCurrentCandidateA
   EXPECT_EQ(first.output.status, SweepStatus::kClear);
   for (int i = 0; i < 20; ++i) {
     const auto previous = *limiter.previousCommand();
-    const auto result = step({.05, 0., 0.}, previous);
+    const auto result = step({.5, 0., 0.}, previous);
     EXPECT_TRUE(result.inhibited);
     EXPECT_LE(result.command.vx, previous.vx);
   }
@@ -184,6 +184,42 @@ TEST_F(GateTest, CollisionBrakesThenHoldsUntilRejectedMotionAndCurrentCandidateA
   // No stale clear authorization: the very next candidate sees the new obstacle.
   wall(0.);
   EXPECT_TRUE(step({.1, 0., 0.}).inhibited);
+}
+
+TEST_F(GateTest, RecoveryUsesCurrentLowSpeedAndDirectionAfterRejectedFastMotion)
+{
+  limiter.seed({.4, 0., 0.}); wall(.30);
+  ASSERT_TRUE(step({.5, 0., 0.}, {.4, 0., 0.}).inhibited);
+  // Standstill after braking. The old high-speed target still intersects the wall,
+  // but a new lateral correction and low-speed restart fit in the available space.
+  limiter.seed({});
+  EXPECT_TRUE(step({}).inhibited);
+  EXPECT_TRUE(step({0., .05, 0.}).inhibited);
+  EXPECT_TRUE(step({0., .05, 0.}).inhibited);
+  const auto release = step({0., .05, 0.});
+  EXPECT_FALSE(release.inhibited);
+  EXPECT_STREQ(release.action, "released");
+  EXPECT_DOUBLE_EQ(release.command.vx, 0.);
+  EXPECT_DOUBLE_EQ(release.command.vy, .05);
+  wall(0.);  // An obstacle at the body must still block the next command.
+  EXPECT_TRUE(step({0., .05, 0.}).inhibited);
+}
+
+TEST_F(GateTest, TinyClearCandidateCannotReleaseAnUnsafeSustainedRestart)
+{
+  auto saved = std::move(geometry.snapshot);
+  geometry.snapshot.reset(); geometry.reason = "map_missing_or_stale";
+  EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
+  geometry.snapshot = std::move(saved); geometry.reason = "ready";
+  geometry.snapshot->map = std::make_unique<nav2_costmap_2d::Costmap2D>(400, 400, .005, -1., -1., 0);
+  wall(.115);
+  for (int i = 0; i < 5; ++i) {
+    const auto d = step({.08, 0., 0.});
+    EXPECT_EQ(d.candidate.status, SweepStatus::kClear);
+    EXPECT_EQ(d.resume.status, SweepStatus::kCollision);
+    EXPECT_TRUE(d.inhibited);
+    EXPECT_DOUBLE_EQ(d.command.vx, 0.);
+  }
 }
 
 TEST_F(GateTest, MissingInputBrakesEveryAxisAndCommitsActualOutput)

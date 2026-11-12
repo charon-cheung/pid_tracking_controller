@@ -296,6 +296,12 @@ if(BUILD_TESTING)
   )
 endif()
 
+# Offline nominal-motion visualization; no controller or ROS runtime linkage.
+add_executable(pid_motion_replay tools/safety_replay/replay_motion.cpp src/motion_transition.cpp)
+target_include_directories(pid_motion_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(pid_motion_replay PRIVATE cxx_std_17)
+install(TARGETS pid_motion_replay DESTINATION lib/${PROJECT_NAME})
+
 ament_export_include_directories(include)
 ament_export_dependencies(rosidl_default_runtime std_msgs builtin_interfaces geometry_msgs nav_msgs)
 ament_package()
