@@ -29,7 +29,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/TrackingProgress.msg" DEPENDENCIES std_msgs builtin_interfaces geometry_msgs)
+  "msg/TrackingProgress.msg" "msg/PathRiskState.msg" DEPENDENCIES std_msgs builtin_interfaces geometry_msgs)
 rosidl_get_typesupport_target(progress_typesupport ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 set(dependencies
@@ -53,10 +53,11 @@ add_library(pid_tracking_controller_plugin SHARED
   src/pid_tracking_controller.cpp
   src/tracking_progress_publisher.cpp
   src/angular_velocity_feedback_filter.cpp
+  src/execution_safety_gate.cpp
   src/execution_safety.cpp
   src/motion_transition.cpp
   src/execution_safety_inputs.cpp
-  src/execution_safety_adapter.cpp
+  src/pid_execution_safety.cpp
   src/motion_observation.cpp
   src/motion_transition_observer.cpp
   src/holonomic_command_limiter.cpp
@@ -202,10 +203,10 @@ if(BUILD_TESTING)
   target_include_directories(test_translation_tracking_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(test_translation_tracking_guard pid_tracking_controller_plugin)
 
-  ament_add_gtest(test_execution_safety_adapter test/test_execution_safety_adapter.cpp)
-  target_include_directories(test_execution_safety_adapter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_execution_safety_adapter ${dependencies} rcutils)
-  target_link_libraries(test_execution_safety_adapter pid_tracking_controller_plugin)
+  ament_add_gtest(test_execution_safety_gate test/test_execution_safety_gate.cpp)
+  target_include_directories(test_execution_safety_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ament_target_dependencies(test_execution_safety_gate ${dependencies})
+  target_link_libraries(test_execution_safety_gate pid_tracking_controller_plugin)
 
   ament_add_gtest(test_motion_transition_observer test/test_motion_transition_observer.cpp)
   target_include_directories(test_motion_transition_observer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -219,8 +220,7 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_execution_safety_inputs test/test_execution_safety_inputs.cpp)
   target_include_directories(test_execution_safety_inputs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  ament_target_dependencies(test_execution_safety_inputs
-    nav2_costmap_2d nav2_msgs geometry_msgs rclcpp tf2_ros tf2_geometry_msgs)
+  ament_target_dependencies(test_execution_safety_inputs ${dependencies})
   target_link_libraries(test_execution_safety_inputs pid_tracking_controller_plugin)
 
   ament_add_gtest(test_motion_transition test/test_motion_transition.cpp)

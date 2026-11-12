@@ -12,6 +12,7 @@ class TrackingProgressPublisher
 {
 public:
   explicit TrackingProgressPublisher(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node);
+  const msg::TrackingProgress & state() const {return state_;}
   void activate();
   void deactivate();
   void invalidate();

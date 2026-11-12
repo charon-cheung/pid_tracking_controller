@@ -4,6 +4,9 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <sstream>
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
 #include <stdexcept>
 
 #include "rclcpp/rclcpp.hpp"
@@ -55,16 +58,6 @@ ExecutionSafetyInputs::ExecutionSafetyInputs(const SafetyInputOptions & options)
   }
 }
 
-void ExecutionSafetyInputs::recordMap(
-  nav2_msgs::msg::Costmap::ConstSharedPtr map,
-  Wall::time_point received)
-{
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto t = map ? stamp(map->header.stamp) : 0;
-  if (t <= map_stamp_) {map_.reset(); return;}
-  map_stamp_ = t; map_received_ = received; map_ = std::move(map);
-}
-
 void ExecutionSafetyInputs::recordFootprint(
   geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint, Wall::time_point received)
 {
@@ -103,7 +96,9 @@ void ExecutionSafetyInputs::recordObservation(
 
 void ExecutionSafetyInputs::clear()
 {
-  map_.reset(); footprint_.reset(); map_stamp_ = footprint_stamp_ = last_now_ = 0;
+  ++reset_epoch_;
+  footprint_.reset(); footprint_stamp_ = last_now_ = 0;
+  path_risk_.reset(); risk_received_ = {};
   for (auto & observation : observations_) {
     observation.samples.clear(); observation.last_stamp = 0;
   }
@@ -117,19 +112,27 @@ void ExecutionSafetyInputs::reset()
 
 SafetyInputResult ExecutionSafetyInputs::capture(
   const geometry_msgs::msg::PoseStamped & pose,
-  const rclcpp::Time & now, tf2_ros::Buffer & tf, Wall::time_point pose_received,
+  const rclcpp::Time & now, tf2_ros::Buffer & tf, nav2_costmap_2d::LayeredCostmap & costmap,
+  Wall::time_point pose_received,
   Wall::time_point wall_now)
 {
   const auto started = Wall::now();
   const auto now_ns = now.nanoseconds();
   SafetyInputResult result;
+  bool reused_map = false;
   const auto finish = [&](const char * reason) {
+      if (configuration_changed_) {
+        result.snapshot.reset(); reason = "configuration_changed_reactivate";
+      }
+      if (!result.snapshot) {cached_map_ = {};}
       result.reason = reason;
-      const auto key = result.reason + ":" + result.source;
+      const auto grid = result.snapshot ? (reused_map ? "cached" : "direct") : "none";
+      const auto key = result.reason + ":" + result.source + ":" + grid;
       if (key != last_log_key_) {
         RCLCPP_INFO(rclcpp::get_logger("PidTrackingController"),
-          "PID_SAFETY inputs ready=%s reason=%s source=%s",
-          result.snapshot ? "true" : "false", reason, result.source.c_str());
+          "PID_SAFETY inputs ready=%s reason=%s source=%s grid=%s map_age=%.3f",
+          result.snapshot ? "true" : "false", reason, result.source.c_str(), grid,
+          result.snapshot ? (now_ns - stamp(result.snapshot->header.stamp)) * 1e-9 : -1.);
         last_log_key_ = key;
       }
       return std::move(result);
@@ -142,9 +145,8 @@ SafetyInputResult ExecutionSafetyInputs::capture(
       return received <= wall_now &&
              std::chrono::duration<double>(wall_now - received).count() <= age;
     };
-  nav2_msgs::msg::Costmap::ConstSharedPtr map;
   geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint;
-  Wall::time_point map_received, footprint_received;
+  Wall::time_point footprint_received;
   std::vector<Observation> observations;
   {
     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
@@ -156,12 +158,11 @@ SafetyInputResult ExecutionSafetyInputs::capture(
       return finish("clock_invalid_or_regressed");
     }
     last_now_ = now_ns;
-    map = map_; footprint = footprint_; observations = observations_;
-    map_received = map_received_; footprint_received = footprint_received_;
+    if (cache_epoch_ != reset_epoch_) {cached_map_ = {}; cache_epoch_ = reset_epoch_;}
+    footprint = footprint_; observations = observations_;
+    footprint_received = footprint_received_;
   }
-  if (!map || !fresh(map->header, now_ns, options_.max_age) ||
-    !wall_fresh(map_received, options_.max_age)) {return finish("map_missing_or_stale");}
-  if (map->header.frame_id != options_.map_frame) {return finish("map_frame_mismatch");}
+  if (configuration_changed_) {return finish("configuration_changed_reactivate");}
   if (!footprint || !fresh(footprint->header, now_ns, options_.max_age) ||
     !wall_fresh(footprint_received, options_.max_age))
   {
@@ -172,15 +173,48 @@ SafetyInputResult ExecutionSafetyInputs::capture(
   {
     return finish("pose_invalid_or_stale");
   }
-  const auto & m = map->metadata;
-  const uint64_t cells = uint64_t(m.size_x) * m.size_y;
-  if (!m.size_x || !m.size_y || cells > options_.max_cells || map->data.size() != cells ||
-    !positive(m.resolution) || !planar(m.origin) ||
-    std::abs(m.origin.orientation.x) > 1e-6 || std::abs(m.origin.orientation.y) > 1e-6 ||
-    std::abs(m.origin.orientation.z) > 1e-6 ||
-    !std::isfinite(m.origin.position.x + m.size_x * double(m.resolution)) ||
-    !std::isfinite(m.origin.position.y + m.size_y * double(m.resolution)))
-  {return finish("invalid_map_geometry");}
+  SafetyInputSnapshot snapshot;
+  snapshot.pose_stamp_ns = stamp(pose.header.stamp);
+  {
+    auto & map = *costmap.getCostmap();
+    std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*map.getMutex(), std::try_to_lock);
+    if (!lock.owns_lock()) {
+      if (!cached_map_.map || cached_map_.owner != &costmap) {return finish("map_busy");}
+      if (!fresh(cached_map_.footprint->header, now_ns, options_.max_age) ||
+        !wall_fresh(cached_map_.received, options_.max_age))
+      {return finish("cached_map_stale");}
+      // Keep the grid's original update witness, never the latest callback stamp.
+      footprint = cached_map_.footprint; footprint_received = cached_map_.received;
+      snapshot.map = std::make_unique<nav2_costmap_2d::Costmap2D>(*cached_map_.map);
+      reused_map = true;
+    } else {
+      cached_map_ = {};  // Known-invalid live data must fence previously good data.
+      // LayeredCostmap::isCurrent() writes a non-atomic aggregate also used by
+      // ControllerServer. Read the layer flags under the update mutex instead.
+      const auto current = [](const auto & layers) {
+          return std::all_of(layers.begin(), layers.end(), [](const auto & layer) {
+              return !layer->isEnabled() || layer->isCurrent();
+            });
+        };
+      if (!costmap.isInitialized() || !current(*costmap.getPlugins()) || !current(*costmap.getFilters())) {
+        return finish("map_not_current");
+      }
+      const auto x = map.getSizeInCellsX(), y = map.getSizeInCellsY();
+      const uint64_t cells = uint64_t(x) * y;
+      if (!x || !y || cells > options_.max_cells || !map.getCharMap() ||
+        !positive(map.getResolution()) || !std::isfinite(map.getOriginX()) ||
+        !std::isfinite(map.getOriginY()) ||
+        !std::isfinite(map.getOriginX() + x * map.getResolution()) ||
+        !std::isfinite(map.getOriginY() + y * map.getResolution()))
+      {return finish("invalid_map_geometry");}
+      if (expired()) {return finish("input_budget");}
+      snapshot.map = std::make_unique<nav2_costmap_2d::Costmap2D>(x, y, map.getResolution(),
+          map.getOriginX(), map.getOriginY(), 0);
+      std::copy_n(map.getCharMap(), cells, snapshot.map->getCharMap());
+    }
+  }  // Release the live map before TF checks and all trajectory evaluation.
+  snapshot.header = footprint->header;
+  snapshot.header.frame_id = options_.map_frame;
 
   for (const auto & observation : observations) {
     result.source = observation.source.name;
@@ -193,7 +227,7 @@ SafetyInputResult ExecutionSafetyInputs::capture(
       return finish("observation_tf_unavailable");
     }
     bool anchored = false;
-    const auto map_time = stamp(map->header.stamp);
+    const auto map_time = stamp(footprint->header.stamp);
     for (const auto & sample : observation.samples) {
       const auto & h = sample.first;
       if (expired()) {return finish("input_budget");}
@@ -206,8 +240,6 @@ SafetyInputResult ExecutionSafetyInputs::capture(
     if (!anchored) {return finish("observation_not_anchored_to_map");}
   }
   result.source.clear();
-  SafetyInputSnapshot snapshot;
-  snapshot.header = map->header;
   try {
     auto map_pose = pose;
     if (pose.header.frame_id != options_.map_frame) {
@@ -254,11 +286,163 @@ SafetyInputResult ExecutionSafetyInputs::capture(
   }
   if (!std::isfinite(area) || area == 0.) {return finish("invalid_footprint");}
   if (expired()) {return finish("input_budget");}
-  snapshot.map = std::make_unique<nav2_costmap_2d::Costmap2D>(m.size_x, m.size_y, m.resolution,
-      m.origin.position.x, m.origin.position.y, 0);
-  std::copy(map->data.begin(), map->data.end(), snapshot.map->getCharMap());
+  if (!reused_map) {
+    // Separate ownership preserves the existing mutable snapshot API. Neither
+    // downstream users nor later live-map updates can mutate the retained grid.
+    cached_map_.map = std::make_unique<nav2_costmap_2d::Costmap2D>(*snapshot.map);
+    cached_map_.owner = &costmap; cached_map_.footprint = footprint;
+    cached_map_.received = footprint_received;
+  }
   if (expired()) {return finish("input_budget");}
   result.snapshot = std::move(snapshot);
   return finish("ready");
+}
+
+SafetyInputOptions safetyInputOptions(nav2_costmap_2d::Costmap2DROS & costmap)
+{
+  SafetyInputOptions options;
+  options.map_frame = costmap.getGlobalFrameID();
+  options.base_frame = costmap.getBaseFrameID();
+  const auto rate = costmap.get_parameter("update_frequency").as_double();
+  if (!positive(rate)) {throw std::invalid_argument("positive_update_frequency_required");}
+  options.map_update_period = 1. / rate;
+  const auto layers = costmap.get_parameter("plugins").as_string_array();
+  for (const auto & layer : layers) {
+    if (!costmap.has_parameter(layer + ".observation_sources") ||
+      !costmap.get_parameter(layer + ".enabled").as_bool()) {continue;}
+    std::istringstream names(costmap.get_parameter(layer + ".observation_sources").as_string());
+    for (std::string name; names >> name; ) {
+      const auto key = layer + "." + name;
+      const auto get = [&](const char * suffix) {return costmap.get_parameter(key + "." + suffix);};
+      if (!get("marking").as_bool() && !get("clearing").as_bool()) {continue;}
+      const auto topic = get("topic").as_string(), type = get("data_type").as_string();
+      const auto age = get("expected_update_rate").as_double();
+      if (topic.empty() || !std::isfinite(age) || age < 0 ||
+        (type != "LaserScan" && type != "PointCloud2"))
+      {throw std::invalid_argument("unsupported_or_invalid_observation_source:" + key);}
+      options.sources.push_back({key, age > 0 ? std::min(age, options.max_age) : options.max_age,
+        costmap.get_node_topics_interface()->resolve_topic_name(topic), type});
+    }
+  }
+  return options;
+}
+
+void ExecutionSafetyInputs::subscribe(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node,
+  const std::shared_ptr<nav2_costmap_2d::Costmap2DROS> & costmap)
+{
+  parameter_callback_ = costmap->add_post_set_parameters_callback(
+    [weak = weak_from_this()](const std::vector<rclcpp::Parameter> &) {
+      if (const auto self = weak.lock()) {self->configuration_changed_ = true;}
+    });
+  // Fence a parameter change between reading options and installing the callback.
+  // Changes after registration invalidate capture through configuration_changed_.
+  const auto live = safetyInputOptions(*costmap);
+  if (live.map_frame != options_.map_frame || live.base_frame != options_.base_frame ||
+    live.map_update_period != options_.map_update_period || live.sources.size() != options_.sources.size() ||
+    !std::equal(live.sources.begin(), live.sources.end(), options_.sources.begin(),
+      [](const auto & a, const auto & b) {
+        return a.name == b.name && a.max_age == b.max_age && a.topic == b.topic && a.type == b.type;
+      })) {configuration_changed_ = true;}
+  for (const auto & source : options_.sources) {
+    RCLCPP_INFO(node->get_logger(), "PID_SAFETY source=%s topic=%s type=%s max_age=%.3f",
+      source.name.c_str(), source.topic.c_str(), source.type.c_str(), source.max_age);
+  }
+  for (size_t i = 0; i < options_.sources.size(); ++i) {
+    bool duplicate = false;
+    for (size_t j = 0; j < i; ++j) {
+      if (options_.sources[j].topic != options_.sources[i].topic) {continue;}
+      if (options_.sources[j].type != options_.sources[i].type) {throw std::runtime_error("conflicting_observation_types");}
+      duplicate = true;
+    }
+    if (duplicate) {continue;}
+    const auto record = [weak = weak_from_this(), wire = options_.sources[i].topic](
+      const std_msgs::msg::Header & h, bool valid) {
+        if (const auto self = weak.lock()) {
+          for (const auto & source : self->options_.sources) {
+            if (source.topic == wire) {self->recordObservation(source.name, h, valid);}
+          }
+        }
+      };
+    if (options_.sources[i].type == "LaserScan") {
+      subscriptions_.push_back(node->create_subscription<sensor_msgs::msg::LaserScan>(
+        options_.sources[i].topic, rclcpp::SensorDataQoS().keep_last(1),
+        [record](sensor_msgs::msg::LaserScan::ConstSharedPtr m) {
+          record(m->header, !m->ranges.empty() && std::isfinite(m->angle_min) &&
+            std::isfinite(m->angle_max) && std::isfinite(m->angle_increment) && m->angle_increment > 0 &&
+            std::isfinite(m->time_increment) && m->time_increment >= 0 &&
+            std::isfinite(m->scan_time) && m->scan_time >= 0 &&
+            std::isfinite(m->range_min) && m->range_min >= 0 &&
+            std::isfinite(m->range_max) && m->range_max > m->range_min &&
+            std::any_of(m->ranges.begin(), m->ranges.end(), [&](float range) {
+              // Positive infinity is a valid no-return scan; individual NaNs may be dropped.
+              return (std::isfinite(range) && range >= m->range_min && range <= m->range_max) ||
+                     (std::isinf(range) && range > 0);
+            }));
+        }));
+    } else {
+      subscriptions_.push_back(node->create_subscription<sensor_msgs::msg::PointCloud2>(
+        options_.sources[i].topic, rclcpp::SensorDataQoS().keep_last(1),
+        [record](sensor_msgs::msg::PointCloud2::ConstSharedPtr m) {
+          bool valid = m->point_step > 0 && m->height > 0 &&
+            m->row_step >= uint64_t(m->width) * m->point_step &&
+            m->data.size() == uint64_t(m->height) * m->row_step;
+          for (const auto * axis : {"x", "y", "z"}) {
+            valid = valid && std::any_of(m->fields.begin(), m->fields.end(), [&](const auto & f) {
+                return f.name == axis && f.count == 1 &&
+                  f.datatype == sensor_msgs::msg::PointField::FLOAT32 && uint64_t(f.offset) + 4 <= m->point_step;
+              });
+          }
+          record(m->header, valid);
+        }));
+    }
+  }
+  subscriptions_.push_back(node->create_subscription<geometry_msgs::msg::PolygonStamped>(
+      costmap->get_node_topics_interface()->resolve_topic_name("published_footprint"), rclcpp::QoS(1),
+      [weak = weak_from_this()](geometry_msgs::msg::PolygonStamped::ConstSharedPtr message) {
+        if (const auto self = weak.lock()) {self->recordFootprint(std::move(message));}
+      }));
+  RCLCPP_INFO(node->get_logger(), "PID_SAFETY inputs grid=local_costmap_direct "
+    "update_witness=published_footprint busy_map=reuse_unexpired source_count=%zu executor=controller "
+    "map_frame=%s base_frame=%s map_period=%.3f max_age=%.3f budget_ms=%.1f",
+    options_.sources.size(), options_.map_frame.c_str(), options_.base_frame.c_str(),
+    options_.map_update_period, options_.max_age, options_.budget_seconds * 1000.);
+}
+
+void ExecutionSafetyInputs::recordPathRisk(msg::PathRiskState::ConstSharedPtr risk)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  path_risk_ = std::move(risk); risk_received_ = Wall::now();
+}
+
+PathRiskTrigger ExecutionSafetyInputs::pathRisk(
+  const msg::TrackingProgress & current, const rclcpp::Time & now)
+{
+  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {return {msg::PathRiskState::UNAVAILABLE, "inputs_busy"};}
+  return validatePathRisk(path_risk_.get(), risk_received_, current, now.nanoseconds(), Wall::now());
+}
+
+SafetyInputResult ExecutionSafetyInputs::captureObserved(
+  const rclcpp::Time & now, tf2_ros::Buffer & tf, nav2_costmap_2d::LayeredCostmap & costmap)
+{
+  std_msgs::msg::Header header;
+  Wall::time_point received;
+  {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {return {std::nullopt, "inputs_busy", ""};}
+    if (!footprint_) {return {std::nullopt, "footprint_missing_or_stale", ""};}
+    header = footprint_->header; received = footprint_received_;
+  }
+  geometry_msgs::msg::PoseStamped pose;
+  try {
+    const auto transform = tf.lookupTransform(options_.map_frame, options_.base_frame,
+        rclcpp::Time(header.stamp));
+    pose.header = header; pose.header.frame_id = options_.map_frame;
+    pose.pose.position.x = transform.transform.translation.x;
+    pose.pose.position.y = transform.transform.translation.y;
+    pose.pose.position.z = transform.transform.translation.z;
+    pose.pose.orientation = transform.transform.rotation;
+  } catch (const tf2::TransformException &) {return {std::nullopt, "robot_tf_unavailable", ""};}
+  return capture(pose, now, tf, costmap, received);
 }
 }  // namespace pid_tracking_controller

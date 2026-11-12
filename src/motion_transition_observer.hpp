@@ -40,7 +40,7 @@ struct TransitionObservation
   double evaluate_ms{0}, total_ms{0};
 };
 
-// Single observation-worker owner. Results have no control-path consumers.
+// Single observation-timer owner. Results have no control-path consumers.
 class MotionTransitionObserver
 {
 public:

@@ -58,7 +58,7 @@ public:
     const geometry_msgs::msg::Twist & twist, const std::string & velocity_frame,
     uint64_t revision = 0, Wall::time_point received = Wall::now());
   std::array<View, 4> snapshot(int64_t ros_now, Wall::time_point now = {});
-  History history();  // Bounded try-lock copy on the observation worker.
+  History history();  // Bounded try-lock copy for the control cycle or observation timer.
   void report(const rclcpp::Logger & logger, int64_t ros_now);
 
 private:
@@ -73,7 +73,7 @@ private:
   std::atomic<uint64_t> dropped_{0};
   std::array<std::atomic<uint64_t>, 4> attempts_{}, drops_{};
   std::atomic<int64_t> last_drop_ns_{0};
-  // Only used by the adapter worker, reset before it starts.
+  // Only used by the observation timer, reset before activation.
   std::array<View, 4> last_report_{};
   Wall::time_point reported_at_{};
   uint64_t report_id_{0}, reported_drops_{0};

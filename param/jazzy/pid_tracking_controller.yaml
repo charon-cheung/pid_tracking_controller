@@ -6,6 +6,8 @@ controller_server:
 
     PidTrackingController:
       plugin: "pid_tracking_controller::PidTrackingController"
+      # Opt-in nominal execution gate; enabled separately in the Webots overlay.
+      execution_safety.enabled: false
       base_frame: "base_link"
       lookahead_time: 1.0
       min_lookahead_dist: 0.5

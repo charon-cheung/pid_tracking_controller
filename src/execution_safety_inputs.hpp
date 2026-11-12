@@ -1,6 +1,7 @@
 #ifndef PID_TRACKING_CONTROLLER__EXECUTION_SAFETY_INPUTS_HPP_
 #define PID_TRACKING_CONTROLLER__EXECUTION_SAFETY_INPUTS_HPP_
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -13,7 +14,8 @@
 #include "execution_safety.hpp"
 #include "geometry_msgs/msg/polygon_stamped.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "nav2_msgs/msg/costmap.hpp"
+#include "nav2_costmap_2d/costmap_2d_ros.hpp"
+#include "path_risk_trigger.hpp"
 #include "tf2_ros/buffer.h"
 
 namespace pid_tracking_controller
@@ -22,6 +24,7 @@ struct SafetyObservationSource
 {
   std::string name;
   double max_age{0.6};  // Positive seconds, even if the layer disables its own expiry.
+  std::string topic, type;
 };
 
 struct SafetyInputOptions
@@ -38,9 +41,11 @@ struct SafetyInputOptions
 
 struct SafetyInputSnapshot
 {
+  // Last witnessed successful update, not the snapshot read time or an exact map version.
   std_msgs::msg::Header header;
   std::unique_ptr<nav2_costmap_2d::Costmap2D> map;
   nav2_costmap_2d::Footprint footprint;  // Body frame, including configured padding.
+  int64_t pose_stamp_ns{0};
   SweepPose pose;  // Map frame, at the supplied robot pose timestamp.
 };
 
@@ -51,21 +56,22 @@ struct SafetyInputResult
   std::string source;
 };
 
-// Standalone 1D collector. The 1E adapter must feed FULL costmap messages (not
-// service responses stamped at request time), the padded footprint and EVERY
-// enabled marking/clearing source. Source payload validation precedes recordObservation.
-// Reset/reconstruct on lifecycle, source or frame configuration changes. Inputs
-// are immutable ROS messages; callers must not mutate them after recording.
-// Ready means usable geometric inputs, NOT a clear sweep or proof that the layer
-// ingested a particular observation. Velocity decisions remain outside this class.
-class ExecutionSafetyInputs
+// Collects and validates execution inputs. Grid data comes directly from the
+// configured local costmap under its mutex, not a costmap topic. The small
+// published_footprint message remains an immutable padded footprint and update
+// witness: Jazzy publishes it after updateMap, but exposes no update timestamp
+// or synchronized Costmap2DROS footprint getter. Never renew this witness on read.
+// Ready means usable inputs, not a clear sweep or proof of source ingestion.
+class ExecutionSafetyInputs : public std::enable_shared_from_this<ExecutionSafetyInputs>
 {
 public:
   using Wall = std::chrono::steady_clock;
   explicit ExecutionSafetyInputs(const SafetyInputOptions & options);
-  void recordMap(
-    nav2_msgs::msg::Costmap::ConstSharedPtr map,
-    Wall::time_point received = Wall::now());
+  // Uses the controller's existing executor; no worker, executor or polling thread.
+  void subscribe(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node,
+    const std::shared_ptr<nav2_costmap_2d::Costmap2DROS> & costmap);
+  void recordPathRisk(msg::PathRiskState::ConstSharedPtr risk);
+  PathRiskTrigger pathRisk(const msg::TrackingProgress & current, const rclcpp::Time & now);
   void recordFootprint(
     geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint,
     Wall::time_point received = Wall::now());
@@ -75,14 +81,19 @@ public:
   void reset();
 
   // One capture caller; record* may run concurrently. Never wait for callbacks,
-  // a mutex or TF. Busy/invalid/expired inputs produce no snapshot. Receipt times
+  // a mutex or TF. A busy map may reuse unexpired, previously validated grid
+  // evidence; other invalid/expired inputs produce no snapshot. Receipt times
   // must use steady_clock; now and all message headers use the same ROS clock.
   // pose_received is the actual arrival time of this stamped pose, not the time
   // of capture. Reusing a pose must not renew its receipt time.
   SafetyInputResult capture(
     const geometry_msgs::msg::PoseStamped & pose,
-    const rclcpp::Time & now, tf2_ros::Buffer & tf, Wall::time_point pose_received,
+    const rclcpp::Time & now, tf2_ros::Buffer & tf, nav2_costmap_2d::LayeredCostmap & costmap,
+    Wall::time_point pose_received,
     Wall::time_point wall_now = Wall::now());
+
+  SafetyInputResult captureObserved(const rclcpp::Time & now, tf2_ros::Buffer & tf,
+    nav2_costmap_2d::LayeredCostmap & costmap);
 
 private:
   struct Observation
@@ -92,15 +103,30 @@ private:
     int64_t last_stamp{0};
     Wall::time_point received{};
   };
+  struct CachedMap
+  {
+    const nav2_costmap_2d::LayeredCostmap * owner{nullptr};
+    std::unique_ptr<nav2_costmap_2d::Costmap2D> map;
+    geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint;
+    Wall::time_point received{};
+  };
   void clear();  // mutex_ held by caller
   SafetyInputOptions options_;
   std::mutex mutex_;
-  nav2_msgs::msg::Costmap::ConstSharedPtr map_;
   geometry_msgs::msg::PolygonStamped::ConstSharedPtr footprint_;
-  Wall::time_point map_received_{}, footprint_received_{};
-  int64_t map_stamp_{0}, footprint_stamp_{0}, last_now_{0};
+  Wall::time_point footprint_received_{};
+  int64_t footprint_stamp_{0}, last_now_{0};
+  msg::PathRiskState::ConstSharedPtr path_risk_;
+  Wall::time_point risk_received_{};
+  std::atomic<bool> configuration_changed_{false};
+  std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
+  rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr parameter_callback_;
   std::vector<Observation> observations_;
+  uint64_t reset_epoch_{0};  // mutex_ held; reset invalidates the capture-owned cache.
+  uint64_t cache_epoch_{0};
+  CachedMap cached_map_;  // Only the single capture caller reads/writes this cache.
   std::string last_log_key_;  // Only capture() uses diagnostic state.
 };
+SafetyInputOptions safetyInputOptions(nav2_costmap_2d::Costmap2DROS & costmap);
 }  // namespace pid_tracking_controller
 #endif  // PID_TRACKING_CONTROLLER__EXECUTION_SAFETY_INPUTS_HPP_

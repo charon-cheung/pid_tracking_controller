@@ -13,6 +13,9 @@
 #include "gtest/gtest.h"
 
 #include "geometry_msgs/msg/point_stamped.hpp"
+#include "geometry_msgs/msg/polygon_stamped.hpp"
+#include "direct_costmap_fixture.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "pid_tracking_controller/pid_tracking_controller.hpp"
@@ -23,6 +26,7 @@
 #include "controller_test_access.hpp"
 #include "motion_observation.hpp"
 #include "pid_tracking_controller/msg/tracking_progress.hpp"
+#include "pid_tracking_controller/msg/path_risk_state.hpp"
 #include "pid_tracking_controller/path_identity.hpp"
 #include "nav2_core/controller_exceptions.hpp"
 #include "rcl/time.h"
@@ -311,7 +315,6 @@ TEST(LifecycleSmoke, unavailableObservationDoesNotChangeCommands)
     costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
     costmap->configure();
     ASSERT_EQ(costmap->get_current_state().label(), "inactive");
-    costmap->set_parameter(rclcpp::Parameter("always_send_full_costmap", true));
     // Declare an observational source without starting a map-update thread.
     costmap->declare_parameter("test_layer.enabled", true);
     costmap->declare_parameter("test_layer.observation_sources", "scan");
@@ -434,6 +437,167 @@ TEST(LifecycleSmoke, rotationParametersAffectTurnsWithoutChangingTranslationYaw)
     EXPECT_LT(turns[2], turns[1]);
     for (const auto omega : translations) {EXPECT_NEAR(omega, -0.1, 1e-12);}
     costmap->cleanup();
+  }
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, enabledSafetyRejectsMotionWithoutInputsIncludingReseedAndNewTask)
+{
+  rclcpp::init(0, nullptr);
+  {
+    auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>("safety_no_inputs");
+    parent->declare_parameter("Controller.execution_safety.enabled", true);
+    parent->declare_parameter("controller_frequency", 15.0);
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("safety_no_inputs_map");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->configure();
+    auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+    auto clock = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+    ASSERT_EQ(rcl_enable_ros_time_override(clock->get_clock_handle()), RCL_RET_OK);
+    PidTrackingController controller;
+    controller.configure(parent, "Controller", tf, costmap);
+    controller.activate();
+    PidTrackingControllerTestAccess::setClock(controller, clock);
+    geometry_msgs::msg::Twist measured;
+    measured.linear.x = .4; measured.linear.y = -.2; measured.angular.z = .1;
+    for (int task = 0; task < 2; ++task) {
+      controller.setPlan(makeLifecyclePath());
+      for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(rcl_set_ros_time_override(clock->get_clock_handle(),
+            1000000000LL + (task * 10 + i) * 66666667LL), RCL_RET_OK);
+        const auto cmd = controller.computeVelocityCommands(makePose(0., 0.), measured, nullptr);
+        EXPECT_DOUBLE_EQ(cmd.twist.linear.x, 0.);
+        EXPECT_DOUBLE_EQ(cmd.twist.linear.y, 0.);
+        EXPECT_DOUBLE_EQ(cmd.twist.angular.z, 0.);
+      }
+      controller.reset();
+    }
+    controller.deactivate(); controller.cleanup(); costmap->cleanup();
+  }
+  rclcpp::shutdown();
+}
+
+TEST(LifecycleSmoke, safetyInputsRecoverRotationEntryStopOnCollisionAndResumeAfterRemoval)
+{
+  rclcpp::init(0, nullptr);
+  {
+    auto parent = std::make_shared<rclcpp_lifecycle::LifecycleNode>("gate_live_inputs");
+    parent->declare_parameter("Controller.execution_safety.enabled", true);
+    parent->declare_parameter("Controller.omega_feedback_filter_tau", 0.0);
+    parent->declare_parameter("controller_frequency", 15.0);
+    parent->declare_parameter("odom_topic", "/gate_live_odom");
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>("gate_live_map");
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>()));
+    costmap->set_parameter(rclcpp::Parameter("global_frame", "map"));
+    costmap->set_parameter(rclcpp::Parameter("robot_base_frame", "base_link"));
+    costmap->configure();
+    costmap->declare_parameter("test_layer.enabled", true);
+    costmap->declare_parameter("test_layer.observation_sources", "scan");
+    costmap->declare_parameter("test_layer.scan.topic", "gate_scan");
+    costmap->declare_parameter("test_layer.scan.data_type", "LaserScan");
+    costmap->declare_parameter("test_layer.scan.expected_update_rate", 0.0);
+    costmap->declare_parameter("test_layer.scan.marking", true);
+    costmap->declare_parameter("test_layer.scan.clearing", true);
+    costmap->set_parameter(rclcpp::Parameter("plugins", std::vector<std::string>{"test_layer"}));
+    auto publisher = std::make_shared<rclcpp::Node>("gate_live_publisher");
+    const auto topic = [&](const char * name) {
+        return costmap->get_node_topics_interface()->resolve_topic_name(name);
+      };
+    auto * live = costmap->getCostmap();
+    live->resizeMap(200, 200, .05, -5., -5.);
+    costmap->getLayeredCostmap()->addPlugin(std::make_shared<TestCostmapLayer>());
+    costmap->getLayeredCostmap()->updateMap(0., 0., 0.);
+    auto footprint_pub = publisher->create_publisher<geometry_msgs::msg::PolygonStamped>(
+        topic("published_footprint"), 1);
+    auto scan_pub = publisher->create_publisher<sensor_msgs::msg::LaserScan>(
+        topic("gate_scan"), rclcpp::SensorDataQoS());
+    auto odom_pub = publisher->create_publisher<nav_msgs::msg::Odometry>("/gate_live_odom", 1);
+    auto risk_pub = publisher->create_publisher<msg::PathRiskState>("path_risk/control_state", 1);
+    uint8_t risk_state = msg::PathRiskState::CLEARANCE_LOW;
+    builtin_interfaces::msg::Time map_stamp;
+    auto progress_sub = parent->create_subscription<msg::TrackingProgress>(
+      "pid_tracking_controller/tracking_progress", 1, [&](msg::TrackingProgress::ConstSharedPtr p) {
+        if (!p->valid) {return;}
+        msg::PathRiskState risk;
+        risk.header = p->header; risk.header.stamp = parent->now(); risk.path_header = p->path_header;
+        risk.controller_instance = p->controller_instance; risk.plan_revision = p->plan_revision;
+        risk.path_fingerprint = p->path_fingerprint; risk.progress_stamp = p->header.stamp;
+        risk.map_stamp = map_stamp; risk.state = risk_state; risk_pub->publish(risk);
+      });
+    auto tf = std::make_shared<tf2_ros::Buffer>(parent->get_clock());
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(parent->get_node_base_interface());
+    PidTrackingController controller;
+    controller.configure(parent, "Controller", tf, costmap); controller.activate();
+    nav_msgs::msg::Path path; path.header.frame_id = "map";
+    path.poses = {makePose(0., 0.), makePose(0., .2), makePose(.6, .2)};
+    controller.setPlan(path);
+    auto pose = makePose(0., 0.); pose.header.stamp = parent->now();
+    auto command = controller.computeVelocityCommands(pose, {}, nullptr);
+    EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.);  // Startup has no input evidence.
+    const auto run = [&](unsigned char cost, double yaw, bool want_motion, bool translation = false) {
+        bool observed = false;
+        risk_state = cost == 254 ? msg::PathRiskState::COLLISION_AHEAD : msg::PathRiskState::CLEARANCE_LOW;
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (std::chrono::steady_clock::now() < deadline && !observed) {
+          pose = makePose(0., yaw); pose.header.stamp = parent->now();
+          geometry_msgs::msg::TransformStamped transform;
+          transform.header = pose.header; transform.child_frame_id = "base_link";
+          transform.transform.rotation = pose.pose.orientation; tf->setTransform(transform, "test", false);
+          map_stamp = pose.header.stamp;
+          {
+            std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(*live->getMutex());
+            std::fill_n(live->getCharMap(), 40000, cost);
+          }
+          geometry_msgs::msg::PolygonStamped footprint; footprint.header = pose.header;
+          for (auto xy : {std::pair<float, float>{-.1, -.1}, {.1, -.1}, {.1, .1}, {-.1, .1}}) {
+            geometry_msgs::msg::Point32 p;
+            p.x = xy.first * std::cos(yaw) - xy.second * std::sin(yaw);
+            p.y = xy.first * std::sin(yaw) + xy.second * std::cos(yaw);
+            footprint.polygon.points.push_back(p);
+          }
+          footprint_pub->publish(footprint);
+          sensor_msgs::msg::LaserScan scan; scan.header = pose.header;
+          scan.angle_max = .1; scan.angle_increment = .1; scan.range_min = .1; scan.range_max = 10.;
+          scan.ranges = {1., 2.}; scan_pub->publish(scan);
+          nav_msgs::msg::Odometry odom; odom.header = pose.header; odom.child_frame_id = "base_link";
+          odom_pub->publish(odom);
+          std::this_thread::sleep_for(30ms);
+          const auto odom_deadline = std::chrono::steady_clock::now() + 100ms;
+          const auto motion = PidTrackingControllerTestAccess::motionObservation(controller);
+          bool anchored = false;
+          while (!anchored && std::chrono::steady_clock::now() < odom_deadline) {
+            executor.spin_some();
+            anchored = motion->snapshot(parent->now().nanoseconds())[MotionObservation::Odometry].sample.stamp_ns ==
+                rclcpp::Time(pose.header.stamp).nanoseconds();
+            if (!anchored) {std::this_thread::sleep_for(1ms);}
+          }
+          EXPECT_TRUE(anchored) << "Fixture must deliver the pose-time odometry before control";
+          if (!anchored) {return false;}
+          command = controller.computeVelocityCommands(pose, {}, nullptr);
+          const bool moving = std::hypot(command.twist.linear.x, command.twist.linear.y) > 1e-5 ||
+              std::abs(command.twist.angular.z) > 1e-5;
+          observed = translation ? std::hypot(command.twist.linear.x, command.twist.linear.y) > 1e-5 :
+              moving == want_motion;
+        }
+        return observed;
+      };
+    ASSERT_TRUE(run(0, 0., true));
+    EXPECT_GT(command.twist.angular.z, 0.);
+    ASSERT_TRUE(run(254, 0., false));
+    EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.);
+    // Full footprint still blocked: repeated cycles must not produce stop/go pulses.
+    for (int i = 0; i < 5; ++i) {ASSERT_TRUE(run(254, 0., false));}
+    ASSERT_TRUE(run(0, 0., true));
+    // Actual rotation completion must advance even if a previous gate stop occurred.
+    ASSERT_TRUE(run(0, .2, true, true));
+    controller.deactivate(); controller.activate(); controller.setPlan(path);
+    pose.header.stamp = parent->now();
+    command = controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
+    EXPECT_DOUBLE_EQ(command.twist.linear.x, 0.);
+    EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.);
+    ASSERT_TRUE(run(0, 0., true));
+    controller.deactivate(); controller.cleanup(); costmap->cleanup();
   }
   rclcpp::shutdown();
 }

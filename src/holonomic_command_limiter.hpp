@@ -79,6 +79,7 @@ public:
     return seeded_ ? std::optional<HolonomicBodyCommand>{previous_command_} : std::nullopt;
   }
 
+  // Computes a candidate, not a safety release; the downstream gate logs release.
   HolonomicCommandLimitResult limit(
     const HolonomicBodyCommand & raw,
     const HolonomicBodyCommand & measured,

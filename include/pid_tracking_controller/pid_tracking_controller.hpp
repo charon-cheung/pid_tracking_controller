@@ -2,6 +2,8 @@
 #define PID_TRACKING_CONTROLLER__PID_TRACKING_CONTROLLER_HPP_
 
 #include <atomic>
+#include <chrono>
+#include <vector>
 #include <cstddef>
 #include <memory>
 #include <limits>
@@ -28,8 +30,11 @@ namespace pid_tracking_controller
 class PidTrackingControllerTestAccess;
 class PathProgressTracker;
 class TrackingProgressPublisher;
-class ExecutionSafetyAdapter;
+class ExecutionSafetyInputs;
+struct NominalTransitionAssumptions;
+class ExecutionSafetyGate;
 class MotionObservation;
+class MotionTransitionObserver;
 class RotationCompletionTracker;
 class RotationEntryGate;
 class RotationVelocityPlanner;
@@ -71,6 +76,8 @@ public:
 private:
   friend class PidTrackingControllerTestAccess;
 
+  void startExecutionSafety();
+  void stopExecutionSafety();
   void resetRotationState(bool preserve_braking = false);
   geometry_msgs::msg::TwistStamped computeHolonomicCommand(
     const geometry_msgs::msg::PoseStamped & pose,
@@ -119,7 +126,16 @@ private:
   std::string controller_plugin_name;
 
   std::unique_ptr<TrackingProgressPublisher> tracking_progress_pub_;
-  std::unique_ptr<ExecutionSafetyAdapter> execution_safety_adapter_;
+  rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
+  std::shared_ptr<ExecutionSafetyInputs> execution_safety_inputs_;
+  std::unique_ptr<NominalTransitionAssumptions> nominal_transition_;
+  std::string observed_smoothed_topic_;
+  std::vector<rclcpp::SubscriptionBase::SharedPtr> safety_subscriptions_;
+  rclcpp::TimerBase::SharedPtr observation_timer_;
+  std::shared_ptr<MotionTransitionObserver> transition_observer_;
+  int64_t safety_pose_stamp_{0};
+  std::chrono::steady_clock::time_point safety_pose_received_{};
+  std::unique_ptr<ExecutionSafetyGate> execution_safety_gate_;
   std::shared_ptr<MotionObservation> motion_observation_;
   std::size_t plan_revision_{0};
   double last_diagnostics_log_time_seconds_{0.0};

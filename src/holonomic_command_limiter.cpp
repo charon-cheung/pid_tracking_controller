@@ -276,7 +276,6 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     previous_command_ = result.command;
     seeded_ = true;
     rotation_direction_ = 0.0;
-    logSafetyState(HolonomicSafetyMode::kInactive, result.command, measured, dt, "normal_limit");
     return result;
   }
 
@@ -357,7 +356,6 @@ HolonomicCommandLimitResult HolonomicCommandLimiter::limit(
     applyExternalSpeedLimit(result.command, external_speed_limit);
   result.stopping_limit_unreachable = translationSpeed(result.command) > stopping_speed_limit;
   previous_command_ = result.command;
-  logSafetyState(HolonomicSafetyMode::kInactive, result.command, measured, dt, "normal_limit");
   return result;
 }
 

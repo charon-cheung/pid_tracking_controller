@@ -19,7 +19,8 @@
 #include "angles/angles.h"
 #include "angular_velocity_feedback_filter.hpp"
 #include "fixed_heading_yaw_gate.hpp"
-#include "execution_safety_adapter.hpp"
+#include "execution_safety_inputs.hpp"
+#include "execution_safety_gate.hpp"
 #include "holonomic_command_limiter.hpp"
 #include "holonomic_control_law.hpp"
 #include "holonomic_speed_planner.hpp"
@@ -152,7 +153,9 @@ void PidTrackingController::configure(
         throw std::runtime_error("PidTrackingController requires a valid local costmap");
     }
 
-    execution_safety_adapter_.reset();
+    execution_safety_gate_.reset();
+    stopExecutionSafety();
+    nominal_transition_.reset();
     motion_observation_.reset();
     controller_plugin_name = std::move(name);
     control_time_valid_ = false;
@@ -338,6 +341,7 @@ void PidTrackingController::configure(
             yaw_gate_config.enabled ? "true" : "false",
             yaw_gate_config.enter_error, yaw_gate_config.exit_error);
     
+    node_ = node;
     costmap_ros_ = std::move(costmap_ros);
     costmap_ = costmap_ros_->getCostmap();
 
@@ -348,10 +352,14 @@ void PidTrackingController::configure(
 
     declare_parameter_if_not_declared(node, controller_plugin_name + ".observe_execution_inputs",
             rclcpp::ParameterValue(false));
-    if (node->get_parameter(controller_plugin_name + ".observe_execution_inputs").as_bool()) {
+    declare_parameter_if_not_declared(node, controller_plugin_name + ".execution_safety.enabled",
+            rclcpp::ParameterValue(false));
+    const bool safety_enabled = node->get_parameter(
+            controller_plugin_name + ".execution_safety.enabled").as_bool();
+    if (safety_enabled || node->get_parameter(controller_plugin_name + ".observe_execution_inputs").as_bool()) {
         declare_parameter_if_not_declared(node, controller_plugin_name + ".observed_smoothed_velocity_topic",
                 rclcpp::ParameterValue("cmd_vel_smoothed"));
-        // Controller limits define an observation hypothesis, not actuator guarantees.
+        // Controller limits define a nominal hypothesis, not actuator guarantees.
         double controller_frequency = 0.;
         node->get_parameter("controller_frequency", controller_frequency);
         NominalTransitionAssumptions nominal;
@@ -364,9 +372,10 @@ void PidTrackingController::configure(
         nominal.braking_deceleration = {speed_config.stopping_deceleration,
                 speed_config.stopping_deceleration, limiter_config.max_alpha};
         motion_observation_ = std::make_shared<MotionObservation>(base_frame_);
-        execution_safety_adapter_ = std::make_unique<ExecutionSafetyAdapter>(node, costmap_ros_, tf_,
-                motion_observation_, node->get_parameter(
-                controller_plugin_name + ".observed_smoothed_velocity_topic").as_string(), nominal);
+        nominal_transition_ = std::make_unique<NominalTransitionAssumptions>(nominal);
+        observed_smoothed_topic_ = node->get_parameter(
+                controller_plugin_name + ".observed_smoothed_velocity_topic").as_string();
+        if (safety_enabled) {execution_safety_gate_ = std::make_unique<ExecutionSafetyGate>(nominal);}
     }
     if (omega_filter_tau > 0.0 || motion_observation_) {
         declare_parameter_if_not_declared(node, "odom_topic", rclcpp::ParameterValue("odom"));
@@ -403,7 +412,7 @@ void PidTrackingController::configure(
 
     declare_parameter_if_not_declared(node, controller_plugin_name + ".publish_tracking_progress",
             rclcpp::ParameterValue(false));
-    if (node->get_parameter(controller_plugin_name + ".publish_tracking_progress").as_bool()) {
+    if (safety_enabled || node->get_parameter(controller_plugin_name + ".publish_tracking_progress").as_bool()) {
         tracking_progress_pub_ = std::make_unique<TrackingProgressPublisher>(node);
     }
 
@@ -453,7 +462,8 @@ void PidTrackingController::configure(
 
 void PidTrackingController::activate()
 {
-    if (execution_safety_adapter_) {execution_safety_adapter_->start();}
+    if (execution_safety_gate_) {execution_safety_gate_->reset();}
+    startExecutionSafety();
     if (tracking_progress_pub_) {tracking_progress_pub_->activate();}
     control_time_valid_ = false;
     if (omega_feedback_filter_) {
@@ -471,7 +481,8 @@ void PidTrackingController::activate()
 
 void PidTrackingController::deactivate()
 {
-    if (execution_safety_adapter_) {execution_safety_adapter_->stop();}
+    if (execution_safety_gate_) {execution_safety_gate_->reset();}
+    stopExecutionSafety();
     if (tracking_progress_pub_) {tracking_progress_pub_->deactivate();}
     control_time_valid_ = false;
     if (omega_feedback_filter_) {
@@ -488,7 +499,9 @@ void PidTrackingController::deactivate()
 
 void PidTrackingController::cleanup()
 {
-    execution_safety_adapter_.reset();
+    execution_safety_gate_.reset();
+    stopExecutionSafety();
+    nominal_transition_.reset();
     motion_observation_.reset();
     tracking_progress_pub_.reset();
     control_time_valid_ = false;
@@ -510,6 +523,7 @@ void PidTrackingController::cleanup()
 
 void PidTrackingController::reset()
 {
+    if (execution_safety_gate_) {execution_safety_gate_->reset();}
     if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
     // The next task seeds the planner and limiter from measured velocity.
     control_time_valid_ = false;
@@ -679,23 +693,60 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     if (braking) {
         raw.vx = raw.vy = raw.omega = 0.0;
     }
-    const auto limited = holonomic_command_limiter_->limit(
+    const auto accepted_output = reseed ? std::nullopt : holonomic_command_limiter_->previousCommand();
+    auto limited = holonomic_command_limiter_->limit(
             {raw.vx, raw.vy, raw.omega},
             limiter_measured,
             reseed ? 0.0 : dt, cap, speed_plan.stopping_speed_limit, rotating && !braking);
-    last_commanded_planar_speed_ = std::hypot(limited.command.vx, limited.command.vy);
     geometry_msgs::msg::TwistStamped command;
     command.header.frame_id = base_frame_;
     command.header.stamp = now;
     command.twist.linear.x = limited.command.vx;
     command.twist.linear.y = limited.command.vy;
     command.twist.angular.z = limited.command.omega;
+    if (motion_observation_) {motion_observation_->record(MotionObservation::Candidate,
+        command.header, command.twist, command.header.frame_id, plan_revision_);}
+    bool safety_inhibited = false;
+    if (execution_safety_gate_) {
+        const auto started = ExecutionSafetyGate::Wall::now();
+        const auto pose_stamp = rclcpp::Time(pose.header.stamp).nanoseconds();
+        if (pose_stamp != safety_pose_stamp_) {
+            safety_pose_stamp_ = pose_stamp; safety_pose_received_ = started;
+        }
+        auto geometry = execution_safety_inputs_ ? execution_safety_inputs_->capture(
+                pose, now, *tf_, *costmap_ros_->getLayeredCostmap(), safety_pose_received_) :
+                SafetyInputResult{std::nullopt, "inputs_inactive", ""};
+        const auto map_stamp = geometry.snapshot ?
+                rclcpp::Time(geometry.snapshot->header.stamp).nanoseconds() : 0;
+        const auto candidate = limited.command;
+        const auto risk = execution_safety_inputs_ ? execution_safety_inputs_->pathRisk(
+                tracking_progress_pub_->state(), now) : PathRiskTrigger{};
+        const auto decision = execution_safety_gate_->apply(geometry, motion_observation_->history(),
+                pose_stamp, now.nanoseconds(), plan_revision_, candidate, measured,
+                reseed ? 0.0 : dt, accepted_output, *holonomic_command_limiter_, started, risk);
+        limited.command = decision.command;
+        safety_inhibited = decision.inhibited;
+        if (safety_inhibited) {
+            const double tangent = reference.current.path_tangent - yaw;
+            holonomic_speed_planner_->seed(std::max(0.0,
+                    decision.command.vx * std::cos(tangent) + decision.command.vy * std::sin(tangent)));
+        }
+        execution_safety_gate_->report(logger_, decision, candidate, plan_revision_, now.nanoseconds(),
+                pose_stamp, map_stamp, std::chrono::duration<double, std::milli>(
+                ExecutionSafetyGate::Wall::now() - started).count());
+        command.twist.linear.x = decision.command.vx;
+        command.twist.linear.y = decision.command.vy;
+        command.twist.angular.z = decision.command.omega;
+    }
+    last_commanded_planar_speed_ = std::hypot(limited.command.vx, limited.command.vy);
     if (!twistIsFinite(command.twist)) {
         throw std::domain_error("holonomic command is non-finite");
     }
 
     RotationCompletionStatus completion;
     const bool previous_candidate = rotation_ack_candidate_;
+    // Stop/rotation evidence uses the actual gated output. It must continue
+    // while inhibited, otherwise a zero-command rotation entry can never finish.
     if (braking) {
         rotation_entry_gate_->observeBraking(measured, limited.command, reseed ? 0.0 : dt);
     } else if (rotating) {
@@ -948,8 +999,6 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
             resetRotationState();
             force_diagnostics_log_ = true;
         }
-        if (motion_observation_) {motion_observation_->record(MotionObservation::Candidate,
-            command.header, command.twist, command.header.frame_id, plan_revision_);}
         return command;
     } catch (const nav2_core::InvalidPath &) {
         if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
