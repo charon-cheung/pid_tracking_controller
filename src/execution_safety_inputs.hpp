@@ -37,6 +37,7 @@ struct SafetyInputOptions
   double map_update_period{0.1};
   std::size_t max_cells{1000000};
   double budget_seconds{0.01};
+  bool simulation{false};  // Existing use_sim_time selects bounded callback skew tolerance.
 };
 
 struct SafetyInputSnapshot

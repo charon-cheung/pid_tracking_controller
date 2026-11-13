@@ -1,5 +1,6 @@
 #include <chrono>
 #include <limits>
+#include <thread>
 #include "gtest/gtest.h"
 #include "execution_safety_gate.hpp"
 
@@ -24,7 +25,7 @@ protected:
   {
     SafetyInputSnapshot s;
     s.map = std::make_unique<nav2_costmap_2d::Costmap2D>(200, 200, .05, -5., -5., 0);
-    s.pose = {0., 0., 0.};
+    s.pose = {0., 0., 0.}; s.header.frame_id = "map";
     for (auto xy : {std::pair<double, double>{-.1, -.1}, {.1, -.1}, {.1, .1}, {-.1, .1}}) {
       geometry_msgs::msg::Point p; p.x = xy.first; p.y = xy.second; s.footprint.push_back(p);
     }
@@ -35,6 +36,7 @@ protected:
     double dt = .1, Wall::time_point started = Wall::now())
   {
     now += 100000000LL;
+    if (refresh_risk) {risk.evidence_stamp_ns = now;}
     auto & series = h.odometry; series = {};
     auto & s = series.samples[0];
     s.vx = measured.vx; s.vy = measured.vy; s.omega = measured.omega;
@@ -42,6 +44,14 @@ protected:
     s.payload = "valid"; s.frame = "base"; series.size = series.next = 1;
     return gate.apply(geometry, h, now, now, revision, candidate, measured,
       dt, limiter.previousCommand(), limiter, started, risk);
+  }
+  void settle()
+  {for (int i = 0; i < 8; ++i) {step({});}}
+  bool refresh_risk{true};
+  void red(double distance)
+  {
+    risk.state = msg::PathRiskState::COLLISION_AHEAD;
+    risk.distance = distance; risk.pose.x = distance; risk.frame = "map";
   }
   void wall(double x)
   {
@@ -59,26 +69,94 @@ protected:
   uint64_t revision{1};
 };
 
-TEST_F(GateTest, PathClearSkipsSweepAndHazardsReenableItWithoutRetainingAnOldStop)
+TEST_F(GateTest, ClearAndNewPathCannotReleaseOngoingBraking)
+{
+  limiter.seed({.4, 0., 0.}); wall(.30);
+  ASSERT_TRUE(step({.5, 0., 0.}, {.4, 0., 0.}).inhibited);
+  geometry.snapshot->map->resetMap(0, 0, 200, 200);
+  risk.state = msg::PathRiskState::CLEAR;
+  ++revision;
+  const auto result = step({.5, 0., 0.}, {.4, 0., 0.});
+  EXPECT_TRUE(result.inhibited);
+  EXPECT_LT(result.command.vx, .4);
+}
+
+TEST_F(GateTest, PathClearSkipsSweepOnlyWhileTracking)
 {
   wall(.30);
-  for (auto state : {msg::PathRiskState::CLEARANCE_LOW, msg::PathRiskState::COLLISION_AHEAD}) {
-    risk.state = state;
-    limiter.seed({.4, 0., 0.});
-    const auto blocked = step({.5, 0., 0.}, {.4, 0., 0.});
-    ASSERT_EQ(blocked.candidate.status, SweepStatus::kCollision);
-    ASSERT_TRUE(blocked.inhibited); EXPECT_TRUE(blocked.sweep_requested);
-    risk.state = msg::PathRiskState::CLEAR;
-    const auto bypass = step({.5, -.2, .1}, {.4, 0., 0.});
-    EXPECT_FALSE(bypass.inhibited); EXPECT_FALSE(bypass.sweep_requested);
-    EXPECT_STREQ(bypass.action, "path_clear_bypass");
-    // Deliberately contradictory map: verify bypass, not accidental sweep success.
-    EXPECT_EQ(bypass.candidate.status, SweepStatus::kUnavailable);
-    EXPECT_STREQ(bypass.candidate.reason, "not_checked_path_clear");
-    EXPECT_DOUBLE_EQ(bypass.command.vx, .5); EXPECT_DOUBLE_EQ(bypass.command.vy, -.2);
-    EXPECT_DOUBLE_EQ(bypass.command.omega, .1);
-    EXPECT_DOUBLE_EQ(limiter.previousCommand()->vx, .5);
+  risk.state = msg::PathRiskState::CLEAR;
+  const auto bypass = step({.5, -.2, .1}, {.4, 0., 0.});
+  EXPECT_FALSE(bypass.inhibited); EXPECT_FALSE(bypass.sweep_requested);
+  EXPECT_STREQ(bypass.action, "path_clear_bypass");
+  EXPECT_STREQ(bypass.candidate.reason, "not_checked_path_clear");
+  risk.state = msg::PathRiskState::CLEARANCE_LOW;
+  EXPECT_TRUE(step({.5, 0., 0.}, {.4, 0., 0.}).inhibited);
+}
+
+TEST_F(GateTest, FarRedAllowsApproachNearRedStopsAndCannotPulseAtTinySpeed)
+{
+  red(2.);
+  EXPECT_FALSE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  red(.15);
+  const auto boundary = step({.3, 0., 0.}, {.3, 0., 0.});
+  ASSERT_TRUE(boundary.inhibited);
+  EXPECT_EQ(boundary.candidate.status, SweepStatus::kClear);
+  EXPECT_EQ(boundary.reason, "path_braking_boundary");
+  for (int i = 0; i < 50; ++i) {
+    const auto d = step({.005, 0., 0.}, *limiter.previousCommand());
+    EXPECT_TRUE(d.inhibited);
   }
+  EXPECT_DOUBLE_EQ(limiter.previousCommand()->vx, 0.);
+  // A yellow path can restart; CLEAR is not a prerequisite.
+  risk.state = msg::PathRiskState::CLEARANCE_LOW;
+  EXPECT_TRUE(step({.03, 0., 0.}).inhibited);
+  EXPECT_TRUE(step({.03, 0., 0.}).inhibited);
+  EXPECT_FALSE(step({.03, 0., 0.}).inhibited);
+}
+
+TEST_F(GateTest, RepeatedRiskFrameCannotAccumulateRestartConfirmations)
+{
+  geometry.reason = "missing"; auto saved = std::move(geometry.snapshot); geometry.snapshot.reset();
+  step({}); geometry.snapshot = std::move(saved); geometry.reason = "ready";
+  settle(); refresh_risk = false;
+  for (int i = 0; i < 8; ++i) {EXPECT_TRUE(step({.03, 0., 0.}).inhibited);}
+  refresh_risk = true;
+  EXPECT_TRUE(step({.03, 0., 0.}).inhibited);
+  EXPECT_FALSE(step({.03, 0., 0.}).inhibited);
+}
+
+TEST_F(GateTest, YellowAloneNeverStopsSafeMotion)
+{
+  wall(.35);  // Adjacent wall, lateral command remains clear.
+  for (int i = 0; i < 20; ++i) {
+    const auto d = step({0., .1, 0.}, {0., .1, 0.});
+    EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vy, .1);
+  }
+}
+
+TEST_F(GateTest, NominalIssuedMotionCannotDisappearWithZeroLatestOutputAndOdometry)
+{
+  auto n = nominal(); n.delay = .5;
+  gate = ExecutionSafetyGate(n, ExecutionSafetyOptions{.025, 512, 500000, .2});
+  risk.state = msg::PathRiskState::CLEAR;
+  step({.6, 0., 0.}); step({});
+  geometry.snapshot->map = std::make_unique<nav2_costmap_2d::Costmap2D>(400, 400, .005, -1., -1., 0);
+  wall(.105);
+  risk.state = msg::PathRiskState::CLEARANCE_LOW;
+  const auto d = step({});
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.candidate.status, SweepStatus::kCollision);
+}
+
+TEST_F(GateTest, NewerMovingOdometryVetoesStoppedAnchor)
+{
+  auto saved = std::move(geometry.snapshot); geometry.snapshot.reset(); step({});
+  geometry.snapshot = std::move(saved); geometry.reason = "ready"; settle();
+  auto & series = h.odometry;
+  series.samples[1] = series.samples[0]; series.samples[1].stamp_ns = now + 50000000LL;
+  series.samples[1].count = 2; series.samples[1].vx = .1; series.size = series.next = 2;
+  const auto d = gate.apply(geometry, h, now, now + 100000000LL, revision, {.03, 0., 0.}, {},
+    .1, limiter.previousCommand(), limiter, Wall::now(), risk);
+  EXPECT_TRUE(d.inhibited); EXPECT_FALSE(d.stopped);
 }
 
 TEST_F(GateTest, UnavailableRiskAndMissingGeometryCannotUseClearBypass)
@@ -116,6 +194,11 @@ TEST(PathRiskTrigger, OnlyFreshMatchingLoadedPathEvidenceCanSkipOrRequestTheSwee
   for (auto state : {Risk::CLEAR, Risk::CLEARANCE_LOW, Risk::COLLISION_AHEAD}) {
     auto value = valid; value.state = state; EXPECT_EQ(check(value).state, state);
   }
+  auto first = valid; first.header.stamp = rclcpp::Time(now - 30000000LL);
+  const auto source_evidence = check(first).evidence_stamp_ns;
+  EXPECT_EQ(check(valid).evidence_stamp_ns, source_evidence);
+  auto new_source = valid; new_source.progress_stamp = rclcpp::Time(now - 10000000LL);
+  EXPECT_GT(check(new_source).evidence_stamp_ns, source_evidence);
   EXPECT_EQ(validatePathRisk(nullptr, wall, current, now, wall).state, Risk::UNAVAILABLE);
   for (int mutation = 0; mutation < 14; ++mutation) {
     SCOPED_TRACE(mutation);
@@ -193,6 +276,7 @@ TEST_F(GateTest, RecoveryUsesCurrentLowSpeedAndDirectionAfterRejectedFastMotion)
   // Standstill after braking. The old high-speed target still intersects the wall,
   // but a new lateral correction and low-speed restart fit in the available space.
   limiter.seed({});
+  settle();
   EXPECT_TRUE(step({}).inhibited);
   EXPECT_TRUE(step({0., .05, 0.}).inhibited);
   EXPECT_TRUE(step({0., .05, 0.}).inhibited);
@@ -213,6 +297,7 @@ TEST_F(GateTest, TinyClearCandidateCannotReleaseAnUnsafeSustainedRestart)
   geometry.snapshot = std::move(saved); geometry.reason = "ready";
   geometry.snapshot->map = std::make_unique<nav2_costmap_2d::Costmap2D>(400, 400, .005, -1., -1., 0);
   wall(.115);
+  settle();
   for (int i = 0; i < 5; ++i) {
     const auto d = step({.08, 0., 0.});
     EXPECT_EQ(d.candidate.status, SweepStatus::kClear);
@@ -263,6 +348,7 @@ TEST_F(GateTest, PathRevisionAndInputGapResetResumeConfirmation)
   auto saved = std::move(geometry.snapshot); geometry.snapshot.reset();
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
   geometry.snapshot = std::move(saved); geometry.reason = "ready";
+  settle();
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
   ++revision;
@@ -270,6 +356,7 @@ TEST_F(GateTest, PathRevisionAndInputGapResetResumeConfirmation)
   ++h.dropped;
   const auto gap = step({.05, 0., 0.});
   EXPECT_TRUE(gap.inhibited); EXPECT_EQ(gap.reason, "odometry_history_gap");
+  settle();
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
   EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
   EXPECT_FALSE(step({.05, 0., 0.}).inhibited);
@@ -308,25 +395,31 @@ TEST_F(GateTest, RealHistoryResetsCannotReuseOldClearAuthorizationWithoutLogging
     };
   const auto run = [&]() {
       const auto history = motion.history(now, revision);
+      risk.evidence_stamp_ns = now;
       return gate.apply(geometry, history, now, now, revision, {.2, 0., 0.}, {}, .1,
         limiter.previousCommand(), limiter, Wall::now(), risk);
+    };
+  const auto recover = [&]() {
+      SafetyGateDecision d;
+      for (int i = 0; i < 12; ++i) {now += 100000000LL; record(); d = run();}
+      EXPECT_FALSE(d.inhibited);
     };
   record(); EXPECT_FALSE(run().inhibited);
   // A new plan discards even a just-received old-plan velocity sample.
   now += 100000000LL; record(); ++revision;
   EXPECT_TRUE(run().inhibited);
-  now += 100000000LL; record(); EXPECT_FALSE(run().inhibited);
+  recover();
   // Clock rollback must be fenced without any timer or logger call.
   now -= 1000000000LL;
   EXPECT_TRUE(run().inhibited);
-  now += 100000000LL; record(); EXPECT_FALSE(run().inhibited);
+  recover();
   // Same-stamp conflicting velocities cannot be silently resolved by picking latest.
   now += 100000000LL; record(0.); record(.3);
   const auto ambiguous = run();
   EXPECT_TRUE(ambiguous.inhibited); EXPECT_EQ(ambiguous.reason, "odometry_anchor_ambiguous");
   motion.deactivate(); motion.activate(); now += 100000000LL;
   EXPECT_TRUE(run().inhibited);
-  now += 100000000LL; record(); EXPECT_FALSE(run().inhibited);
+  recover();
 }
 
 TEST_F(GateTest, ValidTenMillisecondFutureOdometryDoesNotHideExactPoseAnchor)
@@ -339,6 +432,154 @@ TEST_F(GateTest, ValidTenMillisecondFutureOdometryDoesNotHideExactPoseAnchor)
   result = gate.apply(geometry, h, now, now + 100000000LL, revision, {.2, 0., 0.}, {}, .1,
     limiter.previousCommand(), limiter, Wall::now(), risk);
   EXPECT_FALSE(result.inhibited);
+}
+
+TEST_F(GateTest, SimulationAcceptsBoundedPoseAndOdometrySkewButStillRejectsInvalidData)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  risk.state = msg::PathRiskState::CLEAR;
+  ASSERT_FALSE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  for (const int64_t skew : {-50000000LL, 10000000LL}) {
+    now += 100000000LL;
+    h.odometry.samples[0].stamp_ns = now + skew;
+    h.odometry.samples[0].received = Wall::now();
+    ++h.dropped;  // A missed callback is harmless when a recent usable sample exists.
+    const auto d = gate.apply(geometry, h, now + 10000000LL, now, revision,
+      {.3, 0., 0.}, {.3, 0., 0.}, .1, limiter.previousCommand(), limiter, Wall::now(), risk);
+    EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, .3);
+  }
+  now += 100000000LL;
+  h.odometry.samples[0].stamp_ns = now - 150000000LL;
+  auto d = gate.apply(geometry, h, now, now, revision, {.3, 0., 0.}, {.3, 0., 0.},
+    .1, limiter.previousCommand(), limiter, Wall::now(), risk);
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.reason, "odometry_anchor_missing");
+  now += 100000000LL; h.odometry.samples[0].stamp_ns = now;
+  h.odometry.samples[0].payload = "nonfinite_velocity";
+  d = gate.apply(geometry, h, now, now, revision, {.3, 0., 0.}, {.3, 0., 0.},
+    .1, limiter.previousCommand(), limiter, Wall::now(), risk);
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.reason, "odometry_invalid");
+}
+
+TEST_F(GateTest, SimulationRepeatedControlTickPreservesOutputAndStillChecksCollision)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  ASSERT_FALSE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  auto run = [&]() {
+      // Matches the controller's nonpositive-dt reseed: no accepted-output argument.
+      return gate.apply(geometry, h, now, now, revision, {}, {.3, 0., 0.}, 0.,
+        std::nullopt, limiter, Wall::now(), risk);
+    };
+  auto d = run(); EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, .3);
+  wall(.1);
+  d = run(); EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.candidate.status, SweepStatus::kCollision);
+  EXPECT_DOUBLE_EQ(d.command.vx, 0.);
+}
+
+TEST_F(GateTest, SimulationRepeatUsesTheLastSafetyOutputAfterSameStampInputRecovery)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  ASSERT_FALSE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  auto run = [&]() {
+      return gate.apply(geometry, h, now, now, revision, {}, {.3, 0., 0.}, 0.,
+        std::nullopt, limiter, Wall::now(), risk);
+    };
+  auto saved = std::move(geometry.snapshot); geometry.snapshot.reset();
+  auto d = run(); ASSERT_TRUE(d.inhibited); ASSERT_DOUBLE_EQ(d.command.vx, 0.);
+  geometry.snapshot = std::move(saved);
+  d = run(); EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, 0.);
+  EXPECT_DOUBLE_EQ(limiter.previousCommand()->vx, 0.);
+  // The next advancing tick may accelerate normally, after fresh safety checks.
+  d = step({.05, 0., 0.}); EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, .05);
+}
+
+TEST_F(GateTest, SimulationRepeatsDoNotEraseObstacleRestartConfirmations)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  wall(.1); ASSERT_TRUE(step({.3, 0., 0.}).inhibited);
+  geometry.snapshot->map->resetMap(0, 0, 200, 200); settle();
+  for (unsigned count = 1; count <= 3; ++count) {
+    auto d = step({.03, 0., 0.});
+    ASSERT_EQ(d.clear_cycles, count);
+    ASSERT_EQ(d.inhibited, count < 3);
+    d = gate.apply(geometry, h, now, now, revision, {}, {}, 0., std::nullopt,
+      limiter, Wall::now(), risk);
+    EXPECT_EQ(d.clear_cycles, count);
+    EXPECT_EQ(d.inhibited, count < 3);
+    EXPECT_DOUBLE_EQ(d.command.vx, count < 3 ? 0. : .03);
+  }
+}
+
+TEST_F(GateTest, SimulationFrozenControlClockCannotKeepPublishingOldMotion)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  risk.state = msg::PathRiskState::CLEAR;
+  ASSERT_FALSE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  std::this_thread::sleep_for(std::chrono::milliseconds(210));
+  auto d = gate.apply(geometry, h, now, now, revision, {.3, 0., 0.}, {.3, 0., 0.},
+    0., std::nullopt, limiter, Wall::now(), risk);
+  EXPECT_TRUE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, 0.);
+  EXPECT_EQ(d.reason, "control_time_or_revision_invalid");
+}
+
+TEST_F(GateTest, SimulationInputRecoveryDoesNotLatchFarRedButNearRedStillStops)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  red(2.3);
+  ASSERT_FALSE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  auto saved = std::move(geometry.snapshot); geometry.snapshot.reset();
+  geometry.reason = "observation_tf_unavailable";
+  EXPECT_TRUE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  geometry.snapshot = std::move(saved); geometry.reason = "ready";
+  auto d = step({.3, 0., 0.}, {.25, 0., 0.});
+  EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, .3);
+  EXPECT_STREQ(d.action, "inputs_recovered");
+  red(.1);
+  ASSERT_TRUE(step({.3, 0., 0.}, {.3, 0., 0.}).inhibited);
+  for (int i = 0; i < 20; ++i) {EXPECT_TRUE(step({.005, 0., 0.}).inhibited);}
+  EXPECT_DOUBLE_EQ(limiter.previousCommand()->vx, 0.);
+}
+
+TEST_F(GateTest, SimulationInitialRiskWaitDoesNotLockAnOtherwiseSafeFarRedApproach)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  risk = PathRiskTrigger();
+  ASSERT_TRUE(step({}).inhibited);
+  red(2.3);
+  const auto d = step({.05, 0., 0.});
+  EXPECT_FALSE(d.inhibited); EXPECT_DOUBLE_EQ(d.command.vx, .05);
+}
+
+TEST_F(GateTest, SimulationRealObstacleStopStillRequiresFullStopAfterRiskClears)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
+  limiter.seed({.4, 0., 0.}); wall(.3);
+  ASSERT_TRUE(step({.5, 0., 0.}, {.4, 0., 0.}).inhibited);
+  geometry.snapshot->map->resetMap(0, 0, 200, 200);
+  risk.state = msg::PathRiskState::CLEAR;
+  const auto d = step({.5, 0., 0.}, {.4, 0., 0.});
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.reason, "braking_not_stopped");
+}
+
+TEST(PathRiskTrigger, SimulationSkewAllowanceDoesNotAcceptExpiredOrWrongPathEvidence)
+{
+  using Risk = msg::PathRiskState;
+  const int64_t now = 2000000000LL; const auto wall = Wall::now();
+  msg::TrackingProgress current;
+  current.valid = true; current.controller_instance = "controller";
+  current.plan_revision = 7; current.path_fingerprint = 42; current.path_header.frame_id = "map";
+  current.header.stamp = rclcpp::Time(now); current.loaded_at = rclcpp::Time(now - 200000000LL);
+  Risk risk;
+  risk.header.frame_id = "map"; risk.header.stamp = rclcpp::Time(now + 10000000LL);
+  risk.progress_stamp = rclcpp::Time(now + 20000000LL); risk.map_stamp = risk.header.stamp;
+  risk.path_header = current.path_header; risk.controller_instance = current.controller_instance;
+  risk.plan_revision = current.plan_revision; risk.path_fingerprint = current.path_fingerprint;
+  risk.state = Risk::CLEAR;
+  auto check = [&]() {return validatePathRisk(&risk, wall, current, now, wall, true);};
+  EXPECT_EQ(check().state, Risk::CLEAR);
+  risk.header.stamp = rclcpp::Time(now + 101000000LL); EXPECT_EQ(check().state, Risk::UNAVAILABLE);
+  risk.header.stamp = rclcpp::Time(now - 400000000LL); EXPECT_EQ(check().state, Risk::UNAVAILABLE);
+  risk.header.stamp = rclcpp::Time(now + 10000000LL); --risk.plan_revision;
+  EXPECT_EQ(check().state, Risk::UNAVAILABLE);
 }
 }  // namespace
 }  // namespace pid_tracking_controller

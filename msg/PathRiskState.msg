@@ -12,3 +12,7 @@ uint64 path_fingerprint
 builtin_interfaces/Time progress_stamp
 builtin_interfaces/Time map_stamp
 uint8 state
+# Distance along the checked path to the first red envelope, measured from progress_stamp.
+# risk_pose is in header.frame_id; it is the robot centre at that envelope, not an obstacle point.
+float64 risk_distance
+geometry_msgs/Point risk_pose

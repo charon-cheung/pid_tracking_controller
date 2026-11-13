@@ -205,8 +205,8 @@ void HolonomicCommandLimiter::logSafetyState(
   if (mode == safety_mode_) {return;}
   const char * names[] = {"released", "braking", "hold", "emergency"};
   RCLCPP_INFO(rclcpp::get_logger("pid_tracking_controller.safety"),
-    "PID_SAFETY brake event=%s reason=%s dt=%.6f command=(%.6f,%.6f,%.6f) "
-    "measured=(%.6f,%.6f,%.6f) physical_stop=unverified", names[static_cast<unsigned>(mode)],
+    "PID_SAFETY brake event=%s reason=%s dt=%.3f command=(%.3f,%.3f,%.3f) "
+    "measured=(%.3f,%.3f,%.3f) physical_stop=unverified", names[static_cast<unsigned>(mode)],
     reason, dt, command.vx, command.vy, command.omega, measured.vx, measured.vy, measured.omega);
   safety_mode_ = mode;
 }

@@ -19,10 +19,10 @@ TrackingProgressPublisher::TrackingProgressPublisher(
   state_.controller_instance = id.str();
 }
 void TrackingProgressPublisher::activate() {publisher_->on_activate(); invalidate();}
-void TrackingProgressPublisher::deactivate() {invalidate(); publisher_->on_deactivate();}
-void TrackingProgressPublisher::invalidate()
+void TrackingProgressPublisher::deactivate() {invalidate(true); publisher_->on_deactivate();}
+void TrackingProgressPublisher::invalidate(bool execution_finished)
 {
-  state_.valid = false;
+  state_.valid = false; state_.execution_finished = execution_finished;
   state_.header.stamp = clock_->now();
   if (publisher_->is_activated()) {publisher_->publish(state_);}
 }
@@ -35,13 +35,14 @@ void TrackingProgressPublisher::loaded(
   state_.path_fingerprint = path_identity::fingerprintPath(path);
   state_.plan_revision = revision;
   state_.loaded_at = clock_->now();
+  state_.safety_inhibited = false;
   invalidate();
 }
 void TrackingProgressPublisher::update(
   const PathProgressReference & progress,
   const geometry_msgs::msg::PoseStamped & pose, bool rotating)
 {
-  state_.header.stamp = clock_->now();
+  state_.header.stamp = clock_->now(); state_.execution_finished = false;
   // The prepared cursor also advances through pure rotations and skipped
   // duplicate poses; the legacy translation projection fields do not.
   const bool has_path = prepared_ && !prepared_->poses.empty();

@@ -28,9 +28,10 @@ std_msgs::msg::Header header(double seconds, const std::string & frame = "map")
   return h;
 }
 
-SafetyInputOptions options()
+SafetyInputOptions options(bool simulation = false)
 {
   SafetyInputOptions o;
+  o.simulation = simulation;
   o.map_frame = "map"; o.base_frame = "base";
   o.sources = {{"scan", .6, "", ""}};
   o.budget_seconds = 1.;  // Functional tests must not depend on machine load.
@@ -64,7 +65,7 @@ struct Fixture
   nav2_costmap_2d::LayeredCostmap map{"map", false, false};
   std::shared_ptr<TestCostmapLayer> layer{std::make_shared<TestCostmapLayer>()};
 
-  Fixture()
+  explicit Fixture(bool simulation = false) : inputs(options(simulation))
   {
     map.resizeMap(60, 60, .1, -3., -3.);
     map.addPlugin(layer); map.updateMap(0., 0., 0.);
@@ -93,6 +94,67 @@ struct Fixture
           wall, wall);
   }
 };
+
+
+TEST(ExecutionSafetyInputs, SimulationAllowsTenMillisecondFutureInputsButKeepsExpiry)
+{
+  Fixture f(true); f.fill(); f.inputs.recordFootprint(footprint(10.01), f.wall);
+  auto read = [&](double pose_time) {
+      return f.inputs.capture(pose(pose_time), rclcpp::Time(10, 0, RCL_ROS_TIME),
+        f.tf, f.map, f.wall, f.wall);
+    };
+  EXPECT_TRUE(read(10.01).snapshot);
+  EXPECT_FALSE(read(10.101).snapshot);
+  EXPECT_FALSE(read(9.6).snapshot);
+}
+
+TEST(ExecutionSafetyInputs, SimulationIdenticalFootprintDoesNotInvalidateOrRenewEvidence)
+{
+  Fixture f(true); f.fill(); ASSERT_TRUE(f.read().snapshot);
+  f.inputs.recordFootprint(footprint(), f.wall + std::chrono::milliseconds(100));
+  EXPECT_TRUE(f.read().snapshot);
+  const auto later = f.wall + std::chrono::milliseconds(601);
+  auto d = f.inputs.capture(pose(), rclcpp::Time(10, 0, RCL_ROS_TIME),
+    f.tf, f.map, later, later);
+  EXPECT_FALSE(d.snapshot); EXPECT_EQ(d.reason, "footprint_missing_or_stale");
+}
+
+TEST(ExecutionSafetyInputs, SimulationConflictingSameStampFootprintRemainsInvalid)
+{
+  Fixture f(true); f.fill(); ASSERT_TRUE(f.read().snapshot);
+  auto changed = footprint(); changed->polygon.points[0].x -= .1;
+  f.inputs.recordFootprint(changed, f.wall);
+  EXPECT_FALSE(f.read().snapshot);
+}
+
+TEST(ExecutionSafetyInputs, SimulationCanUseRecentTransformableScanButNotAnOldOne)
+{
+  Fixture f(true);
+  geometry_msgs::msg::TransformStamped t;
+  t.header = header(9.8); t.child_frame_id = "dynamic_laser"; t.transform.rotation.w = 1.;
+  ASSERT_TRUE(f.tf.setTransform(t, "test", false));
+  t.header = header(9.95); ASSERT_TRUE(f.tf.setTransform(t, "test", false));
+  f.inputs.recordObservation("scan", header(9.91, "dynamic_laser"), true, f.wall);
+  f.inputs.recordObservation("scan", header(9.99, "dynamic_laser"), true, f.wall);
+  f.inputs.recordFootprint(footprint(10.05), f.wall);
+  auto d = f.read(10.05); ASSERT_TRUE(d.snapshot) << d.reason;
+  f.inputs.recordObservation("scan", header(10.10, "dynamic_laser"), true, f.wall);
+  d = f.read(10.10); EXPECT_FALSE(d.snapshot); EXPECT_EQ(d.reason, "observation_tf_unavailable");
+}
+
+TEST(ExecutionSafetyInputs, SimulationTfFallbackRejectsExpiredButRecentlyReceivedScan)
+{
+  Fixture f(true);
+  geometry_msgs::msg::TransformStamped t;
+  t.header = header(9.3); t.child_frame_id = "dynamic_laser"; t.transform.rotation.w = 1.;
+  ASSERT_TRUE(f.tf.setTransform(t, "test", false));
+  t.header = header(9.4); ASSERT_TRUE(f.tf.setTransform(t, "test", false));
+  f.inputs.recordObservation("scan", header(9.36, "dynamic_laser"), true, f.wall);
+  f.inputs.recordObservation("scan", header(9.45, "dynamic_laser"), true, f.wall);
+  f.inputs.recordFootprint(footprint(9.9), f.wall);
+  const auto d = f.read();
+  EXPECT_FALSE(d.snapshot); EXPECT_EQ(d.reason, "observation_tf_unavailable");
+}
 
 TEST(ExecutionSafetyInputs, MissingInputsDoNotProduceASafeSnapshotAndRecover)
 {

@@ -24,10 +24,11 @@ int64_t stamp(const builtin_interfaces::msg::Time & t)
 
 bool positive(double x) {return std::isfinite(x) && x > 0.;}
 
-bool fresh(const std_msgs::msg::Header & h, int64_t now, double age)
+bool fresh(const std_msgs::msg::Header & h, int64_t now, double age, bool simulation = false)
 {
   const auto t = stamp(h.stamp);
-  return !h.frame_id.empty() && t > 0 && t <= now && (now - t) * 1e-9 <= age;
+  return !h.frame_id.empty() && t > 0 && t - now <= (simulation ? 100000000LL : 0LL) &&
+         (now - t) * 1e-9 <= age;
 }
 
 bool planar(const geometry_msgs::msg::Pose & p)
@@ -63,6 +64,9 @@ void ExecutionSafetyInputs::recordFootprint(
 {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto t = footprint ? stamp(footprint->header.stamp) : 0;
+  // Identical simulation callbacks are not new evidence and do not renew receipt age.
+  if (options_.simulation && footprint && footprint_ && t == footprint_stamp_ &&
+    *footprint == *footprint_) {return;}
   if (t <= footprint_stamp_) {footprint_.reset(); return;}
   footprint_stamp_ = t; footprint_received_ = received; footprint_ = std::move(footprint);
 }
@@ -127,12 +131,13 @@ SafetyInputResult ExecutionSafetyInputs::capture(
       if (!result.snapshot) {cached_map_ = {};}
       result.reason = reason;
       const auto grid = result.snapshot ? (reused_map ? "cached" : "direct") : "none";
-      const auto key = result.reason + ":" + result.source + ":" + grid;
+      // Cache reuse is normal; only readiness/reason/source changes need INFO.
+      const auto key = std::string(result.snapshot ? "ready:" : "unavailable:") +
+        result.reason + ":" + result.source;
       if (key != last_log_key_) {
         RCLCPP_INFO(rclcpp::get_logger("PidTrackingController"),
-          "PID_SAFETY inputs ready=%s reason=%s source=%s grid=%s map_age=%.3f",
-          result.snapshot ? "true" : "false", reason, result.source.c_str(), grid,
-          result.snapshot ? (now_ns - stamp(result.snapshot->header.stamp)) * 1e-9 : -1.);
+          "PID_SAFETY inputs ready=%s reason=%s source=%s grid=%s",
+          result.snapshot ? "true" : "false", reason, result.source.c_str(), grid);
         last_log_key_ = key;
       }
       return std::move(result);
@@ -163,12 +168,12 @@ SafetyInputResult ExecutionSafetyInputs::capture(
     footprint_received = footprint_received_;
   }
   if (configuration_changed_) {return finish("configuration_changed_reactivate");}
-  if (!footprint || !fresh(footprint->header, now_ns, options_.max_age) ||
+  if (!footprint || !fresh(footprint->header, now_ns, options_.max_age, options_.simulation) ||
     !wall_fresh(footprint_received, options_.max_age))
   {
     return finish("footprint_missing_or_stale");
   }
-  if (!fresh(pose.header, now_ns, options_.pose_max_age) ||
+  if (!fresh(pose.header, now_ns, options_.pose_max_age, options_.simulation) ||
     !wall_fresh(pose_received, options_.pose_max_age) || !planar(pose.pose))
   {
     return finish("pose_invalid_or_stale");
@@ -180,7 +185,7 @@ SafetyInputResult ExecutionSafetyInputs::capture(
     std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t> lock(*map.getMutex(), std::try_to_lock);
     if (!lock.owns_lock()) {
       if (!cached_map_.map || cached_map_.owner != &costmap) {return finish("map_busy");}
-      if (!fresh(cached_map_.footprint->header, now_ns, options_.max_age) ||
+      if (!fresh(cached_map_.footprint->header, now_ns, options_.max_age, options_.simulation) ||
         !wall_fresh(cached_map_.received, options_.max_age))
       {return finish("cached_map_stale");}
       // Keep the grid's original update witness, never the latest callback stamp.
@@ -220,10 +225,22 @@ SafetyInputResult ExecutionSafetyInputs::capture(
     result.source = observation.source.name;
     if (observation.samples.empty() ||
       !wall_fresh(observation.received, observation.source.max_age) ||
-      !fresh(observation.samples.back().first, now_ns, observation.source.max_age))
+      !fresh(observation.samples.back().first, now_ns, observation.source.max_age, options_.simulation))
     {return finish("observation_missing_or_stale");}
     const auto & latest = observation.samples.back().first;
-    if (!tf.canTransform(options_.map_frame, latest.frame_id, rclcpp::Time(latest.stamp))) {
+    bool sensor_tf_ready = tf.canTransform(options_.map_frame, latest.frame_id, rclcpp::Time(latest.stamp));
+    if (!sensor_tf_ready && options_.simulation) {
+      // TF may arrive one callback behind the scan. Use actual recent evidence,
+      // never a fabricated timestamp or an indefinitely old latest transform.
+      for (auto it = observation.samples.rbegin(); it != observation.samples.rend(); ++it) {
+        if (stamp(latest.stamp) - stamp(it->first.stamp) > 100000000LL) {break;}
+        if (wall_fresh(it->second, observation.source.max_age) &&
+          fresh(it->first, now_ns, observation.source.max_age, options_.simulation) &&
+          tf.canTransform(options_.map_frame, it->first.frame_id, rclcpp::Time(it->first.stamp)))
+        {sensor_tf_ready = true; break;}
+      }
+    }
+    if (!sensor_tf_ready) {
       return finish("observation_tf_unavailable");
     }
     bool anchored = false;
@@ -301,6 +318,7 @@ SafetyInputResult ExecutionSafetyInputs::capture(
 SafetyInputOptions safetyInputOptions(nav2_costmap_2d::Costmap2DROS & costmap)
 {
   SafetyInputOptions options;
+  options.simulation = costmap.get_parameter("use_sim_time").as_bool();
   options.map_frame = costmap.getGlobalFrameID();
   options.base_frame = costmap.getBaseFrameID();
   const auto rate = costmap.get_parameter("update_frequency").as_double();
@@ -337,7 +355,8 @@ void ExecutionSafetyInputs::subscribe(const rclcpp_lifecycle::LifecycleNode::Sha
   // Fence a parameter change between reading options and installing the callback.
   // Changes after registration invalidate capture through configuration_changed_.
   const auto live = safetyInputOptions(*costmap);
-  if (live.map_frame != options_.map_frame || live.base_frame != options_.base_frame ||
+  if (live.simulation != options_.simulation || live.map_frame != options_.map_frame ||
+    live.base_frame != options_.base_frame ||
     live.map_update_period != options_.map_update_period || live.sources.size() != options_.sources.size() ||
     !std::equal(live.sources.begin(), live.sources.end(), options_.sources.begin(),
       [](const auto & a, const auto & b) {
@@ -403,9 +422,10 @@ void ExecutionSafetyInputs::subscribe(const rclcpp_lifecycle::LifecycleNode::Sha
       }));
   RCLCPP_INFO(node->get_logger(), "PID_SAFETY inputs grid=local_costmap_direct "
     "update_witness=published_footprint busy_map=reuse_unexpired source_count=%zu executor=controller "
-    "map_frame=%s base_frame=%s map_period=%.3f max_age=%.3f budget_ms=%.1f",
+    "map_frame=%s base_frame=%s map_period=%.3f max_age=%.3f budget_ms=%.3f simulation=%d skew_ms=%d",
     options_.sources.size(), options_.map_frame.c_str(), options_.base_frame.c_str(),
-    options_.map_update_period, options_.max_age, options_.budget_seconds * 1000.);
+    options_.map_update_period, options_.max_age, options_.budget_seconds * 1000.,
+    options_.simulation, options_.simulation ? 100 : 0);
 }
 
 void ExecutionSafetyInputs::recordPathRisk(msg::PathRiskState::ConstSharedPtr risk)
@@ -419,7 +439,8 @@ PathRiskTrigger ExecutionSafetyInputs::pathRisk(
 {
   std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
   if (!lock.owns_lock()) {return {msg::PathRiskState::UNAVAILABLE, "inputs_busy"};}
-  return validatePathRisk(path_risk_.get(), risk_received_, current, now.nanoseconds(), Wall::now());
+  return validatePathRisk(path_risk_.get(), risk_received_, current, now.nanoseconds(), Wall::now(),
+    options_.simulation);
 }
 
 }  // namespace pid_tracking_controller

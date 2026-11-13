@@ -25,6 +25,7 @@
 #include "tf2_ros/buffer.h"
 #include "controller_test_access.hpp"
 #include "motion_observation.hpp"
+#include "execution_safety_gate.hpp"
 #include "pid_tracking_controller/msg/tracking_progress.hpp"
 #include "pid_tracking_controller/msg/path_risk_state.hpp"
 #include "pid_tracking_controller/path_identity.hpp"
@@ -119,6 +120,76 @@ geometry_msgs::msg::PoseStamped makePose(double x, double yaw)
 
 
 
+
+TEST(LifecycleSmoke, SafetyLogsKeepTransitionsAndOptInReplayEvidence)
+{
+  rclcpp::init(0, nullptr);
+  ScopedLogCapture logs;
+  auto logger = rclcpp::get_logger("pid_log_summary_test");
+  logger.set_level(rclcpp::Logger::Level::Info);
+  ExecutionSafetyGate gate({.1, .1, {1., 1., 1.}, {1., 1., 1.}, {1., 1., 1.}});
+  MotionObservation::History history;
+  history.state = "ready"; history.epoch = 1;
+  SafetyGateDecision decision;
+  decision.path_risk = msg::PathRiskState::CLEAR;
+  decision.action = "path_clear_bypass"; decision.reason = "path_clear";
+  decision.motion_reason = "ready";
+  decision.candidate.reason = "not_checked_path_clear";
+  decision.resume.reason = "not_required";
+  const auto report = [&](int64_t time) {
+      gate.report(logger, decision, {.2, 0., 0.}, 1, time, time, time, .1, history);
+    };
+  report(1000000000LL);
+  EXPECT_NE(logs.output().find("PID_GATE summary"), std::string::npos);
+  EXPECT_EQ(logs.output().find("candidate_cell="), std::string::npos);
+  EXPECT_EQ(logs.output().find("resume_reason="), std::string::npos);
+  EXPECT_EQ(logs.output().find("PID_MOTION stage="), std::string::npos);
+  EXPECT_EQ(logs.output().find(" now="), std::string::npos);
+  EXPECT_EQ(logs.output().find("pose_age="), std::string::npos);
+  EXPECT_EQ(logs.output().find("map_age="), std::string::npos);
+  const auto first_size = logs.output().size();
+  std::this_thread::sleep_for(1050ms);
+  report(2000000000LL);
+  EXPECT_EQ(logs.output().size(), first_size);  // No healthy one-second INFO heartbeat.
+  decision.inhibited = true; decision.action = "braking"; decision.mode = "braking";
+  decision.reason = "collision"; decision.sweep_requested = true;
+  decision.candidate.status = SweepStatus::kCollision;
+  decision.candidate.reason = "collision"; decision.candidate.time = .125;
+  decision.candidate.pose = {1., 2., .3};
+  geometry_msgs::msg::Point cell; cell.x = 1.1; cell.y = 2.1;
+  decision.candidate.collision_cell = cell;
+  report(2100000000LL);
+  EXPECT_NE(logs.output().find("candidate_cell=(1.100,2.100)"), std::string::npos);
+  EXPECT_NE(logs.output().find("candidate_hit_t=0.125"), std::string::npos);
+  decision.stopped = true; decision.action = "hold"; decision.mode = "stopped";
+  report(2200000000LL);
+  EXPECT_NE(logs.output().find("mode=stopped stopped=1"), std::string::npos);
+  decision.inhibited = false; decision.action = "released"; decision.mode = "tracking";
+  decision.reason = "ready"; decision.resume.status = SweepStatus::kClear;
+  decision.resume.reason = "checked_to_stop"; decision.clear_cycles = 3;
+  report(2300000000LL);
+  EXPECT_NE(logs.output().find("action=released"), std::string::npos);
+  EXPECT_NE(logs.output().find("clear_cycles=3"), std::string::npos);
+  EXPECT_EQ(logs.output().find("pose_age="), std::string::npos);
+  EXPECT_EQ(logs.output().find("map_age="), std::string::npos);
+  decision.reason = "pose_invalid_or_stale";
+  report(2310000000LL);
+  EXPECT_NE(logs.output().find("pose_age=0.000"), std::string::npos);
+  decision.reason = "cached_map_stale";
+  report(2320000000LL);
+  EXPECT_NE(logs.output().find("map_age=0.000"), std::string::npos);
+  decision.reason = "clock_invalid_or_regressed";
+  report(2330000000LL);
+  EXPECT_NE(logs.output().find("now=2.330"), std::string::npos);
+  logger.set_level(rclcpp::Logger::Level::Debug);
+  gate.reset();
+  report(2400000000LL);
+  EXPECT_NE(logs.output().find("PID_MOTION stage=2-A"), std::string::npos);
+  EXPECT_NE(logs.output().find("PID_GATE stage=2-C"), std::string::npos);
+  EXPECT_NE(logs.output().find("now=2.400"), std::string::npos);
+  logger.set_level(rclcpp::Logger::Level::Info);
+  rclcpp::shutdown();
+}
 
 TEST(LifecycleSmoke, publishesCarrotRawCommandAndProgressWithoutPidLogs)
 {
@@ -255,14 +326,24 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndProgressWithoutPidLogs)
     EXPECT_NE(log_capture.output().find("PID_LOG parameter_snapshot_begin"), std::string::npos);
     EXPECT_NE(log_capture.output().find("PID_LOG parameter_snapshot_end"), std::string::npos);
     EXPECT_NE(log_capture.output().find("PID_LOG holonomic plan_revision="), std::string::npos);
-    EXPECT_NE(log_capture.output().find("external_speed_limit="), std::string::npos);
+    EXPECT_EQ(log_capture.output().find("control_now="), std::string::npos);
+    EXPECT_NE(log_capture.output().find(
+      "name=PidTrackingController.fixed_heading_yaw_enter_error type=double value=0.035\n"),
+      std::string::npos);
+    EXPECT_EQ(log_capture.output().find("raw_vx="), std::string::npos);
+    EXPECT_EQ(log_capture.output().find("reference_effective="), std::string::npos);
+    controller.setSpeedLimit(0.1, false);
+    EXPECT_NE(log_capture.output().find("PID_LOG speed_limit external_speed_limit=0.100"),
+      std::string::npos);
+    controller.setSpeedLimit(0.0, false);  // Restore Nav2's no-limit value.
 
     if (costmap_configured) {
       controller.reset();
-      for (int i = 0; i < 20 && received_progress.valid; ++i) {
+      for (int i = 0; i < 20 && (received_progress.valid || !received_progress.execution_finished); ++i) {
         executor.spin_some(); std::this_thread::sleep_for(10ms);
       }
       EXPECT_FALSE(received_progress.valid);
+      EXPECT_TRUE(received_progress.execution_finished);
       EXPECT_EQ(received_progress.controller_instance, instance);
       // Reloading identical geometry is a new execution revision, not a new hash.
       controller.setPlan(makeLifecyclePath());
@@ -271,6 +352,7 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndProgressWithoutPidLogs)
         executor.spin_some(); std::this_thread::sleep_for(10ms);
       }
       EXPECT_TRUE(received_progress.valid);
+      EXPECT_FALSE(received_progress.execution_finished);
       EXPECT_EQ(received_progress.plan_revision, 3u);
       EXPECT_EQ(received_progress.path_fingerprint, path_identity::fingerprintPath(makeLifecyclePath()));
       auto rotation_path = makeLifecyclePath();
@@ -293,10 +375,11 @@ TEST(LifecycleSmoke, publishesCarrotRawCommandAndProgressWithoutPidLogs)
       EXPECT_FALSE(received_progress.rotating);
       EXPECT_EQ(received_progress.segment_index, 3u) << "consumed rotation must publish terminal original index";
       controller.deactivate();
-      for (int i = 0; i < 20 && received_progress.valid; ++i) {
+      for (int i = 0; i < 20 && (received_progress.valid || !received_progress.execution_finished); ++i) {
         executor.spin_some(); std::this_thread::sleep_for(10ms);
       }
       EXPECT_FALSE(received_progress.valid);
+      EXPECT_TRUE(received_progress.execution_finished);
       controller.cleanup();
       costmap->cleanup();
     }

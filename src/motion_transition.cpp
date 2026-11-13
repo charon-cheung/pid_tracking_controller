@@ -91,7 +91,7 @@ MotionTransition buildMotionTransition(const MotionTransitionInput & in)
   const double delay = in.candidate_execution.earliest;
   if (!std::isfinite(delay + in.candidate_duration)) {return out;}
   out.reason = "motion_history_limit";
-  if (in.pending.size() > 16) {return out;}
+  if (in.pending.size() > 64) {return out;}
   out.reason = "active_command_unknown";
   if (delay > 0 && (!in.active_command || !finite(*in.active_command) ||
     !std::isfinite(in.active_valid_for) || in.active_valid_for < 0))

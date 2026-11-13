@@ -51,6 +51,14 @@ def parse_log(text, issues=None):
     for line_no, raw in enumerate(text.splitlines(), 1):
         if 'PID_MOTION ' not in raw and 'PID_GATE ' not in raw:
             continue
+        # Event summaries describe transitions, not complete replay samples.
+        # Lose inferred state across an evidence gap; DEBUG pairs follow summaries.
+        if 'PID_MOTION summary ' in raw or 'PID_GATE summary ' in raw:
+            pending.clear()
+            probe = None
+            inhibited = None
+            previous = None
+            continue
         fields = dict(FIELDS.findall(raw))
         if 'revision' not in fields and (fields.get('model') == 'nominal' or
                 fields.get('source') == 'odometry' or 'PID_GATE started ' in raw):
@@ -84,7 +92,8 @@ def parse_log(text, issues=None):
             inhibited = None
             previous = None
             continue
-        key = (source, fields['revision'], fields['now'])
+        # Millisecond display precision must not merge distinct DEBUG cycles.
+        key = (source, fields['revision'], fields.get('cycle_ns', fields['now']))
         if 'PID_MOTION ' in raw:
             pending[key] = (fields, line_no)
             if len(pending) > 8:
@@ -93,6 +102,7 @@ def parse_log(text, issues=None):
         motion, motion_line = pending.pop(key, ({}, None))
         row = dict(fields, line=line_no, wall=float(stamp[1]), motion=motion,
                    motion_line=motion_line, probe=None, source=source)
+        row['history_model'] = fields.get('queued_commands') == 'nominal_history'
         row['pair_valid'] = bool(motion and motion.get('candidate') == fields['candidate'])
         identity = (key[0], fields['revision'], motion.get('epoch'))
         if (not row['pair_valid'] or previous is None or identity != previous[0]
@@ -314,7 +324,9 @@ def main():
         for row in selected:
             case = dict(row, time=clock(row['wall'], zone), models={}, warnings=[])
             models = {}
-            if not row['pair_valid']:
+            if row['history_model']:
+                case['warnings'].append('门控使用已发输出历史；节流日志不完整，禁止以旧模型重建')
+            elif not row['pair_valid']:
                 case['warnings'].append('缺少同周期 PID_MOTION，禁止运动重建')
             elif row['motion'].get('alignment') != 'ready':
                 case['warnings'].append('运动输入未对齐，禁止运动重建')

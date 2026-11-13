@@ -13,9 +13,10 @@ class TrackingProgressPublisher
 public:
   explicit TrackingProgressPublisher(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node);
   const msg::TrackingProgress & state() const {return state_;}
+  void safetyInhibited(bool value) {state_.safety_inhibited = value;}
   void activate();
   void deactivate();
-  void invalidate();
+  void invalidate(bool execution_finished = false);
   void loaded(const nav_msgs::msg::Path & path, uint64_t revision, PreparedPathPtr prepared);
   void update(
     const PathProgressReference & progress,

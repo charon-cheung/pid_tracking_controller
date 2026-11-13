@@ -374,8 +374,8 @@ void HolonomicSpeedPlanner::logObstacleState(
   if (state == obstacle_log_state_) {return;}
   const char * names[] = {"released", "active", "zero_cap", "unreachable"};
   RCLCPP_INFO(rclcpp::get_logger("pid_tracking_controller.safety"),
-    "PID_SAFETY obstacle event=%s distance_m=%.6f cap_mps=%.6f observed_mps=%.6f "
-    "reference_mps=%.6f", names[state], distance.value_or(-1.0),
+    "PID_SAFETY obstacle event=%s distance_m=%.3f cap_mps=%.3f observed_mps=%.3f "
+    "reference_mps=%.3f", names[state], distance.value_or(-1.0),
     plan.obstacle_speed_limit, observed_speed, plan.reference_velocity);
   obstacle_log_state_ = state;
 }

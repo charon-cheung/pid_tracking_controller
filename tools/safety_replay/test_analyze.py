@@ -15,6 +15,34 @@ def cycle(now, candidate_state='clear', action='pass', epoch=3, revision=1):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_rounded_times_use_integer_cycle_identity_when_available(self):
+        motion, gate = cycle(1).splitlines()
+        motion += ' cycle_ns=1000100000'
+        same = gate + ' cycle_ns=1000100000'
+        other = gate + ' cycle_ns=1000200000'
+        self.assertTrue(parse_log(motion + '\n' + same)[0]['pair_valid'])
+        self.assertFalse(parse_log(motion + '\n' + other)[0]['pair_valid'])
+
+    def test_event_summaries_are_not_replay_evidence_or_corrupt_records(self):
+        summary = ('[node] [1794471446.000] PID_MOTION summary revision=1 now=2.5 '
+                   'history_state=ready alignment=ready\n'
+                   '[node] [1794471446.000] PID_GATE summary revision=1 now=2.5 '
+                   'action=hold reason=collision\n')
+        issues = []
+        rows = parse_log(cycle(1) + cycle(2, 'collision', 'braking') + summary +
+                         cycle(3, action='hold'), issues)
+        self.assertEqual(issues, [])
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(rows[-1]['probe'])
+        self.assertTrue(rows[-1]['pair_valid'])
+        self.assertEqual(parse_log(summary, issues), [])
+
+    def test_nominal_history_is_marked_not_rebuilt_as_measured_only(self):
+        row = parse_log(cycle(1).replace('resume_state=collision',
+            'resume_state=collision queued_commands=nominal_history resume_policy=stopped_current_candidate'))[0]
+        self.assertTrue(row['history_model'])
+        self.assertIsNone(row['probe'])
+
     def test_traces_first_rejection_not_latest_candidate(self):
         rows = parse_log(cycle(1)+cycle(2, 'collision', 'braking')+cycle(3, action='hold'))
         self.assertEqual(rows[-1]['probe']['line'], 4)

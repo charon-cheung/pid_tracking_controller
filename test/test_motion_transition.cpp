@@ -184,7 +184,7 @@ TEST(MotionTransition, invalidRatesNonfiniteInputsAndHistoryOverflowFailClosed)
     if (field == 3) {in.measured.vx = std::numeric_limits<double>::infinity();}
     if (field == 4) {in.candidate_execution = {};}
     if (field == 5) {in.candidate_duration = -1.;}
-    if (field == 6) {in.pending.resize(17);}
+    if (field == 6) {in.pending.resize(65);}
     EXPECT_FALSE(buildMotionTransition(in).available) << field;
   }
   auto in = request({1., 0., 0.});

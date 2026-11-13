@@ -1,5 +1,7 @@
 # Channel entry 2-B / 2-C repair plan
 
+Acceptance correction (2026-11-13): keep the four channel-entry cases active, including the three recorded revisions 4/5/6; require safe stopping near the entrance instead of mandatory passage completion. Only exit cases are excluded. The user confirms committed HEAD 22166aa retains channel-entry capability. Keep these geometry-correctness fixes and safety tests. See [entry-stop-scope-design](../specs/2026-11-12-entry-stop-scope-design.md).
+
 Goal: remove the demonstrated false stop/restart lock while preserving occupied-cell, unknown-input and continuous-motion protection.
 Architecture: keep geometry in execution_safety.cpp and release policy in execution_safety_gate.cpp. No new adapter, planner or controller responsibility.
 Spec: user-authorized repair based on 17:07 and latest revisions 4/5/6; recorded evidence under log/channel_entry_20261112_1721.

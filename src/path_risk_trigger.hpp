@@ -2,6 +2,8 @@
 #define PID_TRACKING_CONTROLLER__PATH_RISK_TRIGGER_HPP_
 
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include "pid_tracking_controller/msg/path_risk_state.hpp"
 #include "pid_tracking_controller/msg/tracking_progress.hpp"
 
@@ -11,6 +13,10 @@ struct PathRiskTrigger
 {
   uint8_t state{msg::PathRiskState::UNAVAILABLE};
   const char * reason{"path_risk_missing"};
+  int64_t evidence_stamp_ns{0};
+  double distance{std::numeric_limits<double>::quiet_NaN()};
+  geometry_msgs::msg::Point pose;
+  std::string frame;
 };
 
 inline const char * pathRiskName(uint8_t state)
@@ -27,7 +33,7 @@ inline const char * pathRiskName(uint8_t state)
 // exact controller instance and path load, including the observer's source times.
 inline PathRiskTrigger validatePathRisk(const msg::PathRiskState * risk,
   std::chrono::steady_clock::time_point received, const msg::TrackingProgress & current,
-  int64_t now, std::chrono::steady_clock::time_point wall)
+  int64_t now, std::chrono::steady_clock::time_point wall, bool simulation = false)
 {
   using Risk = msg::PathRiskState;
   if (!risk) {return {};}
@@ -43,17 +49,26 @@ inline PathRiskTrigger validatePathRisk(const msg::PathRiskState * risk,
     };
   const auto fresh = [&](const builtin_interfaces::msg::Time & t, int64_t age) {
       const auto ns = stamp(t);
-      return t.nanosec < 1000000000u && ns > 0 && now >= ns && now - ns <= age;
+      return t.nanosec < 1000000000u && ns > 0 &&
+             ns - now <= (simulation ? 100000000LL : 0LL) && now - ns <= age;
     };
   if (now <= 0 || wall < received || wall - received > std::chrono::milliseconds(300) ||
     !fresh(current.header.stamp, 300000000LL) || !fresh(risk->header.stamp, 300000000LL) ||
     !fresh(risk->progress_stamp, 300000000LL) || !fresh(risk->map_stamp, 600000000LL) ||
     stamp(current.loaded_at) <= 0 || stamp(risk->progress_stamp) < stamp(current.loaded_at) ||
-    stamp(risk->progress_stamp) > stamp(risk->header.stamp) || risk->header.frame_id.empty())
+    stamp(risk->progress_stamp) - stamp(risk->header.stamp) > (simulation ? 100000000LL : 0LL) ||
+    risk->header.frame_id.empty())
   {return unavailable("path_risk_time_invalid_or_stale");}
   if (risk->state != Risk::CLEAR && risk->state != Risk::CLEARANCE_LOW &&
     risk->state != Risk::COLLISION_AHEAD) {return unavailable("path_risk_unavailable");}
-  return {risk->state, "ready"};
+  if (risk->state == Risk::COLLISION_AHEAD &&
+    (!std::isfinite(risk->risk_distance) || risk->risk_distance < 0. ||
+    !std::isfinite(risk->risk_pose.x) || !std::isfinite(risk->risk_pose.y)))
+  {return unavailable("path_risk_geometry_invalid");}
+  // Observer publication can repeat the same source snapshot. Count source
+  // progress, rather than republished timestamps, as independent risk evidence.
+  return {risk->state, "ready", stamp(risk->progress_stamp), risk->risk_distance,
+    risk->risk_pose, risk->header.frame_id};
 }
 }  // namespace pid_tracking_controller
 #endif  // PID_TRACKING_CONTROLLER__PATH_RISK_TRIGGER_HPP_

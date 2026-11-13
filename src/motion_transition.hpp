@@ -70,7 +70,7 @@ struct MotionTransition
 // Explicit model times are required: uncertain intervals are NOT
 // approximated by endpoints. No asynchronous MotionObservation snapshot conversion.
 // Issued entries are ordered by execution time; expired/unissued entries are ignored.
-// Limits: 16 pending entries / 128 segments. Unavailable results are never a safe path.
+// Limits: 64 pending entries / 128 segments. Unavailable results are never a safe path.
 MotionTransition buildMotionTransition(const MotionTransitionInput & input);
 
 // Legacy constant-body-velocity hold followed by full independent-axis braking.

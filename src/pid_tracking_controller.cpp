@@ -312,7 +312,8 @@ void PidTrackingController::configure(
     external_speed_limit_.store(std::numeric_limits<double>::infinity(), std::memory_order_relaxed);
     control_time_valid_ = false;
     last_holonomic_mode_ = -1;
-    RCLCPP_INFO(logger_, "PID_LOG holonomic_parameters nominal=%.3f max_xy_speed=%.3f "
+    RCLCPP_INFO(logger_, "PID_LOG holonomic_parameters controller=%s", controller_plugin_name.c_str());
+    RCLCPP_DEBUG(logger_, "PID_LOG holonomic_parameters nominal=%.3f max_xy_speed=%.3f "
             "max_vx=%.3f max_vy=%.3f max_omega=%.3f max_ax=%.3f max_ay=%.3f "
             "max_alpha=%.3f rotation_max_alpha=%.3f kp_x=%.3f kp_y=%.3f kp_yaw=%.3f gap=%.3f "
             "rotation_stop_confirm=%.3f rotation_braking_timeout=%.3f "
@@ -323,7 +324,7 @@ void PidTrackingController::configure(
             "tracking_guard_outward=%.3f tracking_guard_confirm=%.3f "
             "tracking_guard_release_confirm=%.3f "
             "configured_min_rate_window=%.3f yaw_feedback_reserve=%.3f "
-            "fixed_heading_yaw_hold=%s yaw_enter_error=%.6f yaw_exit_error=%.6f",
+            "fixed_heading_yaw_hold=%s yaw_enter_error=%.3f yaw_exit_error=%.3f",
             speed_config.nominal_tracking_speed, max_xy_speed_, speed_config.max_vx,
             speed_config.max_vy, speed_config.max_omega, speed_config.max_ax,
             speed_config.max_ay, limiter_config.max_alpha, *limiter_config.rotation_max_alpha,
@@ -367,10 +368,11 @@ void PidTrackingController::configure(
         nominal.braking_deceleration = {speed_config.stopping_deceleration,
                 speed_config.stopping_deceleration, limiter_config.max_alpha};
         motion_observation_ = std::make_shared<MotionObservation>(base_frame_);
-        execution_safety_gate_ = std::make_unique<ExecutionSafetyGate>(nominal);
-        RCLCPP_INFO(logger_, "PID_MOTION stage=2-A model=nominal delay=%.6f duration=%.6f "
-                "accel=(%.6f,%.6f,%.6f) decel=(%.6f,%.6f,%.6f) brake=(%.6f,%.6f,%.6f) "
-                "queued_commands=unmodeled steering=unmodeled physical_response=unverified",
+        execution_safety_gate_ = std::make_unique<ExecutionSafetyGate>(nominal,
+                ExecutionSafetyOptions{}, node->get_parameter("use_sim_time").as_bool());
+        RCLCPP_INFO(logger_, "PID_MOTION stage=2-A model=nominal delay=%.3f duration=%.3f "
+                "accel=(%.3f,%.3f,%.3f) decel=(%.3f,%.3f,%.3f) brake=(%.3f,%.3f,%.3f) "
+                "queued_commands=nominal_history steering=unmodeled physical_response=unverified",
                 nominal.delay, nominal.duration, nominal.acceleration.vx, nominal.acceleration.vy,
                 nominal.acceleration.omega, nominal.deceleration.vx, nominal.deceleration.vy,
                 nominal.deceleration.omega, nominal.braking_deceleration.vx,
@@ -404,7 +406,7 @@ void PidTrackingController::configure(
                     omega_feedback_sub_->get_topic_name(), base_frame_.c_str());
         }
     }
-    RCLCPP_INFO(logger_, "PID_LOG omega_feedback_filter tau=%.6f max_age=0.100 "
+    RCLCPP_INFO(logger_, "PID_LOG omega_feedback_filter tau=%.3f max_age=0.100 "
             "stop_source=raw reseed_source=%s", omega_filter_tau,
             omega_feedback_filter_ ? "filtered_if_fresh" : "raw");
 
@@ -431,7 +433,7 @@ void PidTrackingController::configure(
         if (!available) {
             value << "null";
         } else if (entry.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
-            value << std::setprecision(std::numeric_limits<double>::max_digits10) << entry.as_double();
+            value << std::fixed << std::setprecision(3) << entry.as_double();
         } else if (entry.get_type() == rclcpp::ParameterType::PARAMETER_STRING) {
             value << std::quoted(entry.as_string());
         } else {
@@ -447,12 +449,12 @@ void PidTrackingController::configure(
     plan_revision_ = 0;
     force_diagnostics_log_ = true;
 
-    RCLCPP_INFO(
+    RCLCPP_DEBUG(
             logger_,
-            "PID_LOG tracking_parameters lookahead_time=%.6f "
-            "min_lookahead_dist=%.6f max_lookahead_dist=%.6f "
-            "rotation_yaw_tolerance=%.6f rotation_omega_tolerance=%.6f "
-            "rotation_xy_speed_tolerance=%.6f rotation_settle_time=%.6f",
+            "PID_LOG tracking_parameters lookahead_time=%.3f "
+            "min_lookahead_dist=%.3f max_lookahead_dist=%.3f "
+            "rotation_yaw_tolerance=%.3f rotation_omega_tolerance=%.3f "
+            "rotation_xy_speed_tolerance=%.3f rotation_settle_time=%.3f",
             lookahead_time_, min_lookahead_dist_, max_lookahead_dist_,
             rotation_yaw_tolerance_, rotation_omega_tolerance_,
             rotation_xy_speed_tolerance_, rotation_settle_time_);
@@ -521,7 +523,7 @@ void PidTrackingController::cleanup()
 void PidTrackingController::reset()
 {
     if (execution_safety_gate_) {execution_safety_gate_->reset();}
-    if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
+    if (tracking_progress_pub_) {tracking_progress_pub_->invalidate(true);}
     // The next task seeds the planner and limiter from measured velocity.
     control_time_valid_ = false;
     last_commanded_planar_speed_ = 0.0;
@@ -537,7 +539,7 @@ void PidTrackingController::reset()
 void PidTrackingController::setPlan(const nav_msgs::msg::Path& orig_global_plan)
 {
     if (tracking_progress_pub_) {tracking_progress_pub_->invalidate();}
-    RCLCPP_INFO(logger_, "PidTrackingController received a path");
+    RCLCPP_DEBUG(logger_, "PidTrackingController received a path");
     resetRotationState(true);
     fixed_heading_yaw_gate_->reset();
     force_diagnostics_log_ = true;
@@ -588,7 +590,10 @@ void PidTrackingController::setSpeedLimit(const double & speed_limit, const bool
 {
     try {
         const double cap = convertExternalSpeedLimitToAbsolute(speed_limit, percentage, max_xy_speed_);
-        external_speed_limit_.store(cap, std::memory_order_relaxed);
+        const double previous = external_speed_limit_.exchange(cap, std::memory_order_relaxed);
+        if (previous != cap) {
+            RCLCPP_INFO(logger_, "PID_LOG speed_limit external_speed_limit=%.3f", cap);
+        }
     } catch (const std::invalid_argument & exception) {
         RCLCPP_WARN(logger_, "PID_LOG rejected_speed_limit reason=%s", exception.what());
     }
@@ -722,6 +727,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 reseed ? 0.0 : dt, accepted_output, *holonomic_command_limiter_, started, risk);
         limited.command = decision.command;
         safety_inhibited = decision.inhibited;
+        tracking_progress_pub_->safetyInhibited(safety_inhibited);
         if (safety_inhibited) {
             const double tangent = reference.current.path_tangent - yaw;
             holonomic_speed_planner_->seed(std::max(0.0,
@@ -756,21 +762,40 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
     last_control_time_ = now;
     control_time_valid_ = true;
     const double now_seconds = now.seconds();
-    if (force_diagnostics_log_ || reseed ||
-        last_holonomic_mode_ != static_cast<int>(reference.mode) ||
-        previous_candidate != rotation_ack_candidate_ ||
-        now_seconds - last_diagnostics_log_time_seconds_ >= 1.0) {
+    const bool log_event = force_diagnostics_log_ || reseed ||
+            last_holonomic_mode_ != static_cast<int>(reference.mode);
+    if (log_event) {
+        if (gap || dt < 0.0) {
+            RCLCPP_INFO(logger_, "PID_LOG control_time_anomaly control_now=%.3f dt=%.3f",
+                    now_seconds, dt);
+        }
         RCLCPP_INFO(logger_,
-                "PID_LOG holonomic plan_revision=%zu mode=%s control_now=%.9f planner_step=%s "
-                "reference_effective=%.6f external_speed_limit=%.6f limit_reason=%s "
-                "raw_vx=%.6f raw_vy=%.6f limited_vx=%.6f limited_vy=%.6f "
-                "translation_lambda=%.6f reseed=%s control_gap=%s "
-                "stop_speed_limit=%.6f stop_limit_unreachable=%s "
-                "feedback_speed_limit=%.6f feedback_unreachable=%s "
-                "acceleration_speed_limit=%.6f acceleration_unreachable=%s "
+                "PID_LOG holonomic plan_revision=%zu mode=%s "
+                "reseed=%s control_gap=%s yaw_hold=%s output=(%.3f,%.3f,%.3f)",
+                plan_revision_, holonomicReferenceModeName(reference.mode),
+                reseed_reason, gap ? "true" : "false", yaw_suppressed ? "true" : "false",
+                command.twist.linear.x, command.twist.linear.y, command.twist.angular.z);
+        if (rotating) {
+            RCLCPP_INFO(logger_,
+                    "PID_LOG holonomic_rotation plan_revision=%zu "
+                    "rotation_index=%zu rotation_phase=%s yaw_error=%.3f measured_omega=%.3f",
+                    plan_revision_, pending_rotation_segment_index_,
+                    braking ? "braking" : "rotating", raw.yaw_error, measured.omega);
+        }
+    }
+    if (log_event || previous_candidate != rotation_ack_candidate_ ||
+        now_seconds - last_diagnostics_log_time_seconds_ >= 1.0) {
+        RCLCPP_DEBUG(logger_,
+                "PID_LOG holonomic plan_revision=%zu mode=%s control_now=%.3f planner_step=%s "
+                "reference_effective=%.3f external_speed_limit=%.3f limit_reason=%s "
+                "raw_vx=%.3f raw_vy=%.3f limited_vx=%.3f limited_vy=%.3f "
+                "translation_lambda=%.3f reseed=%s control_gap=%s "
+                "stop_speed_limit=%.3f stop_limit_unreachable=%s "
+                "feedback_speed_limit=%.3f feedback_unreachable=%s "
+                "acceleration_speed_limit=%.3f acceleration_unreachable=%s "
                 "vx_saturated=%s vy_saturated=%s xy_saturated=%s ax_limited=%s ay_limited=%s "
-                "yaw_hold=%s yaw_error=%.6f raw_omega=%.6f limited_omega=%.6f "
-                "measured_omega=%.6f filtered_omega=%.6f omega_filter_valid=%s",
+                "yaw_hold=%s yaw_error=%.3f raw_omega=%.3f limited_omega=%.3f "
+                "measured_omega=%.3f filtered_omega=%.3f omega_filter_valid=%s",
                 plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                 reseed ? "false" : "true",
                 speed_plan.reference_velocity, cap,
@@ -786,19 +811,19 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 raw.yaw_error, raw.omega, limited.command.omega,
                 measured.omega, limiter_measured.omega, omega_sample ? "true" : "false");
         if (rotating) {
-            RCLCPP_INFO(logger_,
-                    "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.9f "
-                    "rotation_index=%zu rotation_phase=%s raw_omega=%.6f limited_omega=%.6f "
-                    "stop_confirmed=%.6f rotation_settled=%.6f ack_candidate=%s "
-                    "rotation_speed_cap=%.6f predicted_stop_angle=%.6f",
+            RCLCPP_DEBUG(logger_,
+                    "PID_LOG holonomic_rotation plan_revision=%zu control_now=%.3f "
+                    "rotation_index=%zu rotation_phase=%s raw_omega=%.3f limited_omega=%.3f "
+                    "stop_confirmed=%.3f rotation_settled=%.3f ack_candidate=%s "
+                    "rotation_speed_cap=%.3f predicted_stop_angle=%.3f",
                     plan_revision_, now_seconds, pending_rotation_segment_index_,
                     braking ? "braking" : "rotating", raw.omega, limited.command.omega,
                     rotation_entry_gate_->stoppedDuration(), completion.settled_duration,
                     rotation_ack_candidate_ ? "true" : "false",
                     rotation_plan.stopping_speed_limit, rotation_plan.predicted_stopping_angle);
         }
-        // Temporary TRA-15 capture: restore this gate and log to DEBUG after sampling.
-        if (logger_.get_effective_level() <= rclcpp::Logger::Level::Info) {
+        // Detailed tracking evidence is opt-in through DEBUG logging.
+        if (logger_.get_effective_level() <= rclcpp::Logger::Level::Debug) {
             // Keep progress and control-law evidence in the same diagnostic cycle.
             const auto & goal = prepared_path_->poses.back().pose;
             const auto segment_index = progress.cursor.segment_index;
@@ -811,19 +836,19 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 ++next_rotation;
             }
             const bool has_rotation = next_rotation < prepared_path_->segments.size();
-            RCLCPP_INFO(logger_,
-                    "PID_LOG tracking_state plan_revision=%zu mode=%s control_now=%.9f "
-                    "robot_x=%.9f robot_y=%.9f robot_yaw=%.9f "
-                    "goal_x=%.9f goal_y=%.9f goal_distance=%.6f goal_yaw_error=%.6f "
-                    "segment=%zu source_index=%zu fraction=%.9f lower_bound=%zu segment_count=%zu "
-                    "segment_type=%s segment_s_begin=%.9f segment_s_end=%.9f "
-                    "progress_s=%.9f total_s=%.9f remaining_s=%.9f budget_remaining=%.9f "
-                    "next_rotation_index=%s next_rotation_s=%.9f "
-                    "projection_x=%.9f projection_y=%.9f reference_x=%.9f reference_y=%.9f "
-                    "carrot_x=%.9f carrot_y=%.9f carrot_s=%.9f "
-                    "path_tangent=%.9f target_yaw=%.9f ex_body=%.9f ey_body=%.9f "
-                    "vx_ff=%.9f vy_ff=%.9f vx_fb=%.9f vy_fb=%.9f "
-                    "measured_vx=%.6f measured_vy=%.6f measured_omega=%.6f",
+            RCLCPP_DEBUG(logger_,
+                    "PID_LOG tracking_state plan_revision=%zu mode=%s control_now=%.3f "
+                    "robot_x=%.3f robot_y=%.3f robot_yaw=%.3f "
+                    "goal_x=%.3f goal_y=%.3f goal_distance=%.3f goal_yaw_error=%.3f "
+                    "segment=%zu source_index=%zu fraction=%.3f lower_bound=%zu segment_count=%zu "
+                    "segment_type=%s segment_s_begin=%.3f segment_s_end=%.3f "
+                    "progress_s=%.3f total_s=%.3f remaining_s=%.3f budget_remaining=%.3f "
+                    "next_rotation_index=%s next_rotation_s=%.3f "
+                    "projection_x=%.3f projection_y=%.3f reference_x=%.3f reference_y=%.3f "
+                    "carrot_x=%.3f carrot_y=%.3f carrot_s=%.3f "
+                    "path_tangent=%.3f target_yaw=%.3f ex_body=%.3f ey_body=%.3f "
+                    "vx_ff=%.3f vy_ff=%.3f vx_fb=%.3f vy_fb=%.3f "
+                    "measured_vx=%.3f measured_vy=%.3f measured_omega=%.3f",
                     plan_revision_, holonomicReferenceModeName(reference.mode), now_seconds,
                     input.robot_x, input.robot_y, yaw, goal.position.x, goal.position.y,
                     std::hypot(goal.position.x - input.robot_x, goal.position.y - input.robot_y),
@@ -847,10 +872,10 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
         last_diagnostics_log_time_seconds_ = now_seconds;
         force_diagnostics_log_ = false;
     }
-    // Temporary response capture: only sample translation anomalies, at most 10 Hz.
+    // DEBUG response capture: only sample translation anomalies, at most 10 Hz.
     // These are same-cycle differences, not estimates of physical response delay.
     if (reference.mode == HolonomicReferenceMode::kTranslation &&
-        logger_.get_effective_level() <= rclcpp::Logger::Level::Info) {
+        logger_.get_effective_level() <= rclcpp::Logger::Level::Debug) {
         const double response_delta = std::hypot(
                 limited.command.vx - measured.vx, limited.command.vy - measured.vy);
         const double limiter_delta = std::hypot(
@@ -860,18 +885,18 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
             // Pose header age is not sensor/odometry latency; velocity has no stamp here.
             const double pose_stamp = static_cast<double>(pose.header.stamp.sec) +
                     1e-9 * pose.header.stamp.nanosec;
-            RCLCPP_INFO_THROTTLE(logger_, *clock_, 100,
-                    "PID_LOG translation_response plan_revision=%zu control_now=%.9f dt=%.6f "
-                    "planner_step=%s pose_stamp=%.9f pose_header_age=%.6f "
-                    "progress_s=%.6f segment=%zu robot_yaw=%.6f path_tangent=%.6f lateral=%.6f "
-                    "reference_target=%.6f reference_effective=%.6f limit_reason=%s "
-                    "tangent_rate=%.6f rate_window=%.6f acceleration_cap=%.6f feedback_cap=%.6f "
-                    "local_tangent_rate=%.6f tracking_hold=%s tracking_cap=%.6f "
-                    "vx_ff=%.6f vy_ff=%.6f vx_fb=%.6f vy_fb=%.6f "
-                    "raw_vx=%.6f raw_vy=%.6f limited_vx=%.6f limited_vy=%.6f "
-                    "measured_vx=%.6f measured_vy=%.6f normal_command=%.6f normal_measured=%.6f "
-                    "translation_lambda=%.6f ax_limited=%s ay_limited=%s "
-                    "yaw_hold=%s yaw_error=%.6f limited_omega=%.6f measured_omega=%.6f",
+            RCLCPP_DEBUG_THROTTLE(logger_, *clock_, 100,
+                    "PID_LOG translation_response plan_revision=%zu control_now=%.3f dt=%.3f "
+                    "planner_step=%s pose_stamp=%.3f pose_header_age=%.3f "
+                    "progress_s=%.3f segment=%zu robot_yaw=%.3f path_tangent=%.3f lateral=%.3f "
+                    "reference_target=%.3f reference_effective=%.3f limit_reason=%s "
+                    "tangent_rate=%.3f rate_window=%.3f acceleration_cap=%.3f feedback_cap=%.3f "
+                    "local_tangent_rate=%.3f tracking_hold=%s tracking_cap=%.3f "
+                    "vx_ff=%.3f vy_ff=%.3f vx_fb=%.3f vy_fb=%.3f "
+                    "raw_vx=%.3f raw_vy=%.3f limited_vx=%.3f limited_vy=%.3f "
+                    "measured_vx=%.3f measured_vy=%.3f normal_command=%.3f normal_measured=%.3f "
+                    "translation_lambda=%.3f ax_limited=%s ay_limited=%s "
+                    "yaw_hold=%s yaw_error=%.3f limited_omega=%.3f measured_omega=%.3f",
                     plan_revision_, now_seconds, dt, reseed ? "false" : "true", pose_stamp,
                     pose_stamp == 0.0 ? std::numeric_limits<double>::quiet_NaN() : now_seconds - pose_stamp,
                     progress.progress_arc_length, progress.cursor.segment_index, yaw, input.path_tangent,
@@ -951,7 +976,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                 if (!progress_handoff_failure_logged_) {
                     RCLCPP_WARN(logger_,
                             "PID_LOG path_handoff_rejected plan_revision=%zu frame=%s "
-                            "robot_x=%.6f robot_y=%.6f reason=%s",
+                            "robot_x=%.3f robot_y=%.3f reason=%s",
                             plan_revision_, prepared_path_->frame_id.c_str(),
                             tracking_pose.pose.position.x, tracking_pose.pose.position.y,
                             exception.what());
@@ -964,16 +989,12 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeVelocityCommands(
                     prepared_path_->segments.begin() + handoff.prepared_segment_lower_bound,
                     [](const auto & segment) { return segment.type == PathSegmentType::kRotation; });
             RCLCPP_INFO(logger_,
-                    "PID_LOG path_handoff plan_revision=%zu frame=%s robot_x=%.6f robot_y=%.6f "
-                    "segment=%zu source_index=%zu fraction=%.6f projection_x=%.6f projection_y=%.6f "
-                    "accepted_s=%.6f projection_distance=%.6f lower_bound=%zu skipped_rotations=%zu",
-                    plan_revision_, handoff.frame_id.c_str(), tracking_pose.pose.position.x,
-                    tracking_pose.pose.position.y, handoff.cursor.segment_index, handoff.segment_index,
-                    handoff.cursor.segment_fraction, handoff.projection.x, handoff.projection.y,
-                    handoff.progress_arc_length,
+                    "PID_LOG path_handoff plan_revision=%zu frame=%s accepted_s=%.3f "
+                    "projection_distance=%.3f skipped_rotations=%zu",
+                    plan_revision_, handoff.frame_id.c_str(), handoff.progress_arc_length,
                     std::hypot(tracking_pose.pose.position.x - handoff.projection.x,
                     tracking_pose.pose.position.y - handoff.projection.y),
-                    handoff.prepared_segment_lower_bound, static_cast<std::size_t>(skipped_rotations));
+                    static_cast<std::size_t>(skipped_rotations));
         }
         const auto progress = path_progress_tracker_->update(tracking_pose.pose.position, lookahead);
         auto command = computeHolonomicCommand(tracking_pose, velocity, progress, lookahead, now);
