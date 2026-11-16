@@ -23,6 +23,8 @@ void TrackingProgressPublisher::deactivate() {invalidate(true); publisher_->on_d
 void TrackingProgressPublisher::invalidate(bool execution_finished)
 {
   state_.valid = false; state_.execution_finished = execution_finished;
+  // A later action terminal must not revive evidence invalidated by a control exception.
+  if (!execution_finished) {state_.safety_stopped = false;}
   state_.header.stamp = clock_->now();
   if (publisher_->is_activated()) {publisher_->publish(state_);}
 }
@@ -35,7 +37,7 @@ void TrackingProgressPublisher::loaded(
   state_.path_fingerprint = path_identity::fingerprintPath(path);
   state_.plan_revision = revision;
   state_.loaded_at = clock_->now();
-  state_.safety_inhibited = false;
+  safety(false, msg::TrackingProgress::SAFETY_NONE, false);
   invalidate();
 }
 void TrackingProgressPublisher::update(

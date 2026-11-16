@@ -17,6 +17,10 @@ struct PathRiskTrigger
   double distance{std::numeric_limits<double>::quiet_NaN()};
   geometry_msgs::msg::Point pose;
   std::string frame;
+  bool footprint_collision{false};
+  double footprint_distance{0.};
+  geometry_msgs::msg::Point footprint_pose;
+  int64_t footprint_origin_ns{0};
 };
 
 inline const char * pathRiskName(uint8_t state)
@@ -65,10 +69,16 @@ inline PathRiskTrigger validatePathRisk(const msg::PathRiskState * risk,
     (!std::isfinite(risk->risk_distance) || risk->risk_distance < 0. ||
     !std::isfinite(risk->risk_pose.x) || !std::isfinite(risk->risk_pose.y)))
   {return unavailable("path_risk_geometry_invalid");}
+  if (risk->footprint_collision && (risk->state != Risk::COLLISION_AHEAD ||
+    !std::isfinite(risk->footprint_distance) || risk->footprint_distance < 0. ||
+    !std::isfinite(risk->footprint_pose.x) || !std::isfinite(risk->footprint_pose.y) ||
+    !fresh(risk->footprint_origin_stamp, 600000000LL)))
+  {return unavailable("path_risk_footprint_invalid");}
   // Observer publication can repeat the same source snapshot. Count source
   // progress, rather than republished timestamps, as independent risk evidence.
   return {risk->state, "ready", stamp(risk->progress_stamp), risk->risk_distance,
-    risk->risk_pose, risk->header.frame_id};
+    risk->risk_pose, risk->header.frame_id, risk->footprint_collision,
+    risk->footprint_distance, risk->footprint_pose, stamp(risk->footprint_origin_stamp)};
 }
 }  // namespace pid_tracking_controller
 #endif  // PID_TRACKING_CONTROLLER__PATH_RISK_TRIGGER_HPP_

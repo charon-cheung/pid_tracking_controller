@@ -16,3 +16,10 @@ uint8 state
 # risk_pose is in header.frame_id; it is the robot centre at that envelope, not an obstacle point.
 float64 risk_distance
 geometry_msgs/Point risk_pose
+
+# Additional evidence from the actual supplied polygon, without envelope padding.
+# Shares the path identity, map and progress timestamps above. False is no evidence.
+bool footprint_collision
+float64 footprint_distance
+geometry_msgs/Point footprint_pose
+builtin_interfaces/Time footprint_origin_stamp

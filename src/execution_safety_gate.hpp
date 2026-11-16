@@ -18,9 +18,11 @@ struct SafetyGateDecision
   uint8_t path_risk{msg::PathRiskState::UNAVAILABLE};
   bool sweep_requested{false};
   bool inhibited{false};
-  bool stopped{false};
+  bool stopped{false}, stopped_for_handoff{false};
+  uint8_t stop_cause{msg::TrackingProgress::SAFETY_NONE};
   int64_t aligned_stamp_ns{0};
   double risk_distance{std::numeric_limits<double>::quiet_NaN()}, stopping_distance{0.};
+  double footprint_distance{std::numeric_limits<double>::quiet_NaN()};
   const char * mode{"tracking"};
   unsigned clear_cycles{0}, evaluations{0};
 };
@@ -33,8 +35,8 @@ class ExecutionSafetyGate
 public:
   using Wall = MotionObservation::Wall;
   explicit ExecutionSafetyGate(const NominalTransitionAssumptions & nominal,
-    const ExecutionSafetyOptions & options = {}, bool simulation = false);
-  void reset();
+    const ExecutionSafetyOptions & options = {}, bool simulation = false, double replan_stop_reserve = 0.);
+  void reset(bool preserve_obstacle_stop = false);
   SafetyGateDecision apply(SafetyInputResult & geometry, const MotionObservation::History & history,
     int64_t pose_stamp_ns, int64_t now_ns, uint64_t revision,
     const HolonomicBodyCommand & candidate, const HolonomicBodyCommand & measured,
@@ -48,12 +50,13 @@ public:
 private:
   NominalTransitionAssumptions nominal_;
   ExecutionSafetyOptions options_;
+  double replan_stop_reserve_;
   struct IssuedOutput {int64_t stamp; HolonomicBodyCommand command;};
   void commit(const HolonomicBodyCommand & command, int64_t now, HolonomicCommandLimiter & limiter);
   std::deque<IssuedOutput> issued_;
   std::optional<HolonomicBodyCommand> last_output_;
   bool inhibited_{false};
-  bool simulation_{false}, obstacle_stop_{false};
+  bool simulation_{false}, obstacle_stop_{false}, obstacle_handoff_pending_{false};
   Wall::time_point last_tick_wall_{};
   int64_t zero_since_{0}, low_since_{0}, confirmed_pose_{0}, confirmed_risk_{0};
   unsigned clear_cycles_{0};

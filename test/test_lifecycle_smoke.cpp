@@ -511,8 +511,10 @@ TEST(LifecycleSmoke, safetyInputsRecoverRotationEntryStopOnCollisionAndResumeAft
     auto risk_pub = publisher->create_publisher<msg::PathRiskState>("path_risk/control_state", 1);
     uint8_t risk_state = msg::PathRiskState::CLEARANCE_LOW;
     builtin_interfaces::msg::Time map_stamp;
+    msg::TrackingProgress gate_progress;
     auto progress_sub = parent->create_subscription<msg::TrackingProgress>(
       "pid_tracking_controller/tracking_progress", 1, [&](msg::TrackingProgress::ConstSharedPtr p) {
+        gate_progress = *p;
         if (!p->valid) {return;}
         msg::PathRiskState risk;
         risk.header = p->header; risk.header.stamp = parent->now(); risk.path_header = p->path_header;
@@ -587,9 +589,38 @@ TEST(LifecycleSmoke, safetyInputsRecoverRotationEntryStopOnCollisionAndResumeAft
     EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.);
     // Full footprint still blocked: repeated cycles must not produce stop/go pulses.
     for (int i = 0; i < 5; ++i) {ASSERT_TRUE(run(254, 0., false));}
+    for (int i = 0; i < 20 && !gate_progress.safety_stopped; ++i) {ASSERT_TRUE(run(254, 0., false));}
+    ASSERT_TRUE(gate_progress.safety_stopped);
+    EXPECT_EQ(gate_progress.safety_stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+    controller.reset();
+    for (int i = 0; i < 30 && !gate_progress.execution_finished; ++i) {
+      executor.spin_some(); std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_TRUE(gate_progress.execution_finished);
+    EXPECT_TRUE(gate_progress.safety_stopped);
+    EXPECT_TRUE(gate_progress.safety_inhibited);
+    EXPECT_EQ(gate_progress.safety_stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+    controller.setPlan(path); ++revision;
+    pose.header.stamp = parent->now();
+    command = controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);
+    EXPECT_DOUBLE_EQ(command.twist.angular.z, 0.);
     ASSERT_TRUE(run(0, 0., true));
     // Actual rotation completion must advance even if a previous gate stop occurred.
     ASSERT_TRUE(run(0, .2, true, true));
+    ASSERT_TRUE(run(254, .2, false));
+    for (int i = 0; i < 20 && !gate_progress.safety_stopped; ++i) {ASSERT_TRUE(run(254, .2, false));}
+    ASSERT_TRUE(gate_progress.safety_stopped);
+    geometry_msgs::msg::Twist invalid_velocity;
+    invalid_velocity.linear.x = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_THROW(controller.computeVelocityCommands(pose, invalid_velocity, nullptr), nav2_core::NoValidControl);
+    controller.reset();
+    for (int i = 0; i < 30 && !gate_progress.execution_finished; ++i) {
+      executor.spin_some(); std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_TRUE(gate_progress.execution_finished);
+    EXPECT_FALSE(gate_progress.safety_stopped);
+    EXPECT_TRUE(gate_progress.safety_inhibited);
+    EXPECT_EQ(gate_progress.safety_stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
     controller.deactivate(); controller.activate(); controller.setPlan(path); ++revision;
     pose.header.stamp = parent->now();
     command = controller.computeVelocityCommands(pose, geometry_msgs::msg::Twist(), nullptr);

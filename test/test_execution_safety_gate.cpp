@@ -36,7 +36,7 @@ protected:
     double dt = .1, Wall::time_point started = Wall::now())
   {
     now += 100000000LL;
-    if (refresh_risk) {risk.evidence_stamp_ns = now;}
+    if (refresh_risk) {risk.evidence_stamp_ns = risk.footprint_origin_ns = now;}
     auto & series = h.odometry; series = {};
     auto & s = series.samples[0];
     s.vx = measured.vx; s.vy = measured.vy; s.omega = measured.omega;
@@ -68,6 +68,192 @@ protected:
   int64_t now{1000000000LL};
   uint64_t revision{1};
 };
+
+TEST_F(GateTest, StopReserveRequiresConfirmedActualFootprintAndHandsOffAfterSettling)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2}, false, .2);
+  red(.3);
+  auto d = step({.3,0.,0.}, {.3,0.,0.});
+  ASSERT_FALSE(d.inhibited);  // Conservative red alone does not use the extra reserve.
+  risk.footprint_collision = true; risk.footprint_distance = .3; risk.footprint_pose.x = .3;
+  d = step({.3,0.,0.}, {.3,0.,0.});
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.reason, "path_replan_reserve");
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  settle(); d = step({});
+  EXPECT_TRUE(d.stopped_for_handoff);
+}
+TEST_F(GateTest, StopReserveUsesPathDistanceOnBendsAndAccountsForEvidenceAge)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2}, false, .2);
+  red(1.); risk.footprint_collision = true;
+  risk.footprint_distance = 1.; risk.footprint_pose.x = .1;
+  auto d = step({.3,0.,0.}, {.3,0.,0.});
+  EXPECT_FALSE(d.inhibited); EXPECT_NEAR(d.footprint_distance, .95, 1e-9);
+  risk.footprint_distance = .45; refresh_risk = false;
+  risk.footprint_origin_ns = now - 200000000LL;
+  d = step({.3,0.,0.}, {.3,0.,0.});
+  EXPECT_LT(d.footprint_distance, .45 - .05 - .09);
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.reason, "path_replan_reserve");
+}
+
+TEST_F(GateTest, StopReserveDoesNotStopYellowOrDistantConfirmedObstacle)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2}, false, .2);
+  EXPECT_FALSE(step({.3,0.,0.}, {.3,0.,0.}).inhibited);
+  red(1.);
+  risk.footprint_collision = true; risk.footprint_distance = 1.; risk.footprint_pose.x = 1.;
+  EXPECT_FALSE(step({.3,0.,0.}, {.3,0.,0.}).inhibited);
+}
+
+TEST_F(GateTest, PersistentNearbyYellowKeepsSafeMotionWithoutReplanning)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2}, false, .5);
+  risk.frame = "map"; risk.distance = .01;
+  for (int i = 0; i < 20; ++i) {
+    const auto d = step({.3,0.,0.}, {.3,0.,0.});
+    EXPECT_EQ(d.candidate.status, SweepStatus::kClear);
+    EXPECT_FALSE(d.inhibited);
+    EXPECT_FALSE(d.stopped_for_handoff);
+    EXPECT_DOUBLE_EQ(d.command.vx, .3);
+  }
+}
+
+TEST_F(GateTest, PersistentYellowAllowsSafeRotationAndLateralTranslation)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2}, false, .5);
+  risk.frame = "map"; risk.distance = 0.;
+  for (const auto & command : {HolonomicBodyCommand{0.,0.,.1}, {0.,.1,0.}}) {
+    for (int i = 0; i < 10; ++i) {
+      const auto d = step(command, command);
+      EXPECT_EQ(d.candidate.status, SweepStatus::kClear);
+      EXPECT_FALSE(d.inhibited);
+      EXPECT_FALSE(d.stopped_for_handoff);
+      EXPECT_DOUBLE_EQ(d.command.vy, command.vy);
+      EXPECT_DOUBLE_EQ(d.command.omega, command.omega);
+    }
+  }
+}
+
+TEST_F(GateTest, YellowStillChecksActualCollisionAndRedStillStopsAtBrakingBoundary)
+{
+  gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2}, false, .5);
+  risk.frame = "map"; risk.distance = .4;
+  wall(.2);
+  auto d = step({.4,0.,0.}, {.4,0.,0.});
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.candidate.status, SweepStatus::kCollision);
+  geometry.snapshot->map->resetMap(0,0,200,200);
+  gate.reset(); limiter = HolonomicCommandLimiter(limits()); red(.05);
+  d = step({.3,0.,0.}, {.3,0.,0.});
+  EXPECT_TRUE(d.inhibited); EXPECT_EQ(d.reason, "path_braking_boundary");
+}
+
+TEST_F(GateTest, ObstacleStopSurvivesActionResetAndRequiresFreshRestartEvidence)
+{
+  red(.15);
+  auto d = step({.3, 0., 0.}, {.3, 0., 0.});
+  ASSERT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  settle();
+  gate.reset(true); ++revision;
+  risk.state = msg::PathRiskState::CLEAR;
+  // A new action and CLEAR cannot clear an earlier obstacle stop.
+  d = step({.03, 0., 0.});
+  EXPECT_TRUE(d.inhibited); EXPECT_FALSE(d.stopped);
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  settle();
+  d = step({});
+  EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped);
+  EXPECT_FALSE(d.stopped_for_handoff);  // Waiting for a candidate is not current obstacle evidence.
+  for (int i = 0; i < 2; ++i) {
+    d = step({.03, 0., 0.});
+    EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped);
+    EXPECT_EQ(d.resume.status, SweepStatus::kClear);
+    EXPECT_FALSE(d.stopped_for_handoff);  // BT must let safe restart confirmation finish.
+  }
+  d = step({.03, 0., 0.});
+  EXPECT_FALSE(d.inhibited); EXPECT_GT(d.command.vx, 0.);
+  EXPECT_FALSE(d.stopped_for_handoff);
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_NONE);
+}
+
+TEST_F(GateTest, InheritedStopAllowsFreshSafeRestartWithDistantRed)
+{
+  for (bool simulation : {false, true}) {
+    gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2},
+      simulation, .5);
+    limiter = HolonomicCommandLimiter(limits());
+    risk.footprint_collision = false; red(.05);
+    ASSERT_TRUE(step({.3,0.,0.}, {.3,0.,0.}).inhibited);
+    settle();
+    gate.reset(true); ++revision;
+    // Latest recorded case: stopped at the path start, red about 1.6 m ahead.
+    red(1.6); risk.footprint_collision = true;
+    risk.footprint_distance = 1.9; risk.footprint_pose.x = 1.9;
+    auto d = step({0.,0.,.056});
+    EXPECT_TRUE(d.inhibited); EXPECT_FALSE(d.stopped_for_handoff);
+    settle();
+    for (int i = 0; i < 3; ++i) {
+      d = step({0.,0.,.056});
+      EXPECT_EQ(d.resume.status, SweepStatus::kClear);
+      EXPECT_FALSE(d.stopped_for_handoff);
+      EXPECT_EQ(d.inhibited, i < 2);
+    }
+    EXPECT_GT(d.command.omega, 0.);
+    EXPECT_FALSE(step({.03,0.,0.}).inhibited);
+  }
+}
+
+TEST_F(GateTest, NewActionStillStopsForCurrentCollisionOrNearRedReserve)
+{
+  for (bool collision : {false, true}) {
+    gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025,512,500000,.2},
+      true, .5);
+    limiter = HolonomicCommandLimiter(limits());
+    geometry.snapshot->map->resetMap(0,0,200,200);
+    risk.footprint_collision = false; red(.05);
+    ASSERT_TRUE(step({.3,0.,0.}, {.3,0.,0.}).inhibited);
+    settle(); gate.reset(true); ++revision;
+    red(1.6); risk.footprint_collision = true;
+    risk.footprint_distance = collision ? 1.9 : .3;
+    risk.footprint_pose.x = risk.footprint_distance;
+    if (collision) {wall(0.);}
+    const auto d = step({0.,0.,.056});
+    EXPECT_TRUE(d.inhibited);
+    EXPECT_EQ(d.candidate.status, collision ? SweepStatus::kCollision : SweepStatus::kClear);
+    if (!collision) {EXPECT_EQ(d.reason, "path_replan_reserve");}
+    settle(); EXPECT_TRUE(step({}).stopped_for_handoff);
+  }
+}
+
+TEST_F(GateTest, MissingInputsNeverBecomeObstacleAndDoNotEraseExistingObstacle)
+{
+  risk = {};
+  auto d = step({.3, 0., 0.});
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_INPUT_UNAVAILABLE);
+  EXPECT_FALSE(d.stopped_for_handoff);
+  gate.reset(true); risk.state = msg::PathRiskState::CLEAR;
+  EXPECT_FALSE(step({.03, 0., 0.}).inhibited);
+  red(.05);  // No remaining approach distance, including after a low issued command.
+  ASSERT_EQ(step({.3, 0., 0.}, {.3, 0., 0.}).stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  settle();
+  EXPECT_TRUE(step({}).stopped_for_handoff);
+  risk = {};
+  d = step({});
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  EXPECT_FALSE(d.stopped_for_handoff);
+  gate.reset(); risk.state = msg::PathRiskState::CLEAR;
+  EXPECT_FALSE(step({.03, 0., 0.}).inhibited);
+}
+
+TEST_F(GateTest, CurrentBodyCollisionStillAllowsStoppedHandoffOnYellow)
+{
+  wall(0.);
+  ASSERT_TRUE(step({.03, 0., 0.}).inhibited);
+  settle();
+  const auto d = step({.03, 0., 0.});
+  EXPECT_EQ(d.candidate.status, SweepStatus::kCollision);
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  EXPECT_TRUE(d.stopped_for_handoff);
+}
 
 TEST_F(GateTest, ClearAndNewPathCannotReleaseOngoingBraking)
 {
@@ -107,11 +293,14 @@ TEST_F(GateTest, FarRedAllowsApproachNearRedStopsAndCannotPulseAtTinySpeed)
     EXPECT_TRUE(d.inhibited);
   }
   EXPECT_DOUBLE_EQ(limiter.previousCommand()->vx, 0.);
-  // A yellow path can restart; CLEAR is not a prerequisite.
+  EXPECT_TRUE(step({}).stopped_for_handoff);  // Persistent red still hands off.
+  // Once the red boundary caused a stop, a low-speed candidate cannot reopen it.
   risk.state = msg::PathRiskState::CLEARANCE_LOW;
-  EXPECT_TRUE(step({.03, 0., 0.}).inhibited);
-  EXPECT_TRUE(step({.03, 0., 0.}).inhibited);
-  EXPECT_FALSE(step({.03, 0., 0.}).inhibited);
+  for (int i = 0; i < 3; ++i) {
+    const auto d = step({.03, 0., 0.});
+    EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped_for_handoff);
+    EXPECT_DOUBLE_EQ(d.command.vx, 0.);
+  }
 }
 
 TEST_F(GateTest, RepeatedRiskFrameCannotAccumulateRestartConfirmations)
@@ -256,14 +445,15 @@ TEST_F(GateTest, CollisionBrakesThenHoldsUntilCurrentRestartIsClear)
     EXPECT_LE(result.command.vx, previous.vx);
   }
   EXPECT_NEAR(limiter.previousCommand()->vx, 0., 1e-12);
-  // A zero candidate is not evidence that a motion restart is clear.
-  EXPECT_TRUE(step({}).inhibited);
+  // A zero or temporarily safe low-speed candidate must hand off after the stop.
+  const auto stopped = step({});
+  EXPECT_TRUE(stopped.inhibited); EXPECT_TRUE(stopped.stopped_for_handoff);
   geometry.snapshot->map->resetMap(0, 0, 200, 200);
-  EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
-  EXPECT_TRUE(step({.05, 0., 0.}).inhibited);
-  const auto released = step({.05, 0., 0.});
-  EXPECT_FALSE(released.inhibited); EXPECT_STREQ(released.action, "released");
-  EXPECT_DOUBLE_EQ(released.command.vx, .05);
+  for (int i = 0; i < 3; ++i) {
+    const auto handoff = step({.05, 0., 0.});
+    EXPECT_TRUE(handoff.inhibited); EXPECT_TRUE(handoff.stopped_for_handoff);
+    EXPECT_DOUBLE_EQ(handoff.command.vx, 0.);
+  }
   // No stale clear authorization: the very next candidate sees the new obstacle.
   wall(0.);
   EXPECT_TRUE(step({.1, 0., 0.}).inhibited);
@@ -277,14 +467,14 @@ TEST_F(GateTest, RecoveryUsesCurrentLowSpeedAndDirectionAfterRejectedFastMotion)
   // but a new lateral correction and low-speed restart fit in the available space.
   limiter.seed({});
   settle();
-  EXPECT_TRUE(step({}).inhibited);
-  EXPECT_TRUE(step({0., .05, 0.}).inhibited);
-  EXPECT_TRUE(step({0., .05, 0.}).inhibited);
-  const auto release = step({0., .05, 0.});
-  EXPECT_FALSE(release.inhibited);
-  EXPECT_STREQ(release.action, "released");
-  EXPECT_DOUBLE_EQ(release.command.vx, 0.);
-  EXPECT_DOUBLE_EQ(release.command.vy, .05);
+  const auto stopped = step({});
+  EXPECT_TRUE(stopped.inhibited); EXPECT_TRUE(stopped.stopped_for_handoff);
+  for (int i = 0; i < 3; ++i) {
+    const auto handoff = step({0., .05, 0.});
+    EXPECT_TRUE(handoff.inhibited); EXPECT_TRUE(handoff.stopped_for_handoff);
+    EXPECT_DOUBLE_EQ(handoff.command.vx, 0.);
+    EXPECT_DOUBLE_EQ(handoff.command.vy, 0.);
+  }
   wall(0.);  // An obstacle at the body must still block the next command.
   EXPECT_TRUE(step({0., .05, 0.}).inhibited);
 }
@@ -298,11 +488,16 @@ TEST_F(GateTest, TinyClearCandidateCannotReleaseAnUnsafeSustainedRestart)
   geometry.snapshot->map = std::make_unique<nav2_costmap_2d::Costmap2D>(400, 400, .005, -1., -1., 0);
   wall(.115);
   settle();
-  for (int i = 0; i < 5; ++i) {
-    const auto d = step({.08, 0., 0.});
-    EXPECT_EQ(d.candidate.status, SweepStatus::kClear);
-    EXPECT_EQ(d.resume.status, SweepStatus::kCollision);
-    EXPECT_TRUE(d.inhibited);
+  auto d = step({.08, 0., 0.});
+  EXPECT_EQ(d.candidate.status, SweepStatus::kClear);
+  EXPECT_EQ(d.resume.status, SweepStatus::kCollision);
+  EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped_for_handoff);
+  EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
+  EXPECT_DOUBLE_EQ(d.command.vx, 0.);
+  for (int i = 0; i < 4; ++i) {
+    d = step({.08, 0., 0.});
+    EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped_for_handoff);
+    EXPECT_EQ(d.stop_cause, msg::TrackingProgress::SAFETY_OBSTACLE);
     EXPECT_DOUBLE_EQ(d.command.vx, 0.);
   }
 }
@@ -497,15 +692,15 @@ TEST_F(GateTest, SimulationRepeatsDoNotEraseObstacleRestartConfirmations)
   gate = ExecutionSafetyGate(nominal(), ExecutionSafetyOptions{.025, 512, 500000, .2}, true);
   wall(.1); ASSERT_TRUE(step({.3, 0., 0.}).inhibited);
   geometry.snapshot->map->resetMap(0, 0, 200, 200); settle();
-  for (unsigned count = 1; count <= 3; ++count) {
+  for (int i = 0; i < 3; ++i) {
     auto d = step({.03, 0., 0.});
-    ASSERT_EQ(d.clear_cycles, count);
-    ASSERT_EQ(d.inhibited, count < 3);
+    EXPECT_EQ(d.clear_cycles, 0u);
+    EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped_for_handoff);
     d = gate.apply(geometry, h, now, now, revision, {}, {}, 0., std::nullopt,
       limiter, Wall::now(), risk);
-    EXPECT_EQ(d.clear_cycles, count);
-    EXPECT_EQ(d.inhibited, count < 3);
-    EXPECT_DOUBLE_EQ(d.command.vx, count < 3 ? 0. : .03);
+    EXPECT_EQ(d.clear_cycles, 0u);
+    EXPECT_TRUE(d.inhibited); EXPECT_TRUE(d.stopped_for_handoff);
+    EXPECT_DOUBLE_EQ(d.command.vx, 0.);
   }
 }
 
@@ -579,6 +774,17 @@ TEST(PathRiskTrigger, SimulationSkewAllowanceDoesNotAcceptExpiredOrWrongPathEvid
   risk.header.stamp = rclcpp::Time(now + 101000000LL); EXPECT_EQ(check().state, Risk::UNAVAILABLE);
   risk.header.stamp = rclcpp::Time(now - 400000000LL); EXPECT_EQ(check().state, Risk::UNAVAILABLE);
   risk.header.stamp = rclcpp::Time(now + 10000000LL); --risk.plan_revision;
+  EXPECT_EQ(check().state, Risk::UNAVAILABLE);
+  ++risk.plan_revision; risk.state = Risk::COLLISION_AHEAD;
+  risk.footprint_collision = true; risk.footprint_distance = .4;
+  EXPECT_EQ(check().state, Risk::UNAVAILABLE);  // No actual pose time.
+  risk.footprint_origin_stamp = rclcpp::Time(now - 200000000LL);
+  EXPECT_EQ(check().state, Risk::COLLISION_AHEAD);
+  EXPECT_EQ(check().footprint_origin_ns, now - 200000000LL);
+  risk.footprint_origin_stamp = rclcpp::Time(now - 601000000LL);
+  EXPECT_EQ(check().state, Risk::UNAVAILABLE);
+  risk.footprint_origin_stamp = rclcpp::Time(now);
+  risk.footprint_distance = std::numeric_limits<double>::quiet_NaN();
   EXPECT_EQ(check().state, Risk::UNAVAILABLE);
 }
 }  // namespace

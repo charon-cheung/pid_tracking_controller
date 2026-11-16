@@ -132,6 +132,20 @@ protected:
   PidTrackingController controller_;
 };
 
+TEST_F(CommandContractTest, RetreatKeepsBodyHeadingAndProducesReverseTranslation)
+{
+  speed_.nominal_tracking_speed = speed_.max_vx = speed_.max_vy = speed_.max_xy_speed = .4;
+  limits_.max_vx = limits_.max_vy = limits_.max_xy_speed = .4;
+  initialize();
+  PidTrackingControllerTestAccess::setLookaheadParameters(controller_, 1.5, .05, .1);
+  controller_.setPlan(makeStraightPath({0., -.05, -.1, -.15, -.2, -.25, -.3}));
+  geometry_msgs::msg::TwistStamped command;
+  for (int i = 0; i < 5; ++i) {command = step();}
+  EXPECT_LT(command.twist.linear.x, 0.);
+  EXPECT_LE(std::hypot(command.twist.linear.x,command.twist.linear.y), .4);
+  EXPECT_NEAR(command.twist.angular.z, 0., 1e-9);
+}
+
 TEST_F(CommandContractTest, filtersOnlyAngularReseedingAndKeepsHistoryAcrossTasks)
 {
   auto filter = std::make_shared<AngularVelocityFeedbackFilter>(0.05);

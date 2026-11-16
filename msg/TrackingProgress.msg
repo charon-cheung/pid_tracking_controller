@@ -16,3 +16,11 @@ bool safety_inhibited
 # Explicit execution end (reset/deactivate), distinct from temporary invalid progress.
 # Does not assert physical standstill; MotionHandoff remains authoritative.
 bool execution_finished
+# Latched obstacle cause survives a later input failure and action termination.
+uint8 SAFETY_NONE=0
+uint8 SAFETY_INPUT_UNAVAILABLE=1
+uint8 SAFETY_OBSTACLE=2
+uint8 safety_stop_cause
+# Nominal gate standstill with a complete current safety check, not physical proof.
+# BT must still finish action termination and MotionHandoff before taking ownership.
+bool safety_stopped

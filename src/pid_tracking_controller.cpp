@@ -367,9 +367,13 @@ void PidTrackingController::configure(
         nominal.deceleration = {limiter_config.max_decel_x, limiter_config.max_decel_y, limiter_config.max_alpha};
         nominal.braking_deceleration = {speed_config.stopping_deceleration,
                 speed_config.stopping_deceleration, limiter_config.max_alpha};
+        declare_parameter_if_not_declared(node, controller_plugin_name + ".execution_safety.replan_stop_reserve",
+                rclcpp::ParameterValue(0.));
+        const double replan_stop_reserve = node->get_parameter(
+                controller_plugin_name + ".execution_safety.replan_stop_reserve").as_double();
         motion_observation_ = std::make_shared<MotionObservation>(base_frame_);
         execution_safety_gate_ = std::make_unique<ExecutionSafetyGate>(nominal,
-                ExecutionSafetyOptions{}, node->get_parameter("use_sim_time").as_bool());
+                ExecutionSafetyOptions{}, node->get_parameter("use_sim_time").as_bool(), replan_stop_reserve);
         RCLCPP_INFO(logger_, "PID_MOTION stage=2-A model=nominal delay=%.3f duration=%.3f "
                 "accel=(%.3f,%.3f,%.3f) decel=(%.3f,%.3f,%.3f) brake=(%.3f,%.3f,%.3f) "
                 "queued_commands=nominal_history steering=unmodeled physical_response=unverified",
@@ -522,7 +526,8 @@ void PidTrackingController::cleanup()
 
 void PidTrackingController::reset()
 {
-    if (execution_safety_gate_) {execution_safety_gate_->reset();}
+    // Ending FollowPath must not authorize the next action to bypass restart checks.
+    if (execution_safety_gate_) {execution_safety_gate_->reset(true);}
     if (tracking_progress_pub_) {tracking_progress_pub_->invalidate(true);}
     // The next task seeds the planner and limiter from measured velocity.
     control_time_valid_ = false;
@@ -727,7 +732,7 @@ geometry_msgs::msg::TwistStamped PidTrackingController::computeHolonomicCommand(
                 reseed ? 0.0 : dt, accepted_output, *holonomic_command_limiter_, started, risk);
         limited.command = decision.command;
         safety_inhibited = decision.inhibited;
-        tracking_progress_pub_->safetyInhibited(safety_inhibited);
+        tracking_progress_pub_->safety(safety_inhibited, decision.stop_cause, decision.stopped_for_handoff);
         if (safety_inhibited) {
             const double tangent = reference.current.path_tangent - yaw;
             holonomic_speed_planner_->seed(std::max(0.0,

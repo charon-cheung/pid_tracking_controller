@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <iomanip>
 #include <sstream>
 #include <utility>
@@ -62,12 +63,20 @@ double rampTime(double from, double to, double acceleration, double deceleration
 }  // namespace
 
 ExecutionSafetyGate::ExecutionSafetyGate(const NominalTransitionAssumptions & nominal,
-  const ExecutionSafetyOptions & options, bool simulation)
-: nominal_(nominal), options_(options), simulation_(simulation) {}
-
-void ExecutionSafetyGate::reset()
+  const ExecutionSafetyOptions & options, bool simulation, double replan_stop_reserve)
+: nominal_(nominal), options_(options), replan_stop_reserve_(replan_stop_reserve),
+  simulation_(simulation)
 {
-  inhibited_ = obstacle_stop_ = false; clear_cycles_ = 0; revision_ = epoch_ = odom_drops_ = 0;
+  if (!std::isfinite(replan_stop_reserve_) || replan_stop_reserve_ < 0.) {
+    throw std::invalid_argument("invalid replan stop reserve");
+  }
+}
+
+void ExecutionSafetyGate::reset(bool preserve_obstacle_stop)
+{
+  const bool keep_stop = preserve_obstacle_stop && inhibited_ && obstacle_stop_;
+  inhibited_ = obstacle_stop_ = keep_stop; obstacle_handoff_pending_ = false;
+  clear_cycles_ = 0; revision_ = epoch_ = odom_drops_ = 0;
   last_tick_wall_ = {};
   last_now_ = 0; last_report_.clear(); last_motion_report_.clear(); reported_at_ = {};
   issued_.clear(); last_output_.reset(); zero_since_ = low_since_ = confirmed_pose_ = confirmed_risk_ = 0;
@@ -112,6 +121,7 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
   if (repeat) {accepted_output = last_output_;}
   const bool clock_reset = last_now_ && now_ns < last_now_;
   if (revision != revision_ || clock_reset || (history.epoch && history.epoch != epoch_)) {
+    if (revision_ && revision != revision_) {obstacle_handoff_pending_ = false;}
     clear_cycles_ = 0; confirmed_pose_ = confirmed_risk_ = low_since_ = 0;
     revision_ = revision;
     if (history.epoch) {epoch_ = history.epoch;}
@@ -141,7 +151,12 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
     const auto & snapshot = *geometry.snapshot;
     if (!std::isfinite(risk.distance) || risk.distance < 0. ||
       !std::isfinite(risk.pose.x) || !std::isfinite(risk.pose.y) ||
-      risk.frame != snapshot.header.frame_id || risk.frame.empty())
+      risk.frame != snapshot.header.frame_id || risk.frame.empty() ||
+      (risk.footprint_collision && (!std::isfinite(risk.footprint_distance) ||
+      risk.footprint_distance < 0. || !std::isfinite(risk.footprint_pose.x) ||
+      !std::isfinite(risk.footprint_pose.y) || risk.footprint_origin_ns <= 0 ||
+      now_ns - risk.footprint_origin_ns > 600000000LL ||
+      risk.footprint_origin_ns - now_ns > (simulation_ ? 100000000LL : 0LL))))
     {out.reason = "path_risk_geometry_invalid";} else {
       // Centre-to-risk-pose is a conservative shortcut of the remaining path.
       // The red envelope already includes the body: do not subtract robot width again.
@@ -233,28 +248,56 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
   out.candidate = evaluate(target_command, false);
   if (inputs_ready) {out.reason = out.candidate.reason;}
   bool clear = out.candidate.status == SweepStatus::kClear;
+  bool obstacle_blocks_motion = out.candidate.status == SweepStatus::kCollision;
   if (clear && risk.state == msg::PathRiskState::COLLISION_AHEAD &&
     out.stopping_distance >= out.risk_distance) {
-    clear = false; out.reason = "path_braking_boundary";
+    clear = false; obstacle_blocks_motion = true; out.reason = "path_braking_boundary";
+  }
+  if (clear && risk.state == msg::PathRiskState::COLLISION_AHEAD &&
+    risk.footprint_collision && replan_stop_reserve_ > 0.) {
+    // Preserve along-path distance on bends. Age is measured from the pose
+    // used by the observer, not its later publication time.
+    const double age = std::max(0., (now_ns - risk.footprint_origin_ns) * 1e-9);
+    double speed = std::max(std::hypot(measured.vx, measured.vy),
+      std::hypot(target_command.vx, target_command.vy));
+    for (size_t i = 0; i < history.odometry.size; ++i) {
+      const auto & s = history.odometry.at(i);
+      speed = std::max(speed, std::hypot(s.vx, s.vy));
+    }
+    for (const auto & issued : issued_) {
+      speed = std::max(speed, std::hypot(issued.command.vx, issued.command.vy));
+    }
+    const double advance = speed * age + .5 * age * age *
+      std::hypot(nominal_.acceleration.vx, nominal_.acceleration.vy);
+    out.footprint_distance = std::max(0., risk.footprint_distance - advance - .05);
+    if (out.stopping_distance + replan_stop_reserve_ >= out.footprint_distance) {
+      clear = false; obstacle_blocks_motion = true; out.reason = "path_replan_reserve";
+    }
   }
   if (!clear) {
     inhibited_ = true; clear_cycles_ = 0;
-    obstacle_stop_ = obstacle_stop_ || out.candidate.status == SweepStatus::kCollision ||
-      out.reason == "path_braking_boundary";
+    obstacle_stop_ = obstacle_stop_ || obstacle_blocks_motion;
+    obstacle_handoff_pending_ = obstacle_handoff_pending_ || obstacle_blocks_motion;
   } else if (inhibited_ && simulation_ && !obstacle_stop_) {
     // Input recovery is not an obstacle stop. Current geometry, motion and
     // red braking distance have all passed above; no forced full stop is needed.
     inhibited_ = false; clear_cycles_ = 0; out.action = "inputs_recovered";
   } else if (inhibited_) {
     if (!out.stopped) {clear = false; out.reason = "braking_not_stopped";}
-    else if (risk.state == msg::PathRiskState::COLLISION_AHEAD) {
-      clear = false; out.reason = "path_collision_persists";
+    else if (obstacle_handoff_pending_) {
+      clear = false; obstacle_blocks_motion = true; out.reason = "obstacle_handoff_pending";
     } else if (!repeat) {
+      // A stop inherited from another action may restart with distant red:
+      // current sweep and red distance/reserve checks above already passed.
+      // Same-action obstacle stops remain latched by handoff_pending above.
       // Repeated zero output neither adds nor erases a valid restart confirmation.
       if (!moving(target_command)) {clear = false; out.reason = "resume_motion_missing";}
       else {
         out.resume = evaluate(target_command, true);
         clear = out.resume.status == SweepStatus::kClear;
+        if (out.resume.status == SweepStatus::kCollision) {
+          obstacle_stop_ = obstacle_handoff_pending_ = obstacle_blocks_motion = true;
+        }
         if (!clear) {out.reason = out.resume.reason;}
       }
     }
@@ -273,7 +316,7 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
       brake.mode == HolonomicSafetyMode::kHold ? "hold" : "braking";
     out.output = evaluate(out.command, false);
     if (out.output.status == SweepStatus::kCollision) {
-      obstacle_stop_ = true;
+      obstacle_stop_ = obstacle_handoff_pending_ = obstacle_blocks_motion = true;
       out.command = {}; out.action = "emergency_zero"; out.reason = "braking_collision";
       out.output = evaluate(out.command, false);
     }
@@ -283,6 +326,13 @@ SafetyGateDecision ExecutionSafetyGate::apply(SafetyInputResult & geometry, cons
   }
   commit(out.command, now_ns, limiter);
   out.inhibited = inhibited_; out.clear_cycles = clear_cycles_;
+  out.stop_cause = !inhibited_ ? msg::TrackingProgress::SAFETY_NONE : obstacle_stop_ ?
+    msg::TrackingProgress::SAFETY_OBSTACLE : msg::TrackingProgress::SAFETY_INPUT_UNAVAILABLE;
+  // A stop from this path revision remains blocked after settling; a preserved
+  // latch from an earlier action does not trigger a handoff by itself.
+  out.stopped_for_handoff = obstacle_blocks_motion && inhibited_ && out.stopped && !moving(out.command) &&
+    inputs_ready && out.candidate.status != SweepStatus::kUnavailable &&
+    out.output.status != SweepStatus::kUnavailable;
   out.mode = inhibited_ ? (out.stopped ? "stopped" : "braking") : "tracking";
   return out;
 }
@@ -318,10 +368,12 @@ void ExecutionSafetyGate::report(const rclcpp::Logger & logger, const SafetyGate
       " action=" << d.action << " reason=" << d.reason << " mode=" << d.mode << " stopped=" << d.stopped;
     if (d.inhibited || std::strcmp(d.action, "released") == 0) {
       event << " candidate=(" << candidate.vx << ',' << candidate.vy << ',' << candidate.omega <<
-        ") output=(" << d.command.vx << ',' << d.command.vy << ',' << d.command.omega << ')';
+        ") output=(" << d.command.vx << ',' << d.command.vy << ',' << d.command.omega <<
+        ") handoff_ready=" << d.stopped_for_handoff;
     }
     if (d.path_risk == msg::PathRiskState::COLLISION_AHEAD) {
-      event << " risk_remaining=" << d.risk_distance << " stop_travel=" << d.stopping_distance;
+      event << " risk_remaining=" << d.risk_distance << " stop_travel=" << d.stopping_distance <<
+        " footprint_remaining=" << d.footprint_distance << " replan_reserve=" << replan_stop_reserve_;
     }
     if (d.reason == "pose_invalid_or_stale" || d.motion_reason == "pose_time_invalid") {
       event << " pose_age=" << (now_ns - pose_stamp_ns) * 1e-9;
